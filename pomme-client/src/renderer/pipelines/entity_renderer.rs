@@ -13,6 +13,8 @@ use crate::renderer::chunk::mesher::ChunkVertex;
 use crate::renderer::entity_model::BakedEntityModel;
 use crate::renderer::{MAX_FRAMES_IN_FLIGHT, entity_model, shader, util};
 
+pub const MAX_OVERLAYS: usize = 2;
+
 pub struct EntityRenderInfo {
     pub x: f64,
     pub y: f64,
@@ -24,6 +26,10 @@ pub struct EntityRenderInfo {
     pub walk_anim_pos: f32,
     pub walk_anim_speed: f32,
     pub entity_kind: EntityKind,
+    pub variant_index: u32,
+    pub overlay_tints: [Option<[f32; 4]>; MAX_OVERLAYS],
+    pub head_y_offset: f32,
+    pub head_x_rot_override: Option<f32>,
 }
 
 struct MobVariant {
@@ -37,19 +43,78 @@ struct MobVariant {
 }
 
 struct MobEntry {
-    adult: MobVariant,
-    baby: Option<MobVariant>,
+    adult_variants: Vec<MobVariant>,
+    baby_variants: Option<Vec<MobVariant>>,
+    adult_overlays: Vec<MobVariant>,
+    baby_overlays: Vec<MobVariant>,
     anim: AnimationType,
 }
 
 impl MobEntry {
-    fn variant(&self, is_baby: bool) -> &MobVariant {
-        if is_baby {
-            self.baby.as_ref().unwrap_or(&self.adult)
+    fn base_variant(&self, is_baby: bool, variant_index: u32) -> &MobVariant {
+        let pool = if is_baby {
+            self.baby_variants.as_ref().unwrap_or(&self.adult_variants)
         } else {
-            &self.adult
+            &self.adult_variants
+        };
+        let idx = (variant_index as usize).min(pool.len().saturating_sub(1));
+        &pool[idx]
+    }
+
+    fn overlays(&self, is_baby: bool) -> &[MobVariant] {
+        if is_baby {
+            &self.baby_overlays
+        } else {
+            &self.adult_overlays
         }
     }
+}
+
+pub const WHITE_TINT: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+
+pub const WOOL_COLOR_RGBA: [[f32; 4]; 16] = [
+    rgb(0xF0F0F0), // 0 white
+    rgb(0xEB8844), // 1 orange
+    rgb(0xC354CD), // 2 magenta
+    rgb(0x6689D3), // 3 light_blue
+    rgb(0xDECF2A), // 4 yellow
+    rgb(0x41CD34), // 5 lime
+    rgb(0xD88198), // 6 pink
+    rgb(0x434343), // 7 gray
+    rgb(0xABABAB), // 8 light_gray
+    rgb(0x287697), // 9 cyan
+    rgb(0x7B2FBE), // 10 purple
+    rgb(0x253192), // 11 blue
+    rgb(0x51301A), // 12 brown
+    rgb(0x3B511A), // 13 green
+    rgb(0xB3312C), // 14 red
+    rgb(0x1E1B1B), // 15 black
+];
+
+const fn rgb(hex: u32) -> [f32; 4] {
+    let r = ((hex >> 16) & 0xFF) as f32 / 255.0;
+    let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
+    let b = (hex & 0xFF) as f32 / 255.0;
+    [r, g, b, 1.0]
+}
+
+pub fn wool_color_tint(color: u8) -> [f32; 4] {
+    WOOL_COLOR_RGBA[(color & 0x0F) as usize]
+}
+
+pub fn jeb_sheep_tint(entity_id: i32, age_in_ticks: u32) -> [f32; 4] {
+    let base = (age_in_ticks / 25).wrapping_add(entity_id as u32);
+    let c1 = (base % 16) as usize;
+    let c2 = ((base + 1) % 16) as usize;
+    let t = (age_in_ticks % 25) as f32 / 25.0;
+    let a = WOOL_COLOR_RGBA[c1];
+    let b = WOOL_COLOR_RGBA[c2];
+    [
+        a[0] * (1.0 - t) + b[0] * t,
+        a[1] * (1.0 - t) + b[1] * t,
+        a[2] * (1.0 - t) + b[2] * t,
+        1.0,
+    ]
 }
 
 pub struct EntityRenderer {
@@ -71,41 +136,126 @@ enum AnimationType {
     Humanoid,
 }
 
+struct VariantDef {
+    model: BakedEntityModel,
+    /// Outer slice: one entry per texture variant (variant_index). Inner slice:
+    /// fallback chain of asset keys.
+    tex_variants: &'static [&'static [&'static str]],
+    tex_size: u32,
+}
+
 struct MobDef {
     kind: EntityKind,
     anim: AnimationType,
-    adult_model: BakedEntityModel,
-    adult_tex_keys: &'static [&'static str],
-    adult_tex_size: u32,
-    baby_model: Option<BakedEntityModel>,
-    baby_tex_keys: Option<&'static [&'static str]>,
-    baby_tex_size: u32,
+    adult: VariantDef,
+    baby: Option<VariantDef>,
+    adult_overlays: Vec<VariantDef>,
+    baby_overlays: Vec<VariantDef>,
 }
 
 fn mob_definitions() -> Vec<MobDef> {
+    const PIG_ADULT_TEX: &[&[&str]] = &[&[
+        "minecraft/textures/entity/pig/pig_temperate.png",
+        "minecraft/textures/entity/pig/temperate_pig.png",
+    ]];
+    const PIG_BABY_TEX: &[&[&str]] = &[&["minecraft/textures/entity/pig/pig_temperate_baby.png"]];
+    const COW_ADULT_TEX: &[&[&str]] = &[
+        &[
+            "minecraft/textures/entity/cow/cow_temperate.png",
+            "minecraft/textures/entity/cow/cow.png",
+        ],
+        &["minecraft/textures/entity/cow/cow_cold.png"],
+        &["minecraft/textures/entity/cow/cow_warm.png"],
+    ];
+    const COW_BABY_TEX: &[&[&str]] = &[
+        &["minecraft/textures/entity/cow/cow_temperate_baby.png"],
+        &["minecraft/textures/entity/cow/cow_cold_baby.png"],
+        &["minecraft/textures/entity/cow/cow_warm_baby.png"],
+    ];
+    const SHEEP_ADULT_TEX: &[&[&str]] = &[&["minecraft/textures/entity/sheep/sheep.png"]];
+    const SHEEP_BABY_TEX: &[&[&str]] = &[&["minecraft/textures/entity/sheep/sheep_baby.png"]];
+    const SHEEP_WOOL_UNDERCOAT_TEX: &[&[&str]] =
+        &[&["minecraft/textures/entity/sheep/sheep_wool_undercoat.png"]];
+    const SHEEP_WOOL_TEX: &[&[&str]] = &[&["minecraft/textures/entity/sheep/sheep_wool.png"]];
+    const SHEEP_BABY_WOOL_TEX: &[&[&str]] =
+        &[&["minecraft/textures/entity/sheep/sheep_wool_baby.png"]];
+    const PLAYER_TEX: &[&[&str]] = &[&["minecraft/textures/entity/player/wide/steve.png"]];
+
     vec![
         MobDef {
             kind: EntityKind::Pig,
             anim: AnimationType::Quadruped,
-            adult_model: entity_model::bake_pig_model(),
-            adult_tex_keys: &[
-                "minecraft/textures/entity/pig/pig_temperate.png",
-                "minecraft/textures/entity/pig/temperate_pig.png",
+            adult: VariantDef {
+                model: entity_model::bake_pig_model(),
+                tex_variants: PIG_ADULT_TEX,
+                tex_size: 64,
+            },
+            baby: Some(VariantDef {
+                model: entity_model::bake_baby_pig_model(),
+                tex_variants: PIG_BABY_TEX,
+                tex_size: 32,
+            }),
+            adult_overlays: vec![],
+            baby_overlays: vec![],
+        },
+        MobDef {
+            kind: EntityKind::Cow,
+            anim: AnimationType::Quadruped,
+            adult: VariantDef {
+                model: entity_model::bake_cow_model(),
+                tex_variants: COW_ADULT_TEX,
+                tex_size: 64,
+            },
+            baby: Some(VariantDef {
+                model: entity_model::bake_baby_cow_model(),
+                tex_variants: COW_BABY_TEX,
+                tex_size: 64,
+            }),
+            adult_overlays: vec![],
+            baby_overlays: vec![],
+        },
+        MobDef {
+            kind: EntityKind::Sheep,
+            anim: AnimationType::Quadruped,
+            adult: VariantDef {
+                model: entity_model::bake_sheep_model(),
+                tex_variants: SHEEP_ADULT_TEX,
+                tex_size: 64,
+            },
+            baby: Some(VariantDef {
+                model: entity_model::bake_baby_sheep_model(),
+                tex_variants: SHEEP_BABY_TEX,
+                tex_size: 64,
+            }),
+            adult_overlays: vec![
+                VariantDef {
+                    model: entity_model::bake_sheep_wool_undercoat_model(),
+                    tex_variants: SHEEP_WOOL_UNDERCOAT_TEX,
+                    tex_size: 64,
+                },
+                VariantDef {
+                    model: entity_model::bake_sheep_wool_model(),
+                    tex_variants: SHEEP_WOOL_TEX,
+                    tex_size: 64,
+                },
             ],
-            adult_tex_size: 64,
-            baby_model: Some(entity_model::bake_baby_pig_model()),
-            baby_tex_keys: Some(&["minecraft/textures/entity/pig/pig_temperate_baby.png"]),
-            baby_tex_size: 32,
+            baby_overlays: vec![VariantDef {
+                model: entity_model::bake_baby_sheep_wool_model(),
+                tex_variants: SHEEP_BABY_WOOL_TEX,
+                tex_size: 64,
+            }],
         },
         MobDef {
             kind: EntityKind::Player,
             anim: AnimationType::Humanoid,
-            adult_model: entity_model::bake_player_model(),
-            adult_tex_keys: &["minecraft/textures/entity/player/wide/steve.png"],
-            adult_tex_size: 64,
-            baby_model: None,
-            baby_tex_keys: None,
-            baby_tex_size: 64,
+            adult: VariantDef {
+                model: entity_model::bake_player_model(),
+                tex_variants: PLAYER_TEX,
+                tex_size: 64,
+            },
+            baby: None,
+            adult_overlays: vec![],
+            baby_overlays: vec![],
         },
     ]
 }
@@ -135,7 +285,7 @@ impl EntityRenderer {
         let push_constant_range = vk::PushConstantRange {
             stage_flags: vk::ShaderStageFlags::Vertex,
             offset: 0,
-            size: 64,
+            size: 80,
         };
 
         let layouts = [camera_layout, texture_layout];
@@ -156,7 +306,19 @@ impl EntityRenderer {
         let defs = mob_definitions();
         let tex_count: u32 = defs
             .iter()
-            .map(|d| if d.baby_model.is_some() { 2 } else { 1 })
+            .map(|d| {
+                let mut n = d.adult.tex_variants.len() as u32;
+                if let Some(b) = &d.baby {
+                    n += b.tex_variants.len() as u32;
+                }
+                for o in &d.adult_overlays {
+                    n += o.tex_variants.len() as u32;
+                }
+                for o in &d.baby_overlays {
+                    n += o.tex_variants.len() as u32;
+                }
+                n
+            })
             .sum();
 
         let pool_sizes = [
@@ -226,23 +388,8 @@ impl EntityRenderer {
         let mut mobs = HashMap::new();
 
         for def in defs {
-            let adult = create_mob_variant(
-                device,
-                queue,
-                command_pool,
-                allocator,
-                descriptor_pool,
-                texture_layout,
-                texture_sampler,
-                jar_assets_dir,
-                asset_index,
-                def.adult_model,
-                def.adult_tex_keys,
-                def.adult_tex_size,
-            );
-
-            let baby = match (def.baby_model, def.baby_tex_keys) {
-                (Some(model), Some(keys)) => Some(create_mob_variant(
+            let mut build = |v: VariantDef| {
+                build_variants(
                     device,
                     queue,
                     command_pool,
@@ -252,18 +399,34 @@ impl EntityRenderer {
                     texture_sampler,
                     jar_assets_dir,
                     asset_index,
-                    model,
-                    keys,
-                    def.baby_tex_size,
-                )),
-                _ => None,
+                    v,
+                )
             };
+            let adult_variants = build(def.adult);
+            let baby_variants = def.baby.map(&mut build);
+            let adult_overlays: Vec<MobVariant> = def
+                .adult_overlays
+                .into_iter()
+                .flat_map(&mut build)
+                .collect();
+            let baby_overlays: Vec<MobVariant> =
+                def.baby_overlays.into_iter().flat_map(&mut build).collect();
+
+            // Anim part-name indices are computed against the base variant's model and
+            // reused for each overlay draw. Catch mismatched part order at construction
+            // time rather than rendering wrong limbs in production.
+            assert_part_order_matches(&adult_variants, &adult_overlays);
+            if let Some(baby) = &baby_variants {
+                assert_part_order_matches(baby, &baby_overlays);
+            }
 
             mobs.insert(
                 def.kind,
                 MobEntry {
-                    adult,
-                    baby,
+                    adult_variants,
+                    baby_variants,
+                    adult_overlays,
+                    baby_overlays,
                     anim: def.anim,
                 },
             );
@@ -301,20 +464,7 @@ impl EntityRenderer {
             let Some(entry) = self.mobs.get(&info.entity_kind) else {
                 continue;
             };
-            let variant = entry.variant(info.is_baby);
-
-            let variant_ptr: *const MobVariant = variant;
-            if last_variant != variant_ptr {
-                cmd.bind_descriptor_sets(
-                    vk::PipelineBindPoint::Graphics,
-                    self.pipeline_layout,
-                    0,
-                    &[self.camera_sets[frame], variant.texture_set],
-                    &[],
-                );
-                cmd.bind_vertex_buffers(0, &[variant.vertex_buffer], &[0]);
-                last_variant = variant_ptr;
-            }
+            let variant = entry.base_variant(info.is_baby, info.variant_index);
 
             let entity_mat = glam::Mat4::from_translation(glam::Vec3::new(
                 info.x as f32,
@@ -322,13 +472,15 @@ impl EntityRenderer {
                 info.z as f32,
             )) * glam::Mat4::from_rotation_y((180.0f32 - info.yaw).to_radians());
 
-            let anim_rotations = match entry.anim {
+            let anim = match entry.anim {
                 AnimationType::Quadruped => entity_model::compute_quadruped_anim(
                     &variant.model,
                     info.pitch,
                     info.head_yaw - info.yaw,
                     info.walk_anim_pos,
                     info.walk_anim_speed,
+                    info.head_y_offset,
+                    info.head_x_rot_override,
                 ),
                 AnimationType::Humanoid => entity_model::compute_humanoid_anim(
                     &variant.model,
@@ -339,26 +491,74 @@ impl EntityRenderer {
                 ),
             };
 
-            let part_transforms = variant.model.compute_part_transforms(&anim_rotations);
+            self.draw_variant(
+                cmd,
+                frame,
+                variant,
+                entity_mat,
+                &anim,
+                WHITE_TINT,
+                &mut last_variant,
+            );
 
-            for (i, (start, count)) in variant.model.part_ranges.iter().enumerate() {
-                if *count == 0 {
+            for (slot, overlay) in entry.overlays(info.is_baby).iter().enumerate() {
+                let Some(tint) = info.overlay_tints[slot] else {
                     continue;
-                }
-
-                let part_mat = entity_mat * part_transforms[i];
-
-                let mat_array = part_mat.to_cols_array();
-                let mat_bytes: &[u8] = bytemuck::cast_slice(&mat_array);
-                cmd.push_constants(
-                    self.pipeline_layout,
-                    vk::ShaderStageFlags::Vertex,
-                    0,
-                    mat_bytes,
+                };
+                self.draw_variant(
+                    cmd,
+                    frame,
+                    overlay,
+                    entity_mat,
+                    &anim,
+                    tint,
+                    &mut last_variant,
                 );
-
-                cmd.draw(*count, 1, *start, 0);
             }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_variant(
+        &self,
+        cmd: vk::CommandBuffer,
+        frame: usize,
+        variant: &MobVariant,
+        entity_mat: glam::Mat4,
+        anim: &entity_model::PartAnim,
+        tint: [f32; 4],
+        last_variant: &mut *const MobVariant,
+    ) {
+        let ptr: *const MobVariant = variant;
+        if *last_variant != ptr {
+            cmd.bind_descriptor_sets(
+                vk::PipelineBindPoint::Graphics,
+                self.pipeline_layout,
+                0,
+                &[self.camera_sets[frame], variant.texture_set],
+                &[],
+            );
+            cmd.bind_vertex_buffers(0, &[variant.vertex_buffer], &[0]);
+            *last_variant = ptr;
+        }
+
+        let part_transforms = variant.model.compute_part_transforms(anim);
+        for (i, (start, count)) in variant.model.part_ranges.iter().enumerate() {
+            if *count == 0 {
+                continue;
+            }
+            let part_mat = entity_mat * part_transforms[i];
+            let mat_array = part_mat.to_cols_array();
+            let mut bytes = [0u8; 80];
+            bytes[..64].copy_from_slice(bytemuck::cast_slice(&mat_array));
+            bytes[64..].copy_from_slice(bytemuck::cast_slice(&tint));
+            cmd.push_constants(
+                self.pipeline_layout,
+                vk::ShaderStageFlags::Vertex,
+                0,
+                &bytes,
+            );
+            cmd.draw(*count, 1, *start, 0);
         }
     }
 
@@ -381,8 +581,12 @@ impl EntityRenderer {
         device.destroy_sampler(self.texture_sampler, None);
 
         for entry in self.mobs.values_mut() {
-            let variants: Vec<&mut MobVariant> = std::iter::once(&mut entry.adult)
-                .chain(entry.baby.iter_mut())
+            let variants: Vec<&mut MobVariant> = entry
+                .adult_variants
+                .iter_mut()
+                .chain(entry.baby_variants.iter_mut().flatten())
+                .chain(entry.adult_overlays.iter_mut())
+                .chain(entry.baby_overlays.iter_mut())
                 .collect();
             for v in variants {
                 device.destroy_buffer(v.vertex_buffer, None);
@@ -411,8 +615,32 @@ impl EntityRenderer {
     }
 }
 
+fn assert_part_order_matches(base: &[MobVariant], overlays: &[MobVariant]) {
+    let Some(base_first) = base.first() else {
+        return;
+    };
+    let base_names: Vec<&str> = base_first
+        .model
+        .parts
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    for overlay in overlays {
+        let overlay_names: Vec<&str> = overlay
+            .model
+            .parts
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(
+            base_names, overlay_names,
+            "overlay part order must match base; anim indices are shared across both"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn create_mob_variant(
+fn build_variants(
     device: &vk::Device,
     queue: vk::Queue,
     command_pool: vk::CommandPool,
@@ -422,65 +650,74 @@ fn create_mob_variant(
     texture_sampler: vk::Sampler,
     jar_assets_dir: &Path,
     asset_index: &Option<AssetIndex>,
-    model: BakedEntityModel,
-    tex_keys: &[&str],
-    fallback_tex_size: u32,
-) -> MobVariant {
-    let vert_bytes = bytemuck::cast_slice::<ChunkVertex, u8>(&model.vertices);
-    let (vertex_buffer, vertex_allocation) = util::create_mapped_buffer(
-        device,
-        allocator,
-        vert_bytes,
-        vk::BufferUsageFlags::VertexBuffer,
-        "entity_vertices",
-    );
-
-    let (texture_image, texture_view, texture_allocation) = load_entity_texture(
-        device,
-        queue,
-        command_pool,
-        allocator,
-        jar_assets_dir,
-        asset_index,
-        tex_keys,
-        fallback_tex_size,
-    );
-
-    let tex_alloc_info = vk::DescriptorSetAllocateInfo {
-        descriptor_pool,
-        descriptor_set_count: 1,
-        set_layouts: &texture_layout,
-        ..Default::default()
-    };
-    let mut texture_set = vk::DescriptorSet::null();
-    device
-        .allocate_descriptor_sets(&tex_alloc_info, slice::from_mut(&mut texture_set))
-        .expect("failed to allocate entity texture descriptor set");
-
-    let image_info = vk::DescriptorImageInfo {
-        sampler: texture_sampler,
-        image_view: texture_view,
-        image_layout: vk::ImageLayout::ShaderReadOnlyOptimal,
-    };
-    let tex_write = vk::WriteDescriptorSet {
-        dst_set: texture_set,
-        dst_binding: 0,
-        descriptor_type: vk::DescriptorType::CombinedImageSampler,
-        descriptor_count: 1,
-        image_info: &image_info,
-        ..Default::default()
-    };
-    device.update_descriptor_sets(&[tex_write], &[]);
-
-    MobVariant {
+    variant: VariantDef,
+) -> Vec<MobVariant> {
+    let VariantDef {
         model,
-        vertex_buffer,
-        vertex_allocation,
-        texture_image,
-        texture_view,
-        texture_allocation,
-        texture_set,
-    }
+        tex_variants,
+        tex_size,
+    } = variant;
+    let vert_bytes = bytemuck::cast_slice::<ChunkVertex, u8>(&model.vertices);
+
+    tex_variants
+        .iter()
+        .map(|tex_keys| {
+            let (vertex_buffer, vertex_allocation) = util::create_mapped_buffer(
+                device,
+                allocator,
+                vert_bytes,
+                vk::BufferUsageFlags::VertexBuffer,
+                "entity_vertices",
+            );
+
+            let (texture_image, texture_view, texture_allocation) = load_entity_texture(
+                device,
+                queue,
+                command_pool,
+                allocator,
+                jar_assets_dir,
+                asset_index,
+                tex_keys,
+                tex_size,
+            );
+
+            let tex_alloc_info = vk::DescriptorSetAllocateInfo {
+                descriptor_pool,
+                descriptor_set_count: 1,
+                set_layouts: &texture_layout,
+                ..Default::default()
+            };
+            let mut texture_set = vk::DescriptorSet::null();
+            device
+                .allocate_descriptor_sets(&tex_alloc_info, slice::from_mut(&mut texture_set))
+                .expect("failed to allocate entity texture descriptor set");
+
+            let image_info = vk::DescriptorImageInfo {
+                sampler: texture_sampler,
+                image_view: texture_view,
+                image_layout: vk::ImageLayout::ShaderReadOnlyOptimal,
+            };
+            let tex_write = vk::WriteDescriptorSet {
+                dst_set: texture_set,
+                dst_binding: 0,
+                descriptor_type: vk::DescriptorType::CombinedImageSampler,
+                descriptor_count: 1,
+                image_info: &image_info,
+                ..Default::default()
+            };
+            device.update_descriptor_sets(&[tex_write], &[]);
+
+            MobVariant {
+                model: model.clone(),
+                vertex_buffer,
+                vertex_allocation,
+                texture_image,
+                texture_view,
+                texture_allocation,
+                texture_set,
+            }
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -598,7 +835,7 @@ fn create_pipeline(
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo {
         depth_test_enable: vk::TRUE,
         depth_write_enable: vk::TRUE,
-        depth_compare_op: vk::CompareOp::Less,
+        depth_compare_op: vk::CompareOp::LessOrEqual,
         ..Default::default()
     };
 
