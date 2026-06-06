@@ -184,11 +184,9 @@ pub fn update_game(
 ) -> GameUpdateResult {
     // Position the audio listener at the player's head and push current
     // volumes before draining sound packets this frame.
-    let listener_pos = game.player.position;
-    core.audio.set_listener(
-        [listener_pos.x, listener_pos.y + 1.62, listener_pos.z],
-        game.player.yaw,
-    );
+    let listener_pos = game.player.eye_pos();
+    core.audio
+        .set_listener(listener_pos, game.player.look_dir.y_rot_deg());
     core.audio.set_volumes(core.menu.category_volumes());
 
     let disconnect_reason =
