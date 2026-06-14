@@ -479,10 +479,11 @@ pub fn update_game(
         core.input.clear_click_events();
     }
 
+    let mut player_preview = None;
     if game.inventory_open {
         let cursor = core.input.cursor_pos();
         let clicked = core.input.left_just_pressed();
-        close_inventory = crate::ui::inventory::build_inventory(
+        let result = crate::ui::inventory::build_inventory(
             &mut elements,
             sw,
             sh,
@@ -491,6 +492,8 @@ pub fn update_game(
             &game.player.inventory,
             gs,
         );
+        close_inventory = result.clicked_outside;
+        player_preview = Some(result.player_preview);
         core.input.clear_click_events();
     }
 
@@ -707,6 +710,7 @@ pub fn update_game(
         &block_entity_renders,
         &weather_columns,
         effective_rd,
+        player_preview,
     ) {
         tracing::error!("Render error: {e}");
     }
