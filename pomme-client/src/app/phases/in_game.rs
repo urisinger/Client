@@ -137,6 +137,11 @@ impl GameState {
         self.inventory_open || self.creative_inventory_open
     }
 
+    /// No menu (pause, inventory, chat) is capturing input.
+    pub fn input_live(&self) -> bool {
+        !self.paused && !self.gui_open() && !self.chat.is_open()
+    }
+
     pub fn sync_render_distance(&mut self, connection: &ConnectionHandle, render_distance: u32) {
         self.last_render_distance = render_distance;
         tracing::info!("Render distance changed to {render_distance}");
@@ -210,30 +215,23 @@ pub fn update_game(
         core.time_tick_accumulator -= TICK_RATE;
     }
 
-    if !game.paused && !game.gui_open() && !game.chat.is_open() {
+    if game.input_live() {
         gfx.renderer.update_camera(&mut core.input);
+    }
 
-        core.tick_accumulator += dt;
-        while core.tick_accumulator >= TICK_RATE {
-            core.tick_physics(&mut gfx.renderer, connection, game);
-            game.item_entity_store.tick(
-                |bx, by, bz| !game.chunk_store.get_block_state(bx, by, bz).is_air(),
-                |bx, by, bz| block_friction(game.chunk_store.get_block_state(bx, by, bz)),
-            );
-            game.block_entity_anim.tick();
-            core.tick_accumulator -= TICK_RATE;
-        }
+    // Menus never pause the simulation; tick_physics substitutes neutral input.
+    core.tick_accumulator += dt;
+    while core.tick_accumulator >= TICK_RATE {
+        core.tick_physics(&mut gfx.renderer, connection, game);
+        game.item_entity_store.tick(
+            |bx, by, bz| !game.chunk_store.get_block_state(bx, by, bz).is_air(),
+            |bx, by, bz| block_friction(game.chunk_store.get_block_state(bx, by, bz)),
+        );
+        game.block_entity_anim.tick();
+        core.tick_accumulator -= TICK_RATE;
     }
 
     let partial_tick = core.tick_accumulator / TICK_RATE;
-
-    if !game.paused && !game.gui_open() && !game.chat.is_open() {
-        game.interaction.update_target(
-            game.player.eye_pos(),
-            gfx.renderer.camera_look_dir(),
-            &game.chunk_store,
-        );
-    }
 
     let typed = core.input.drain_typed_chars();
     let backspace = core.input.backspace_pressed();
@@ -273,11 +271,7 @@ pub fn update_game(
     let gs = hud::gui_scale(sw, sh, core.menu.gui_scale_setting);
 
     let mut elements: Vec<MenuElement> = Vec::new();
-    let hide_cursor = !game.paused
-        && !game.dead
-        && !game.gui_open()
-        && !game.chat.is_open()
-        && core.input.is_cursor_captured();
+    let hide_cursor = game.input_live() && !game.dead && core.input.is_cursor_captured();
 
     let debug = if game.show_debug {
         Some(hud::DebugInfo {
@@ -546,6 +540,12 @@ pub fn update_game(
     game.chat.build(&mut elements, sw, sh, gs, &|t, s| {
         gfx.renderer.menu_text_width(t, s)
     });
+
+    // Chat consumes keys, not clicks; nothing else clears them while only chat
+    // is open, so drop them here to keep stray clicks out of the live sim.
+    if game.chat.is_open() {
+        core.input.clear_click_events();
+    }
 
     let swing_progress = game.interaction.get_swing_progress(partial_tick);
     let destroy_info = game.interaction.destroy_stage().map(|(pos, stage)| {
