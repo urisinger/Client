@@ -1,3 +1,4 @@
+mod friends_screen;
 mod helpers;
 mod main_screen;
 mod options;
@@ -11,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::core::DisplayMode;
 use crate::renderer::pipelines::menu_overlay::{
-    ICON_CHECK, ICON_CODE, ICON_COMMENT, ICON_GEAR, ICON_GLOBE, ICON_LINK, ICON_PAINTBRUSH,
-    ICON_USER, MenuElement, SpriteId,
+    ICON_CHECK, ICON_CODE, ICON_COMMENT, ICON_GEAR, ICON_GLOBE, ICON_LANGUAGE, ICON_LINK,
+    ICON_PAINTBRUSH, ICON_UNIVERSAL_ACCESS, ICON_USER, ICON_USERS, MenuElement, SpriteId,
 };
 
 #[derive(Serialize, Deserialize)]
@@ -135,6 +136,7 @@ use helpers::*;
 
 use super::common;
 use super::common::WHITE;
+use super::friends::{self, ActionError, FaceCache, FriendsData};
 use super::server_list::{
     PingResults, PingState, ServerEntry, ServerList, is_valid_address, ping_all_servers,
 };
@@ -143,6 +145,12 @@ use super::server_list::{
 pub enum PanoramaTheme {
     Pomme,
     Default,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FriendTab {
+    Friends,
+    Requests,
 }
 
 struct ThemeTransition {
@@ -212,6 +220,7 @@ const DOUBLE_CLICK_MS: u128 = 400;
 enum Screen {
     Main,
     ServerList,
+    Friends,
     ConfirmDelete(usize),
     DirectConnect,
     AddServer,
@@ -236,6 +245,7 @@ impl Screen {
     fn clone_screen(&self) -> Self {
         match self {
             Self::Main => Self::Main,
+            Self::Friends => Self::Friends,
             Self::Options => Self::Options,
             Self::OptionsOnline => Self::OptionsOnline,
             Self::OptionsVideo => Self::OptionsVideo,
@@ -259,6 +269,25 @@ impl Screen {
     }
 }
 
+/// Returns true once `count` has held steady for 500ms since it last changed —
+/// debounces favicon / friend-face atlas rebuilds.
+fn atlas_dirty(count: usize, last: &mut usize, since: &mut Option<Instant>) -> bool {
+    if count != *last {
+        *last = count;
+        *since = Some(Instant::now());
+        false
+    } else if let Some(t) = *since {
+        if t.elapsed().as_millis() >= 500 {
+            *since = None;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}
+
 pub struct MainMenu {
     username: String,
     screen: Screen,
@@ -268,9 +297,21 @@ pub struct MainMenu {
     edit_address: String,
     last_mp_ip: String,
     ping_results: PingResults,
+    access_token: Option<String>,
+    friends_data: FriendsData,
+    face_cache: FaceCache,
+    last_face_count: usize,
+    face_dirty_since: Option<Instant>,
+    friend_tab: FriendTab,
+    add_friend_name: String,
+    action_error: ActionError,
+    pending_remove: Option<(String, String)>,
     rt: Arc<tokio::runtime::Runtime>,
     links_open: bool,
     theme_open: bool,
+    /// Return target for Language/Accessibility, which open from both the
+    /// title-screen icon row and the Options grid.
+    settings_back: Screen,
     theme: PanoramaTheme,
     transition: Option<ThemeTransition>,
     scroll_offset: f32,
@@ -325,7 +366,12 @@ pub struct MainMenu {
 }
 
 impl MainMenu {
-    pub fn new(game_dir: &Path, rt: Arc<tokio::runtime::Runtime>, username: String) -> Self {
+    pub fn new(
+        game_dir: &Path,
+        rt: Arc<tokio::runtime::Runtime>,
+        username: String,
+        access_token: Option<String>,
+    ) -> Self {
         let server_list = ServerList::load(game_dir);
         let ping_results: PingResults = Default::default();
         ping_all_servers(&rt, &server_list.servers, &ping_results);
@@ -339,9 +385,19 @@ impl MainMenu {
             edit_address: String::new(),
             last_mp_ip: String::new(),
             ping_results,
+            access_token,
+            friends_data: Default::default(),
+            face_cache: Default::default(),
+            last_face_count: 0,
+            face_dirty_since: None,
+            friend_tab: FriendTab::Friends,
+            add_friend_name: String::new(),
+            action_error: Default::default(),
+            pending_remove: None,
             rt,
             links_open: false,
             theme_open: false,
+            settings_back: Screen::Options,
             theme: PanoramaTheme::Pomme,
             transition: None,
             scroll_offset: 0.0,
@@ -403,6 +459,12 @@ impl MainMenu {
         self.last_field_click = None;
         self.field_undo_stack.clear();
         self.cursor_blink = Instant::now();
+        // Favicons and friend faces share one GPU atlas; force a rebuild on
+        // screen change so the correct set loads for the screen we're entering.
+        self.last_favicon_count = usize::MAX;
+        self.favicon_dirty_since = None;
+        self.last_face_count = usize::MAX;
+        self.face_dirty_since = None;
     }
 
     /// Per-category volumes in `SoundCategory` order
@@ -462,6 +524,17 @@ impl MainMenu {
         self.set_screen(Screen::Options);
     }
 
+    /// Open the friends screen and kick off a fetch (no-op without a token).
+    fn open_friends(&mut self) {
+        self.set_screen(Screen::Friends);
+        self.scroll_offset = 0.0;
+        self.friend_tab = FriendTab::Friends;
+        self.add_friend_name.clear();
+        self.pending_remove = None;
+        *self.action_error.write() = None;
+        self.refresh_friends_now();
+    }
+
     pub fn is_options_screen(&self) -> bool {
         matches!(
             self.screen,
@@ -495,9 +568,14 @@ impl MainMenu {
         matches!(self.screen, Screen::ServerList)
     }
 
+    pub fn is_friends_screen(&self) -> bool {
+        matches!(self.screen, Screen::Friends)
+    }
+
     pub fn favicons_changed(&mut self) -> bool {
-        let results = self.ping_results.read();
-        let count = results
+        let count = self
+            .ping_results
+            .read()
             .values()
             .filter(|s| {
                 matches!(
@@ -509,20 +587,11 @@ impl MainMenu {
                 )
             })
             .count();
-        if count != self.last_favicon_count {
-            self.last_favicon_count = count;
-            self.favicon_dirty_since = Some(Instant::now());
-            false
-        } else if let Some(since) = self.favicon_dirty_since {
-            if since.elapsed().as_millis() >= 500 {
-                self.favicon_dirty_since = None;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        }
+        atlas_dirty(
+            count,
+            &mut self.last_favicon_count,
+            &mut self.favicon_dirty_since,
+        )
     }
 
     pub fn collect_favicons(&self) -> Vec<(String, Vec<u8>, u32)> {
@@ -544,6 +613,19 @@ impl MainMenu {
             .collect()
     }
 
+    pub fn faces_changed(&mut self) -> bool {
+        let count = self.face_cache.read().len();
+        atlas_dirty(count, &mut self.last_face_count, &mut self.face_dirty_since)
+    }
+
+    pub fn collect_faces(&self) -> Vec<(String, Vec<u8>, u32)> {
+        self.face_cache
+            .read()
+            .iter()
+            .map(|(uuid, rgba)| (uuid.clone(), rgba.clone(), 8))
+            .collect()
+    }
+
     pub fn show_disconnect(&mut self, reason: String) {
         self.set_screen(Screen::Disconnected(reason));
     }
@@ -559,6 +641,7 @@ impl MainMenu {
             Screen::Main => self.build_main(screen_w, screen_h, input, text_width_fn),
 
             Screen::ServerList => self.build_server_list(screen_w, screen_h, input, &text_width_fn),
+            Screen::Friends => self.build_friends(screen_w, screen_h, input, &text_width_fn),
             Screen::ConfirmDelete(_) => {
                 self.build_confirm_delete(screen_w, screen_h, input, &text_width_fn)
             }
@@ -585,7 +668,8 @@ impl MainMenu {
                 Screen::OptionsControls,
             ),
             Screen::OptionsLanguage => {
-                self.build_options_stub(screen_w, screen_h, input, "Language", Screen::Options)
+                let back = self.settings_back.clone_screen();
+                self.build_options_stub(screen_w, screen_h, input, "Language", back)
             }
             Screen::OptionsChatSettings => self.build_options_chat(screen_w, screen_h, input),
             Screen::OptionsResourcePacks => {
