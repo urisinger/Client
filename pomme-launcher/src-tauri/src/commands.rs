@@ -370,7 +370,11 @@ pub async fn launch_game(
     override_version: Option<String>,
     debug_enabled: Option<bool>,
 ) -> Result<String, String> {
-    let exe = find_client_binary()?;
+    // Prefer a local dev build (target/); otherwise download the latest release.
+    let exe = match find_client_binary() {
+        Ok(local) => local,
+        Err(_) => crate::client_updater::ensure_client(&app).await?,
+    };
     let account = uuid.as_deref().and_then(crate::auth::try_restore);
     let username = account
         .as_ref()
@@ -391,6 +395,17 @@ pub async fn launch_game(
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+
+    // macOS releases bundle MoltenVK next to the client; point the Vulkan loader
+    // at the bundled ICD. Absent for local dev builds, which use system Vulkan.
+    #[cfg(target_os = "macos")]
+    if let Some(icd) = exe
+        .parent()
+        .map(|d| d.join("MoltenVK_icd.json"))
+        .filter(|p| p.exists())
+    {
+        cmd.env("VK_ICD_FILENAMES", &icd);
+    }
 
     if debug_enabled.unwrap_or(false) {
         cmd.env("RUST_LOG", "debug");
