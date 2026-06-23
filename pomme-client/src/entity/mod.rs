@@ -24,6 +24,7 @@ pub struct LivingEntity {
     pub body_y_rot_deg: f32,
     pub prev_body_y_rot_deg: f32,
     pub entity_type: EntityKind,
+    pub player_uuid: Option<uuid::Uuid>,
     pub walk_anim_pos: f32,
     pub walk_anim_speed: f32,
     pub prev_walk_anim_speed: f32,
@@ -61,6 +62,7 @@ impl LivingEntity {
         look_dir: LookDirection,
         head_y_rot_deg: f32,
         body_y_rot_deg: f32,
+        player_uuid: Option<uuid::Uuid>,
     ) -> Self {
         Self {
             position,
@@ -72,6 +74,7 @@ impl LivingEntity {
             body_y_rot_deg,
             prev_body_y_rot_deg: body_y_rot_deg,
             entity_type,
+            player_uuid,
             walk_anim_pos: 0.0,
             walk_anim_speed: 0.0,
             prev_walk_anim_speed: 0.0,
@@ -391,7 +394,7 @@ impl EntityStore {
         position: Position,
         look_dir: LookDirection,
         body_y_rot_deg: f32,
-        head_y_rot_deg: f32,
+        player_uuid: Option<uuid::Uuid>,
     ) {
         self.living.insert(
             id,
@@ -399,8 +402,9 @@ impl EntityStore {
                 entity_type,
                 position,
                 look_dir,
-                head_y_rot_deg,
+                look_dir.y_rot_deg(),
                 body_y_rot_deg,
+                player_uuid,
             ),
         );
     }
@@ -508,8 +512,14 @@ impl EntityStore {
         }
     }
 
-    pub fn remove_living(&mut self, id: i32) {
-        self.living.remove(&id);
+    pub fn remove_living(&mut self, id: i32) -> Option<LivingEntity> {
+        self.living.remove(&id)
+    }
+
+    pub fn has_player_uuid(&self, uuid: &uuid::Uuid) -> bool {
+        self.living
+            .values()
+            .any(|entity| entity.player_uuid == Some(*uuid))
     }
 
     pub fn tick_living(&mut self) {

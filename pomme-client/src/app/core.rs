@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ops::Add;
 use std::sync::Arc;
 use std::time::Instant;
@@ -35,6 +36,12 @@ pub struct PendingPackDownload {
 }
 
 pub type PackDownloadResult = Result<std::path::PathBuf, crate::resource_pack::PackError>;
+
+struct PlayerSkinResult {
+    uuid: uuid::Uuid,
+    textures: Option<String>,
+    result: Result<(Vec<u8>, u32, u32), String>,
+}
 
 /// Queues `pos` and its already-loaded mesh neighborhood (de-duplicated): when
 /// `pos` changes, every chunk whose mesh samples it must re-mesh too, else
@@ -124,6 +131,9 @@ pub struct AppCore {
     pub audio: crate::audio::AudioEngine,
     pub tick_accumulator: f32,
     pub time_tick_accumulator: f32,
+    player_skin_tx: crossbeam_channel::Sender<PlayerSkinResult>,
+    player_skin_rx: crossbeam_channel::Receiver<PlayerSkinResult>,
+    requested_player_skins: HashMap<uuid::Uuid, Option<String>>,
 }
 
 impl AppCore {
@@ -151,6 +161,7 @@ impl AppCore {
             asset_index.clone(),
             menu.category_volumes(),
         );
+        let (player_skin_tx, player_skin_rx) = crossbeam_channel::unbounded();
 
         Self {
             user,
@@ -167,6 +178,9 @@ impl AppCore {
             audio,
             tick_accumulator: 0.0,
             time_tick_accumulator: 0.0,
+            player_skin_tx,
+            player_skin_rx,
+            requested_player_skins: HashMap::new(),
         }
     }
 
@@ -245,6 +259,50 @@ impl AppCore {
         let _ = connection.chat_tx.try_send(msg);
     }
 
+    fn queue_player_skin(&mut self, uuid: uuid::Uuid, textures: Option<String>) {
+        if self.requested_player_skins.get(&uuid) == Some(&textures) {
+            return;
+        }
+        self.requested_player_skins.insert(uuid, textures.clone());
+
+        let tx = self.player_skin_tx.clone();
+        let requested_textures = textures.clone();
+        self.tokio_rt.spawn(async move {
+            let result = if let Some(textures) = textures {
+                crate::renderer::fetch_skin_texture_from_profile_property(&textures).await
+            } else {
+                let uuid_str = uuid.to_string().replace('-', "");
+                crate::renderer::fetch_skin_texture(&uuid_str).await
+            };
+            let _ = tx.send(PlayerSkinResult {
+                uuid,
+                textures: requested_textures,
+                result,
+            });
+        });
+    }
+
+    fn drain_player_skin_results(&mut self, renderer: &mut Renderer) {
+        while let Ok(skin) = self.player_skin_rx.try_recv() {
+            if self.requested_player_skins.get(&skin.uuid) != Some(&skin.textures) {
+                continue;
+            }
+            match skin.result {
+                Ok((pixels, width, height)) => {
+                    renderer.update_player_entity_skin(&skin.uuid, &pixels, width, height);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load entity player skin for {}: {e}", skin.uuid)
+                }
+            }
+        }
+    }
+
+    fn remove_player_skin(&mut self, renderer: &mut Renderer, uuid: &uuid::Uuid) {
+        self.requested_player_skins.remove(uuid);
+        renderer.remove_player_entity_skin(uuid);
+    }
+
     pub fn drain_network_events(
         &mut self,
         connection: &ConnectionHandle,
@@ -261,6 +319,7 @@ impl AppCore {
         let mut priority_remesh: Vec<(azalea_core::position::ChunkPos, i32)> = Vec::new();
         let mut disconnect_reason: Option<String> = None;
         let mut processed = 0u32;
+        self.drain_player_skin_results(renderer);
 
         while let Ok(event) = rx.try_recv() {
             processed += 1;
@@ -625,6 +684,7 @@ impl AppCore {
                 }
                 NetworkEvent::EntitySpawned {
                     id,
+                    uuid,
                     entity_type,
                     position,
                     y_rot_deg,
@@ -632,14 +692,25 @@ impl AppCore {
                     head_y_rot_deg,
                 } => {
                     if crate::entity::is_living_mob(&entity_type) {
+                        let player_uuid = (entity_type
+                            == azalea_registry::builtin::EntityKind::Player)
+                            .then_some(uuid);
                         game.entity_store.spawn_living(
                             id,
                             entity_type,
                             position,
                             LookDirection::new(head_y_rot_deg, x_rot_deg),
                             y_rot_deg,
-                            head_y_rot_deg,
+                            player_uuid,
                         );
+                        if let Some(uuid) = player_uuid {
+                            let textures = game
+                                .tab_list
+                                .players
+                                .get(&uuid)
+                                .and_then(|p| p.textures.clone());
+                            self.queue_player_skin(uuid, textures);
+                        }
                     }
                     if entity_type == azalea_registry::builtin::EntityKind::Item {
                         game.item_entity_store.spawn_item(id, position);
@@ -675,7 +746,12 @@ impl AppCore {
                 }
                 NetworkEvent::EntitiesRemoved { ids } => {
                     for id in &ids {
-                        game.entity_store.remove_living(*id);
+                        if let Some(entity) = game.entity_store.remove_living(*id)
+                            && let Some(uuid) = entity.player_uuid
+                            && !game.entity_store.has_player_uuid(&uuid)
+                        {
+                            self.remove_player_skin(renderer, &uuid);
+                        }
                     }
                     game.item_entity_store.remove(&ids);
                 }
@@ -812,11 +888,27 @@ impl AppCore {
                     tracing::warn!("Disconnected: {reason}");
                     disconnect_reason = Some(reason);
                     game.tab_list.clear();
+                    self.requested_player_skins.clear();
+                    renderer.clear_player_entity_skins();
                 }
                 NetworkEvent::PlayerInfoUpdate { actions, entries } => {
+                    if actions.add_player {
+                        for entry in &entries {
+                            self.queue_player_skin(entry.uuid, entry.textures.clone());
+                        }
+                    } else {
+                        for entry in entries.iter().filter(|e| e.textures.is_some()) {
+                            self.queue_player_skin(entry.uuid, entry.textures.clone());
+                        }
+                    }
                     game.tab_list.apply_update(&actions, &entries);
                 }
                 NetworkEvent::PlayerInfoRemove { uuids } => {
+                    for uuid in &uuids {
+                        if !game.entity_store.has_player_uuid(uuid) {
+                            self.remove_player_skin(renderer, uuid);
+                        }
+                    }
                     game.tab_list.remove(&uuids);
                 }
                 NetworkEvent::TabListHeaderFooter { header, footer } => {
