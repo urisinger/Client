@@ -30,7 +30,7 @@ pub fn partial_shape(state: BlockState) -> Option<&'static [LocalBox]> {
 }
 
 fn compute_shape(state: BlockState) -> Option<Vec<LocalBox>> {
-    let block: Box<dyn azalea_block::BlockTrait> = state.into();
+    let block = state.to_trait();
     let id = block.id();
     let props = block.property_map();
 

@@ -33,7 +33,7 @@ static BLOCK_SOUNDS: LazyLock<HashMap<String, (String, String, f32, f32)>> = Laz
 /// vanilla `SoundType.STONE` default. An empty event field means that action is
 /// silent for the block.
 pub fn block_sounds(state: BlockState) -> BlockSounds {
-    let block: Box<dyn BlockTrait> = state.into();
+    let block = state.to_trait();
     let id = block.id();
     let key = id.strip_prefix("minecraft:").unwrap_or(id);
 

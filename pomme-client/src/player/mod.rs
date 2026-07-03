@@ -28,7 +28,7 @@ fn is_water_block(state: azalea_block::BlockState) -> bool {
     if state.is_air() {
         return false;
     }
-    let block: Box<dyn azalea_block::BlockTrait> = state.into();
+    let block = state.to_trait();
     let id = block.id();
     if id == "water" || id == "bubble_column" {
         return true;

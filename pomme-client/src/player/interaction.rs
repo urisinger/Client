@@ -707,7 +707,7 @@ fn destroy_progress(state: BlockState, on_ground: bool, creative: bool) -> f32 {
         return 1.0;
     }
     use azalea_block::BlockTrait;
-    let behavior = Box::<dyn BlockTrait>::from(state).behavior();
+    let behavior = state.to_trait().behavior();
     let hardness = behavior.destroy_time;
 
     if hardness < 0.0 {

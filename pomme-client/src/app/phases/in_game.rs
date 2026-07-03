@@ -862,7 +862,7 @@ pub fn update_game(
                 let state =
                     game.chunk_store
                         .get_block_state(t.block_pos.x, t.block_pos.y, t.block_pos.z);
-                let block: Box<dyn azalea_block::BlockTrait> = state.into();
+                let block = state.to_trait();
                 Some((t.block_pos, t.face, block.id().to_string()))
             }),
             chunk_count: gfx.renderer.loaded_chunk_count(),
@@ -1424,7 +1424,7 @@ pub fn update_game(
             .iter()
             .map(|(pos, be)| {
                 let state = game.chunk_store.get_block_state(pos.x, pos.y, pos.z);
-                let block: Box<dyn azalea_block::BlockTrait> = state.into();
+                let block = state.to_trait();
                 let props = block.property_map();
                 let variant = crate::renderer::pipelines::block_entity::variant_for_block(
                     be.kind,

@@ -145,12 +145,12 @@ impl BlockRegistry {
     }
 
     pub fn get_textures(&self, state: BlockState) -> Option<&FaceTextures> {
-        let block: Box<dyn azalea_block::BlockTrait> = state.into();
+        let block = state.to_trait();
         self.textures.get(block.id())
     }
 
     pub fn get_baked_model(&self, state: BlockState) -> Option<&BakedModel> {
-        let block: Box<dyn azalea_block::BlockTrait> = state.into();
+        let block = state.to_trait();
         let variants = self.baked.get(block.id())?;
 
         if variants.len() == 1 {
@@ -171,7 +171,7 @@ impl BlockRegistry {
     }
 
     pub fn get_multipart_quads(&self, state: BlockState) -> Option<Vec<&model::BakedQuad>> {
-        let block: Box<dyn azalea_block::BlockTrait> = state.into();
+        let block = state.to_trait();
         let entries = self.multipart.get(block.id())?;
         let props = block.property_map();
 
@@ -243,7 +243,7 @@ impl BlockRegistry {
 fn build_placeable_blocks() -> HashMap<String, BlockState> {
     let mut seen: HashMap<String, Option<BlockState>> = HashMap::new();
     for state in (0u32..).map_while(|id| BlockState::try_from(id).ok()) {
-        let block: Box<dyn azalea_block::BlockTrait> = state.into();
+        let block = state.to_trait();
         seen.entry(block.id().to_string())
             .and_modify(|v| *v = None)
             .or_insert(Some(state));
