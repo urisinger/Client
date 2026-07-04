@@ -20,7 +20,7 @@ pub use camera::CloudMode;
 use camera::{Camera, CameraUniform};
 use chunk::atlas::TextureAtlas;
 use chunk::buffer::ChunkBufferStore;
-use chunk::mesher::{ChunkMeshData, MeshDispatcher};
+use chunk::mesher::{ MeshDispatcher};
 use context::VulkanContext;
 use glam::dvec3;
 use pipelines::block_entity::BlockEntityPipeline;

@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use azalea_core::position::ChunkPos;
+use azalea_core::position::{ChunkPos, ChunkSectionPos};
 use azalea_protocol::packets::game::{ServerboundClientInformation, ServerboundGamePacket};
 use azalea_registry::builtin::EntityKind;
 use glam::FloatExt as _;
@@ -108,25 +108,25 @@ pub struct GameState {
     /// load). This is the dirty marker: a column needs (re)meshing whenever its
     /// `content_gen` outruns what was last enqueued, regardless of visibility,
     /// so an edit to a deferred/hidden column can never be lost.
-    pub content_gen: HashMap<ChunkPos, u64>,
+    pub content_gen: HashMap<ChunkSectionPos, u64>,
     /// What was most recently meshed for each column: the LOD, the column
     /// `content_gen`, and the bitmask of section indices already meshed. The
     /// re-scan meshes only sections newly made visible (or re-meshes all on a
     /// lod/content change), so hidden sections never mesh.
-    pub meshed: HashMap<ChunkPos, MeshedCol>,
+    pub meshed: HashMap<ChunkSectionPos, MeshedSection>,
     /// Per-column bitmask of currently-visible section indices (bit `si` set =
     /// section is in-frustum and not occluded). Computed in
     /// `update_visibility`.
-    pub vis_mask: HashMap<ChunkPos, u32>,
+    pub vis: HashSet<ChunkSectionPos>,
     /// Per-section generation for edits only (bulk uses the column
     /// `content_gen` above). Bumped per edited section so a result is
     /// dropped only when *that* section was edited again — editing one
     /// section never invalidates a sibling section's in-flight result.
-    pub section_gen: HashMap<(ChunkPos, i32), u64>,
+    pub section_gen: HashMap<ChunkSectionPos, u64>,
     pub next_section_gen: u64,
     /// Per-section cave-cull visibility (vanilla `VisibilitySet`), keyed like
     /// `section_gen`. Fed by mesh results; consumed by the occlusion walk.
-    pub section_vis: HashMap<(ChunkPos, i32), VisibilitySet>,
+    pub section_vis: HashMap<ChunkSectionPos, VisibilitySet>,
     /// Highest upload epoch each `section_vis` entry was set from; mirrors the
     /// buffer's per-section geometry gate so a stale bulk can't re-stale an
     /// edited section's visibility.
@@ -141,7 +141,7 @@ pub struct GameState {
     pub last_vis_cam: (i32, i32, i32),
     /// In-flight async occlusion walk; its result is applied a few frames
     /// later.
-    pub vis_task: Option<crossbeam_channel::Receiver<HashMap<ChunkPos, u32>>>,
+    pub vis_task: Option<crossbeam_channel::Receiver<HashSet<ChunkSectionPos>>>,
     /// Runtime toggle for graph-driven chunk occlusion culling (F3+O). When
     /// off, only frustum culling applies (full masks pushed to the
     /// renderer).
@@ -151,10 +151,9 @@ pub struct GameState {
 /// What a column was last meshed as: LOD, content generation, and the set of
 /// section indices (bitmask) that have been meshed so far.
 #[derive(Clone, Copy)]
-pub struct MeshedCol {
+pub struct MeshedSection {
     pub lod: u32,
     pub content_gen: u64,
-    pub mask: u32,
 }
 
 impl GameState {
@@ -220,7 +219,7 @@ impl GameState {
             chunk_load_upload: None,
             content_gen: HashMap::new(),
             meshed: HashMap::new(),
-            vis_mask: HashMap::new(),
+            vis: HashSet::new(),
             section_gen: HashMap::new(),
             next_section_gen: 0,
             section_vis: HashMap::new(),
@@ -288,7 +287,7 @@ impl GameState {
     /// new value. Any in-flight mesh built from an older generation is
     /// dropped on arrival, so a deferred column always remeshes with the
     /// latest blocks.
-    pub fn bump_content_gen(&mut self, pos: ChunkPos) -> u64 {
+    pub fn bump_content_gen(&mut self, pos: ChunkSectionPos) -> u64 {
         let g = self.content_gen.entry(pos).or_insert(0);
         *g += 1;
         *g
@@ -297,12 +296,12 @@ impl GameState {
     /// Mesh a single edited section now on the priority lane, ungated by
     /// visibility. Bumps that section's generation so the result is dropped
     /// only if the same section is edited again before it lands.
-    pub fn enqueue_section_edit(&mut self, col: ChunkPos, si: i32, lod: u32) {
+    pub fn enqueue_section_edit(&mut self, pos: ChunkSectionPos, lod: u32) {
         self.next_section_gen += 1;
         let g = self.next_section_gen;
-        self.section_gen.insert((col, si), g);
+        self.section_gen.insert(pos, g);
         self.mesh_dispatcher
-            .enqueue(&self.chunk_store, col, lod, true, g, si..si + 1);
+            .enqueue_section(&self.chunk_store, pos, lod, true, g);
     }
 
     /// Drive the cave-cull occlusion walk: apply a finished async walk to the
@@ -313,7 +312,7 @@ impl GameState {
     pub fn update_visibility(
         &mut self,
         renderer: &mut Renderer,
-        player_chunk: ChunkPos,
+        player_chunk: ChunkSectionPos,
         loads_happened: bool,
     ) {
         // Before the camera is placed the frustum is meaningless, so trust
@@ -348,8 +347,8 @@ impl GameState {
             self.last_vis_cam = cam_bucket;
             let section_vis = self.section_vis.clone();
             let min_y = self.chunk_store.min_y();
-            let n = self.chunk_store.section_count();
-            let cam_si = ((eye.y - min_y as f64) / 16.0).floor() as i32;
+
+            let height = self.chunk_store.height() as i32;
             // Bound the walk by the actual loaded radius (a server can stream
             // terrain past the client render distance).
             let rd = self
@@ -368,10 +367,9 @@ impl GameState {
                 let bfs = occlusion_graph::compute_visible_mask(
                     &section_vis,
                     player_chunk,
-                    cam_si,
                     eye,
                     min_y,
-                    n,
+                    height,
                     rd,
                 );
                 let _ = tx.send(bfs);
@@ -383,7 +381,7 @@ impl GameState {
     /// Combine a finished walk with the current camera frustum into per-column
     /// draw masks (occluded sections omitted) and tiers, and push them to the
     /// GPU cull.
-    fn apply_visibility(&mut self, renderer: &mut Renderer, bfs: &HashMap<ChunkPos, u32>) {
+    fn apply_visibility(&mut self, renderer: &mut Renderer, bfs: &HashSet<ChunkSectionPos>) {
         let planes = renderer.frustum_planes();
         let planes_wide = renderer.frustum_planes_dilated(VIS_MARGIN_RADIANS);
         let eye_f = renderer.camera_render_position().as_vec3();
@@ -392,7 +390,7 @@ impl GameState {
         let full = section_mask(self.chunk_store.section_count());
 
         let mut tiers = HashMap::new();
-        let mut masks = HashMap::new();
+        let mut masks = HashSet::new();
         for pos in self.chunk_store.loaded_positions() {
             let near = column_is_near(pos, eye_f);
             let tier = if near {
@@ -413,7 +411,7 @@ impl GameState {
             masks.insert(pos, mask);
         }
         self.vis_tiers = tiers;
-        self.vis_mask = masks.clone();
+        self.vis = masks.clone();
         self.vis_valid = true;
 
         // With occlusion off, push full masks (frustum still applies on the GPU).

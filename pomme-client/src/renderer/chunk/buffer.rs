@@ -5,7 +5,7 @@ use azalea_core::position::ChunkPos;
 use pomme_gpu_allocator::vulkan::{Allocation, Allocator};
 use pyronyx::vk;
 
-use super::mesher::{ChunkMeshData, ChunkVertex, SectionMesh};
+use super::mesher::{SectionMeshData, ChunkVertex};
 use crate::renderer::{MAX_FRAMES_IN_FLIGHT, shader, util};
 
 const BUCKET_VERTICES: u32 = 32768;
