@@ -530,7 +530,7 @@ dependencies = [
 [[package]]
 name = "azalea-auth"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/urisinger/azalea-graphics.git?branch=block-table#42a792088874d2d873ad029ca0557f53fd17990c"
+source = "git+https://github.com/urisinger/azalea-graphics.git?branch=pomme#7df11bd6517d405a582570e812ad4e151ce1c58f"
 dependencies = [
  "azalea-buf",
  "azalea-crypto",
@@ -550,7 +550,7 @@ dependencies = [
 [[package]]
 name = "azalea-block"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/urisinger/azalea-graphics.git?branch=block-table#42a792088874d2d873ad029ca0557f53fd17990c"
+source = "git+https://github.com/urisinger/azalea-graphics.git?branch=pomme#7df11bd6517d405a582570e812ad4e151ce1c58f"
 dependencies = [
  "azalea-block-macros",
  "azalea-buf",
@@ -560,7 +560,7 @@ dependencies = [
 [[package]]
 name = "azalea-block-macros"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/urisinger/azalea-graphics.git?branch=block-table#42a792088874d2d873ad029ca0557f53fd17990c"
+source = "git+https://github.com/urisinger/azalea-graphics.git?branch=pomme#7df11bd6517d405a582570e812ad4e151ce1c58f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -570,7 +570,7 @@ dependencies = [
 [[package]]
 name = "azalea-brigadier"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/urisinger/azalea-graphics.git?branch=block-table#42a792088874d2d873ad029ca0557f53fd17990c"
+source = "git+https://github.com/urisinger/azalea-graphics.git?branch=pomme#7df11bd6517d405a582570e812ad4e151ce1c58f"
 dependencies = [
  "azalea-buf",
  "azalea-chat",
@@ -580,7 +580,7 @@ dependencies = [
 [[package]]
 name = "azalea-buf"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/urisinger/azalea-graphics.git?branch=block-table#42a792088874d2d873ad029ca0557f53fd17990c"
+source = "git+https://github.com/urisinger/azalea-graphics.git?branch=pomme#7df11bd6517d405a582570e812ad4e151ce1c58f"
 dependencies = [
  "azalea-buf-macros",
  "byteorder",
@@ -595,7 +595,7 @@ dependencies = [
 [[package]]
 name = "azalea-buf-macros"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/urisinger/azalea-graphics.git?branch=block-table#42a792088874d2d873ad029ca0557f53fd17990c"
+source = "git+https://github.com/urisinger/azalea-graphics.git?branch=pomme#7df11bd6517d405a582570e812ad4e151ce1c58f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -605,7 +605,7 @@ dependencies = [
 [[package]]
 name = "azalea-chat"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/urisinger/azalea-graphics.git?branch=block-table#42a792088874d2d873ad029ca0557f53fd17990c"
+source = "git+https://github.com/urisinger/azalea-graphics.git?branch=pomme#7df11bd6517d405a582570e812ad4e151ce1c58f"
 dependencies = [
  "azalea-buf",
  "azalea-language",
@@ -619,7 +619,7 @@ dependencies = [
 [[package]]
 name = "azalea-core"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/urisinger/azalea-graphics.git?branch=block-table#42a792088874d2d873ad029ca0557f53fd17990c"
+source = "git+https://github.com/urisinger/azalea-graphics.git?branch=pomme#7df11bd6517d405a582570e812ad4e151ce1c58f"
 dependencies = [
  "azalea-buf",
  "azalea-chat",
@@ -640,7 +640,7 @@ dependencies = [
 [[package]]
 name = "azalea-crypto"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/urisinger/azalea-graphics.git?branch=block-table#42a792088874d2d873ad029ca0557f53fd17990c"
+source = "git+https://github.com/urisinger/azalea-graphics.git?branch=pomme#7df11bd6517d405a582570e812ad4e151ce1c58f"
 dependencies = [
  "aes",
  "azalea-buf",
@@ -659,7 +659,7 @@ dependencies = [
 [[package]]
 name = "azalea-entity"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/urisinger/azalea-graphics.git?branch=block-table#42a792088874d2d873ad029ca0557f53fd17990c"
+source = "git+https://github.com/urisinger/azalea-graphics.git?branch=pomme#7df11bd6517d405a582570e812ad4e151ce1c58f"
 dependencies = [
  "azalea-block",
  "azalea-buf",
@@ -679,7 +679,7 @@ dependencies = [
 [[package]]
 name = "azalea-inventory"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/urisinger/azalea-graphics.git?branch=block-table#42a792088874d2d873ad029ca0557f53fd17990c"
+source = "git+https://github.com/urisinger/azalea-graphics.git?branch=pomme#7df11bd6517d405a582570e812ad4e151ce1c58f"
 dependencies = [
  "azalea-auth",
  "azalea-buf",
@@ -697,7 +697,7 @@ dependencies = [
 [[package]]
 name = "azalea-inventory-macros"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/urisinger/azalea-graphics.git?branch=block-table#42a792088874d2d873ad029ca0557f53fd17990c"
+source = "git+https://github.com/urisinger/azalea-graphics.git?branch=pomme#7df11bd6517d405a582570e812ad4e151ce1c58f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -707,7 +707,7 @@ dependencies = [
 [[package]]
 name = "azalea-language"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/urisinger/azalea-graphics.git?branch=block-table#42a792088874d2d873ad029ca0557f53fd17990c"
+source = "git+https://github.com/urisinger/azalea-graphics.git?branch=pomme#7df11bd6517d405a582570e812ad4e151ce1c58f"
 dependencies = [
  "compact_str",
  "serde_json",
@@ -716,7 +716,7 @@ dependencies = [
 [[package]]
 name = "azalea-protocol"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/urisinger/azalea-graphics.git?branch=block-table#42a792088874d2d873ad029ca0557f53fd17990c"
+source = "git+https://github.com/urisinger/azalea-graphics.git?branch=pomme#7df11bd6517d405a582570e812ad4e151ce1c58f"
 dependencies = [
  "azalea-auth",
  "azalea-block",
@@ -749,7 +749,7 @@ dependencies = [
 [[package]]
 name = "azalea-protocol-macros"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/urisinger/azalea-graphics.git?branch=block-table#42a792088874d2d873ad029ca0557f53fd17990c"
+source = "git+https://github.com/urisinger/azalea-graphics.git?branch=pomme#7df11bd6517d405a582570e812ad4e151ce1c58f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -759,7 +759,7 @@ dependencies = [
 [[package]]
 name = "azalea-registry"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/urisinger/azalea-graphics.git?branch=block-table#42a792088874d2d873ad029ca0557f53fd17990c"
+source = "git+https://github.com/urisinger/azalea-graphics.git?branch=pomme#7df11bd6517d405a582570e812ad4e151ce1c58f"
 dependencies = [
  "azalea-buf",
  "azalea-registry-macros",
@@ -770,7 +770,7 @@ dependencies = [
 [[package]]
 name = "azalea-registry-macros"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/urisinger/azalea-graphics.git?branch=block-table#42a792088874d2d873ad029ca0557f53fd17990c"
+source = "git+https://github.com/urisinger/azalea-graphics.git?branch=pomme#7df11bd6517d405a582570e812ad4e151ce1c58f"
 dependencies = [
  "quote",
  "syn 2.0.118",
@@ -779,7 +779,7 @@ dependencies = [
 [[package]]
 name = "azalea-world"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/urisinger/azalea-graphics.git?branch=block-table#42a792088874d2d873ad029ca0557f53fd17990c"
+source = "git+https://github.com/urisinger/azalea-graphics.git?branch=pomme#7df11bd6517d405a582570e812ad4e151ce1c58f"
 dependencies = [
  "azalea-block",
  "azalea-buf",
@@ -1805,9 +1805,9 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "dbus"
-version = "0.9.11"
+version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b942602992bb7acfd1f51c49811c58a610ef9181b6e66f3e519d79b540a3bf73"
+checksum = "3ab69f03cc8c4340c9c8e315114e1658e6775a9b16a04357973aa21cec22b32e"
 dependencies = [
  "libc",
  "libdbus-sys",

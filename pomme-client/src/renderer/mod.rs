@@ -20,7 +20,7 @@ pub use camera::CloudMode;
 use camera::{Camera, CameraUniform};
 use chunk::atlas::TextureAtlas;
 use chunk::buffer::ChunkBufferStore;
-use chunk::mesher::{ MeshDispatcher};
+use chunk::mesher::{MeshDispatcher, SectionMeshData};
 use context::VulkanContext;
 use glam::dvec3;
 use pipelines::block_entity::BlockEntityPipeline;
@@ -860,7 +860,7 @@ impl Renderer {
 
     /// Returns the section indices dropped due to pool exhaustion (need
     /// re-mesh); empty on success.
-    pub fn upload_chunk_mesh(&mut self, mesh: &ChunkMeshData) -> Vec<i32> {
+    pub fn upload_chunk_mesh(&mut self, mesh: &SectionMeshData) -> Vec<i32> {
         self.chunk_buffers.upload(
             &self.ctx.device,
             &self.ctx.allocator,

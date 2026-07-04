@@ -572,7 +572,7 @@ impl ChunkBufferStore {
         device: &vk::Device,
         allocator: &Arc<Mutex<Allocator>>,
         queue: vk::Queue,
-        mesh: &ChunkMeshData,
+        mesh: &SectionMeshData,
     ) -> Vec<i32> {
         // Tight AABB over a section's own vertices (better cull granularity than
         // the chunk-column bounds; also robust to LOD cubes that exceed 16 tall).
@@ -602,33 +602,30 @@ impl ChunkBufferStore {
             }
         }
 
-        // The covered sections this job is authoritative for: reject any where a
-        // newer upload (higher epoch) already landed. See
-        // `ChunkMeshData::upload_epoch`.
-        let accepted: std::collections::HashSet<i32> = mesh
-            .replaced
-            .clone()
-            .filter(|si| {
-                let stored = self
-                    .chunks
-                    .get(&mesh.pos)
-                    .and_then(|c| c.sections.iter().find(|s| s.section_index == *si))
-                    .map(|s| s.epoch)
-                    .unwrap_or(0);
-                mesh.upload_epoch >= stored
-            })
-            .collect();
+        let col_pos = ChunkPos::new(mesh.spos.x, mesh.spos.z);
+        let si = mesh.relative_si;
+        let stored = self
+            .chunks
+            .get(&col_pos)
+            .and_then(|c| c.sections.iter().find(|s| s.section_index == si))
+            .map(|s| s.epoch)
+            .unwrap_or(0);
 
-        // Retire the slices of every accepted covered section: the re-meshed ones
-        // are re-allocated below, the now-empty ones simply vanish. Remember which
-        // were present so a re-meshed section swaps instantly while a freshly
-        // revealed one still fades in. Rejected sections are left untouched.
+        let accepted = mesh.upload_epoch >= stored;
+        if !accepted {
+            return Vec::new();
+        }
+
+        // Retire the slices of the accepted section: the re-meshed ones
+        // are re-allocated below, the now-empty ones simply vanish. Remember if it
+        // was present so a re-meshed section swaps instantly while a freshly
+        // revealed one still fades in.
         let mut freed: Vec<(u32, u32, u32, u32)> = Vec::new();
-        let mut was_present: std::collections::HashSet<i32> = std::collections::HashSet::new();
-        if let Some(entry) = self.chunks.get_mut(&mesh.pos) {
+        let mut was_present = false;
+        if let Some(entry) = self.chunks.get_mut(&col_pos) {
             entry.sections.retain(|s| {
-                if accepted.contains(&s.section_index) {
-                    was_present.insert(s.section_index);
+                if s.section_index == si {
+                    was_present = true;
                     freed.push((s.vertex_offset as u32, s.vtx_len, s.first_index, s.idx_len));
                     false
                 } else {
@@ -637,48 +634,32 @@ impl ChunkBufferStore {
             });
         }
         self.retire_slices(freed.iter().copied());
-        // Sections were removed/replaced, so the draw list must be rebuilt even if
-        // an early return below skips the upload (otherwise it keeps drawing a
-        // retired, soon-reused slice).
+        // Section was removed/replaced, so the draw list must be rebuilt.
         self.meta_dirty = true;
 
-        let upload_secs: Vec<&SectionMesh> = mesh
-            .sections
-            .iter()
-            .filter(|s| accepted.contains(&s.section_index))
-            .collect();
-
-        if upload_secs.is_empty() {
-            // Every accepted section is now empty (freed above); drop the column
-            // if nothing remains.
+        if mesh.is_empty() {
+            // Drop the column if nothing remains.
             if self
                 .chunks
-                .get(&mesh.pos)
+                .get(&col_pos)
                 .is_some_and(|c| c.sections.is_empty())
             {
-                self.chunks.remove(&mesh.pos);
+                self.chunks.remove(&col_pos);
             }
             return Vec::new();
         }
 
         let staging_half = self.staging_size as usize / 2;
+        let vcount = mesh.vertices.len() as u32;
+        let icount = (mesh.indices.len() + mesh.water_indices.len()) as u32;
+
         if self.use_staging {
-            // Verts and indices share the staging buffer (two halves), copied in
-            // one transfer. A chunk too large for staging is skipped rather than
-            // overflowing the buffer (matches the prior column-sized limit). This
-            // is permanent, so it's not reported for retry.
-            let v_bytes: usize = upload_secs
-                .iter()
-                .map(|s| s.vertices.len() * VERTEX_SIZE as usize)
-                .sum();
-            let i_bytes: usize = upload_secs
-                .iter()
-                .map(|s| (s.indices.len() + s.water_indices.len()) * INDEX_SIZE as usize)
-                .sum();
+            let v_bytes = vcount as usize * VERTEX_SIZE as usize;
+            let i_bytes = icount as usize * INDEX_SIZE as usize;
             if v_bytes > staging_half || i_bytes > staging_half {
                 tracing::warn!(
-                    "Chunk {:?} too large for staging ({} v / {} i bytes), skipping",
-                    mesh.pos,
+                    "Section {:?} too large for staging ({} v / {} i bytes), skipping",
+                    mesh.spos,
                     v_bytes,
                     i_bytes,
                 );
@@ -686,161 +667,107 @@ impl ChunkBufferStore {
             }
         }
 
-        // Sub-allocate an exact-size vertex + index slice for each non-empty
-        // section. Indices stay section-local and `vertex_offset` rebases the draw,
-        // so no packing or rebasing is needed — just one slice per section.
-        struct Plan<'a> {
-            section_index: i32,
-            verts: &'a [ChunkVertex],
-            indices: &'a [u32],
-            water_indices: &'a [u32],
-            vtx_off: u32,
-            idx_off: u32,
-            aabb: ChunkAABB,
-        }
+        // Sub-allocate vertex + index slice.
+        let Some(vtx_off) = self.vtx_free.alloc(vcount) else {
+            tracing::debug!("Vertex pool full, skipping {:?}", mesh.spos);
+            return vec![si];
+        };
+        let Some(idx_off) = self.idx_free.alloc(icount) else {
+            self.vtx_free.free_region(vtx_off, vcount);
+            tracing::debug!("Index pool full, skipping {:?}", mesh.spos);
+            return vec![si];
+        };
 
-        let mut plans: Vec<Plan> = Vec::with_capacity(upload_secs.len());
-        // (vtx_off, vtx_len, idx_off, idx_len) taken this call, for rollback if the
-        // pool runs out partway through a column.
-        let mut taken: Vec<(u32, u32, u32, u32)> = Vec::new();
-        // The accepted sections were retired above; on a pool-full rollback they
-        // need re-meshing, so report them for retry (rescan re-enqueues next frame).
-        let dropped: Vec<i32> = accepted.iter().copied().collect();
-        for sec in &upload_secs {
-            let vcount = sec.vertices.len() as u32;
-            // Opaque and water indices share one slice (opaque first, water after).
-            let icount = (sec.indices.len() + sec.water_indices.len()) as u32;
-            if vcount == 0 || icount == 0 {
-                continue;
-            }
-            let Some(vtx_off) = self.vtx_free.alloc(vcount) else {
-                self.free_slices(&taken);
-                tracing::debug!("Vertex pool full, skipping {:?}", mesh.pos);
-                return dropped;
-            };
-            let Some(idx_off) = self.idx_free.alloc(icount) else {
-                self.vtx_free.free_region(vtx_off, vcount);
-                self.free_slices(&taken);
-                tracing::debug!("Index pool full, skipping {:?}", mesh.pos);
-                return dropped;
-            };
-            taken.push((vtx_off, vcount, idx_off, icount));
-            plans.push(Plan {
-                section_index: sec.section_index,
-                verts: &sec.vertices,
-                indices: &sec.indices,
-                water_indices: &sec.water_indices,
-                vtx_off,
-                idx_off,
-                aabb: section_aabb(&sec.vertices),
-            });
-        }
-
-        if plans.is_empty() {
-            // Nothing to upload (all accepted sections were empty) — not a
-            // capacity failure, so no retry.
-            return Vec::new();
-        }
+        let aabb = section_aabb(&mesh.vertices);
 
         if self.use_staging {
-            let mut copy_v: Vec<vk::BufferCopy> = Vec::new();
-            let mut copy_i: Vec<vk::BufferCopy> = Vec::new();
             {
                 let buf = self.staging_alloc.mapped_slice_mut().unwrap();
-                let mut stg_v = 0usize;
-                let mut stg_i = 0usize;
-                for p in &plans {
-                    let vb: &[u8] = bytemuck::cast_slice(p.verts);
-                    buf[stg_v..stg_v + vb.len()].copy_from_slice(vb);
-                    copy_v.push(vk::BufferCopy {
-                        src_offset: stg_v as u64,
-                        dst_offset: p.vtx_off as u64 * VERTEX_SIZE,
-                        size: vb.len() as u64,
-                    });
-                    stg_v += vb.len();
+                let vb: &[u8] = bytemuck::cast_slice(&mesh.vertices);
+                buf[0..vb.len()].copy_from_slice(vb);
 
-                    let opaque: &[u8] = bytemuck::cast_slice(p.indices);
-                    let water: &[u8] = bytemuck::cast_slice(p.water_indices);
-                    let off = staging_half + stg_i;
-                    buf[off..off + opaque.len()].copy_from_slice(opaque);
-                    buf[off + opaque.len()..off + opaque.len() + water.len()]
-                        .copy_from_slice(water);
-                    copy_i.push(vk::BufferCopy {
-                        src_offset: off as u64,
-                        dst_offset: p.idx_off as u64 * INDEX_SIZE,
-                        size: (opaque.len() + water.len()) as u64,
-                    });
-                    stg_i += opaque.len() + water.len();
-                }
+                let opaque: &[u8] = bytemuck::cast_slice(&mesh.indices);
+                let water: &[u8] = bytemuck::cast_slice(&mesh.water_indices);
+                let off = staging_half;
+                buf[off..off + opaque.len()].copy_from_slice(opaque);
+                buf[off + opaque.len()..off + opaque.len() + water.len()]
+                    .copy_from_slice(water);
+
+                let copy_v = [vk::BufferCopy {
+                    src_offset: 0,
+                    dst_offset: vtx_off as u64 * VERTEX_SIZE,
+                    size: vb.len() as u64,
+                }];
+                let copy_i = [vk::BufferCopy {
+                    src_offset: off as u64,
+                    dst_offset: idx_off as u64 * INDEX_SIZE,
+                    size: (opaque.len() + water.len()) as u64,
+                }];
+
+                let begin = vk::CommandBufferBeginInfo {
+                    flags: vk::CommandBufferUsageFlags::OneTimeSubmit,
+                    ..Default::default()
+                };
+                self.transfer_cmd.begin(&begin).unwrap();
+                self.transfer_cmd
+                    .copy_buffer(self.staging_buffer, self.vertex_buffer, &copy_v);
+                self.transfer_cmd
+                    .copy_buffer(self.staging_buffer, self.index_buffer, &copy_i);
+                self.transfer_cmd.end().unwrap();
+                let submit = [vk::SubmitInfo {
+                    command_buffer_count: 1,
+                    command_buffers: &self.transfer_cmd.handle(),
+                    ..Default::default()
+                }];
+                queue.submit(&submit, vk::Fence::null()).unwrap();
+                queue.wait_idle().unwrap();
             }
-
-            let begin = vk::CommandBufferBeginInfo {
-                flags: vk::CommandBufferUsageFlags::OneTimeSubmit,
-                ..Default::default()
-            };
-            self.transfer_cmd.begin(&begin).unwrap();
-            self.transfer_cmd
-                .copy_buffer(self.staging_buffer, self.vertex_buffer, &copy_v);
-            self.transfer_cmd
-                .copy_buffer(self.staging_buffer, self.index_buffer, &copy_i);
-            self.transfer_cmd.end().unwrap();
-            let submit = [vk::SubmitInfo {
-                command_buffer_count: 1,
-                command_buffers: &self.transfer_cmd.handle(),
-                ..Default::default()
-            }];
-            queue.submit(&submit, vk::Fence::null()).unwrap();
-            queue.wait_idle().unwrap();
         } else {
             {
                 let vbuf = self.vertex_alloc.mapped_slice_mut().unwrap();
-                for p in &plans {
-                    let vb: &[u8] = bytemuck::cast_slice(p.verts);
-                    let off = p.vtx_off as usize * VERTEX_SIZE as usize;
-                    vbuf[off..off + vb.len()].copy_from_slice(vb);
-                }
+                let vb: &[u8] = bytemuck::cast_slice(&mesh.vertices);
+                let off = vtx_off as usize * VERTEX_SIZE as usize;
+                vbuf[off..off + vb.len()].copy_from_slice(vb);
             }
             {
                 let ibuf = self.index_alloc.mapped_slice_mut().unwrap();
-                for p in &plans {
-                    let opaque: &[u8] = bytemuck::cast_slice(p.indices);
-                    let water: &[u8] = bytemuck::cast_slice(p.water_indices);
-                    let off = p.idx_off as usize * INDEX_SIZE as usize;
-                    ibuf[off..off + opaque.len()].copy_from_slice(opaque);
-                    ibuf[off + opaque.len()..off + opaque.len() + water.len()]
-                        .copy_from_slice(water);
-                }
+                let opaque: &[u8] = bytemuck::cast_slice(&mesh.indices);
+                let water: &[u8] = bytemuck::cast_slice(&mesh.water_indices);
+                let off = idx_off as usize * INDEX_SIZE as usize;
+                ibuf[off..off + opaque.len()].copy_from_slice(opaque);
+                ibuf[off + opaque.len()..off + opaque.len() + water.len()]
+                    .copy_from_slice(water);
             }
         }
 
         let now = std::time::Instant::now();
-        let new_sections = plans.iter().map(|p| SectionAlloc {
-            section_index: p.section_index,
-            aabb: p.aabb,
-            first_index: p.idx_off,
-            index_count: p.indices.len() as u32,
-            water_first_index: p.idx_off + p.indices.len() as u32,
-            water_index_count: p.water_indices.len() as u32,
-            idx_len: (p.indices.len() + p.water_indices.len()) as u32,
-            vertex_offset: p.vtx_off as i32,
-            vtx_len: p.verts.len() as u32,
+        let sec_alloc = SectionAlloc {
+            section_index: si,
+            aabb,
+            first_index: idx_off,
+            index_count: mesh.indices.len() as u32,
+            water_first_index: idx_off + mesh.indices.len() as u32,
+            water_index_count: mesh.water_indices.len() as u32,
+            idx_len: icount,
+            vertex_offset: vtx_off as i32,
+            vtx_len: vcount,
             // A re-meshed section swaps instantly; a freshly revealed one fades in.
-            uploaded_at: if was_present.contains(&p.section_index) {
+            uploaded_at: if was_present {
                 now.checked_sub(std::time::Duration::from_secs(2))
                     .unwrap_or(now)
             } else {
                 now
             },
             epoch: mesh.upload_epoch,
-        });
+        };
 
         self.chunks
-            .entry(mesh.pos)
+            .entry(col_pos)
             .or_insert_with(|| ChunkAlloc {
                 sections: Vec::new(),
             })
             .sections
-            .extend(new_sections);
+            .push(sec_alloc);
 
         let total_sections: usize = self.chunks.values().map(|c| c.sections.len()).sum();
         self.ensure_meta_capacity(device, allocator, total_sections);

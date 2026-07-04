@@ -25,17 +25,17 @@ tracing-subscriber = "0.3"
 
 # azalea lags crates.io releases; track the 26.2 branch from git.
 [patch.crates-io]
-azalea-buf = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "block-table" }
-azalea-protocol = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "block-table" }
-azalea-crypto = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "block-table" }
-azalea-auth = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "block-table" }
-azalea-entity = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "block-table" }
-azalea-world = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "block-table" }
-azalea-block = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "block-table" }
-azalea-chat = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "block-table" }
-azalea-core = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "block-table" }
-azalea-registry = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "block-table" }
-azalea-inventory = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "block-table" }
+azalea-buf = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "pomme" }
+azalea-protocol = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "pomme" }
+azalea-crypto = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "pomme" }
+azalea-auth = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "pomme" }
+azalea-entity = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "pomme" }
+azalea-world = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "pomme" }
+azalea-block = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "pomme" }
+azalea-chat = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "pomme" }
+azalea-core = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "pomme" }
+azalea-registry = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "pomme" }
+azalea-inventory = { git = "https://github.com/urisinger/azalea-graphics.git", branch = "pomme" }
 
 [profile.dev]
 opt-level = 1

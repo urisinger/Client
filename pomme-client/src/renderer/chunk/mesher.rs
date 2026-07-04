@@ -93,6 +93,7 @@ pub const PACKED_WHITE_SHIFTED: u32 = pack_tint_shifted([1.0, 1.0, 1.0]);
 /// per-column.
 pub struct SectionMeshData {
     pub spos: ChunkSectionPos,
+    pub relative_si: i32,
     pub vertices: Vec<ChunkVertex>,
     pub indices: Vec<u32>,
     pub water_indices: Vec<u32>,
@@ -113,9 +114,10 @@ pub struct SectionMeshData {
 }
 
 impl SectionMeshData {
-    pub fn new(spos: ChunkSectionPos, content_gen: u64, upload_epoch: u64) -> Self {
+    pub fn new(spos: ChunkSectionPos, relative_si: i32, content_gen: u64, upload_epoch: u64) -> Self {
         Self {
             spos,
+            relative_si,
             vertices: Vec::with_capacity(1024),
             indices: Vec::with_capacity(1024),
             water_indices: Vec::with_capacity(256),
@@ -559,7 +561,7 @@ impl PendingJob {
             &self.uv_map,
             self.lod,
             self.content_gen,
-            self.upload_epoch
+            self.upload_epoch,
         );
         if let (Some(enqueued_at), Some(started_at)) = (self.enqueued_at, started_at) {
             mesh.timing = Some(RemeshTiming {
@@ -882,12 +884,12 @@ fn greedy_mesh_section(
     for ly in 0..18 {
         for lx in 0..18 {
             for lz in 0..18 {
-                let state = snapshot.section.get_block_state(lx, ly, lz);
+                let state = snapshot.section.blocks[lx][ly][lz];
                 let idx =
                     greedy::pad_linearize::<SECTION_SIZE>(lx as usize, ly as usize, lz as usize);
                 voxels[idx] = type_map.get_id(state);
                 occluders[idx] = registry.is_opaque_full_cube(state);
-                light[idx] = snapshot.get_light(lx, ly, lz);
+                light[idx] = LIGHT_TABLE[snapshot.section.light[lx][ly][lz] as usize];
             }
         }
     }
@@ -969,7 +971,7 @@ fn greedy_mesh_section(
     })
 }
 
-pub fn mesh_section(
+fn mesh_section(
     snapshot: &SectionStoreSnapshot,
     spos: ChunkSectionPos,
     registry: &BlockRegistry,
@@ -978,7 +980,8 @@ pub fn mesh_section(
     content_gen: u64,
     upload_epoch: u64,
 ) -> SectionMeshData {
-    let mut mesh = SectionMeshData::new(spos, content_gen, upload_epoch);
+    let relative_si = spos.y - snapshot.min_y.div_euclid(16);
+    let mut mesh = SectionMeshData::new(spos, relative_si, content_gen, upload_epoch);
     let mut logged_missing: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let step = 1i32 << lod;
@@ -1058,9 +1061,9 @@ pub fn mesh_section(
                         snapshot,
                         registry,
                         uv_map,
-                        bx,
-                        by,
-                        bz,
+                        local_x,
+                        local_y,
+                        local_z,
                         step,
                     );
                 } else if let BlockKind::Water | BlockKind::Lava = kind {
@@ -1077,9 +1080,9 @@ pub fn mesh_section(
                         snapshot,
                         registry,
                         uv_map,
-                        bx,
-                        by,
-                        bz,
+                        local_x,
+                        local_y,
+                        local_z,
                     );
                 } else if let Some(baked) = registry.get_baked_model(state) {
                     emit_baked_model(
@@ -1090,9 +1093,9 @@ pub fn mesh_section(
                         snapshot,
                         registry,
                         uv_map,
-                        bx,
-                        by,
-                        bz,
+                        local_x,
+                        local_y,
+                        local_z,
                     );
                 } else if let Some(quads) = registry.get_multipart_quads(state) {
                     emit_multipart(
@@ -1103,9 +1106,9 @@ pub fn mesh_section(
                         snapshot,
                         registry,
                         uv_map,
-                        bx,
-                        by,
-                        bz,
+                        local_x,
+                        local_y,
+                        local_z,
                     );
                 } else if let Some(textures) = registry.get_textures(state) {
                     emit_cube_faces(
@@ -1116,9 +1119,9 @@ pub fn mesh_section(
                         snapshot,
                         registry,
                         uv_map,
-                        bx,
-                        by,
-                        bz,
+                        local_x,
+                        local_y,
+                        local_z,
                     );
                 } else {
                     let block = state.to_trait();
@@ -1132,16 +1135,16 @@ pub fn mesh_section(
                         block_pos,
                         snapshot,
                         registry,
-                        bx,
-                        by,
-                        bz,
+                        local_x,
+                        local_y,
+                        local_z,
                     );
                 }
             }
         }
     }
 
-   mesh
+    mesh
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -117,7 +117,7 @@ pub struct GameState {
     /// Per-column bitmask of currently-visible section indices (bit `si` set =
     /// section is in-frustum and not occluded). Computed in
     /// `update_visibility`.
-    pub vis: HashSet<ChunkSectionPos>,
+    pub vis_mask: HashMap<ChunkPos, u32>,
     /// Per-section generation for edits only (bulk uses the column
     /// `content_gen` above). Bumped per edited section so a result is
     /// dropped only when *that* section was edited again — editing one
@@ -130,7 +130,7 @@ pub struct GameState {
     /// Highest upload epoch each `section_vis` entry was set from; mirrors the
     /// buffer's per-section geometry gate so a stale bulk can't re-stale an
     /// edited section's visibility.
-    pub section_vis_epoch: HashMap<(ChunkPos, i32), u64>,
+    pub section_vis_epoch: HashMap<ChunkSectionPos, u64>,
     /// Cached per-column frustum tier (0 in view, 1 margin, 2 behind),
     /// recomputed each time an occlusion walk completes. Only the F3
     /// overlay reads it now.
@@ -219,7 +219,7 @@ impl GameState {
             chunk_load_upload: None,
             content_gen: HashMap::new(),
             meshed: HashMap::new(),
-            vis: HashSet::new(),
+            vis_mask: HashMap::new(),
             section_gen: HashMap::new(),
             next_section_gen: 0,
             section_vis: HashMap::new(),
@@ -389,8 +389,11 @@ impl GameState {
         let max_y = min_y + self.chunk_store.height() as f32;
         let full = section_mask(self.chunk_store.section_count());
 
+        let min_y_section = self.chunk_store.min_y().div_euclid(16);
+        let section_count = self.chunk_store.section_count();
+
         let mut tiers = HashMap::new();
-        let mut masks = HashSet::new();
+        let mut masks = HashMap::new();
         for pos in self.chunk_store.loaded_positions() {
             let near = column_is_near(pos, eye_f);
             let tier = if near {
@@ -403,7 +406,14 @@ impl GameState {
             let mask = if near {
                 full
             } else {
-                bfs.get(&pos).copied().unwrap_or(0)
+                let mut m = 0u32;
+                for si in 0..section_count {
+                    let sec_pos = ChunkSectionPos::new(pos.x, min_y_section + si, pos.z);
+                    if bfs.contains(&sec_pos) {
+                        m |= 1 << si;
+                    }
+                }
+                m
             };
             // A fully-occluded column (no visible section) drops to the hidden tier.
             let tier = if tier == 0 && mask == 0 { 2 } else { tier };
@@ -411,7 +421,7 @@ impl GameState {
             masks.insert(pos, mask);
         }
         self.vis_tiers = tiers;
-        self.vis = masks.clone();
+        self.vis_mask = masks.clone();
         self.vis_valid = true;
 
         // With occlusion off, push full masks (frustum still applies on the GPU).
@@ -429,38 +439,36 @@ impl GameState {
     /// drawing — and the queue orders the backlog nearest-first. Runs every
     /// frame to drain it.
     pub fn rescan_mesh_jobs(&mut self, player_chunk: ChunkPos) {
-        let n = self.chunk_store.section_count();
-        let full = section_mask(n);
+        let min_y_section = self.chunk_store.min_y().div_euclid(16);
+        let section_count = self.chunk_store.section_count();
         for pos in self.chunk_store.loaded_positions() {
             let lod = crate::app::core::chunk_lod(pos, player_chunk);
-            let content_gen = self.content_gen.get(&pos).copied().unwrap_or(0);
-            // Mesh the whole column once, then nothing until a lod/content change.
-            // Occlusion gates drawing, not meshing, so off-screen and hidden
-            // sections still mesh (the queue orders the backlog nearest-first).
-            let to_mesh = match self.meshed.get(&pos) {
-                Some(m) if m.lod == lod && m.content_gen == content_gen => full & !m.mask,
-                _ => full,
-            };
-            if to_mesh != 0 {
-                for (start, end) in contiguous_runs(to_mesh) {
-                    self.mesh_dispatcher.enqueue(
+            for si in 0..section_count {
+                let spos = ChunkSectionPos::new(pos.x, min_y_section + si, pos.z);
+                let content_gen = self.content_gen.get(&spos).copied().unwrap_or(0);
+                
+                let needs_mesh = match self.meshed.get(&spos) {
+                    Some(m) if m.lod == lod && m.content_gen == content_gen => false,
+                    _ => true,
+                };
+                
+                if needs_mesh {
+                    self.mesh_dispatcher.enqueue_section(
                         &self.chunk_store,
-                        pos,
+                        spos,
                         lod,
                         false,
                         content_gen,
-                        start..end,
+                    );
+                    self.meshed.insert(
+                        spos,
+                        MeshedSection {
+                            lod,
+                            content_gen,
+                        },
                     );
                 }
             }
-            self.meshed.insert(
-                pos,
-                MeshedCol {
-                    lod,
-                    content_gen,
-                    mask: full,
-                },
-            );
         }
     }
 }
@@ -712,13 +720,11 @@ pub fn update_game(
     for mesh in game.mesh_dispatcher.drain_results() {
         // Drop a mesh built from an out-of-date snapshot. Edits (priority lane,
         // single section) are keyed per section so editing one section never
-        // drops a sibling's in-flight result; bulk loads keep the column key.
+        // drops a sibling's in-flight result; bulk loads keep the section content gen.
         let stale = if mesh.timing.is_some() {
-            mesh.replaced
-                .clone()
-                .any(|si| game.section_gen.get(&(mesh.pos, si)).copied() != Some(mesh.content_gen))
+            game.section_gen.get(&mesh.spos).copied() != Some(mesh.content_gen)
         } else {
-            mesh.content_gen < game.content_gen.get(&mesh.pos).copied().unwrap_or(0)
+            mesh.content_gen < game.content_gen.get(&mesh.spos).copied().unwrap_or(0)
         };
         if stale {
             continue;
@@ -726,9 +732,10 @@ pub fn update_game(
         if let Some(t) = &mesh.timing {
             let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
             tracing::info!(
-                "edit remesh [{}, {}]: queue {:.1}ms + mesh {:.1}ms + drain {:.1}ms = {:.1}ms",
-                mesh.pos.x,
-                mesh.pos.z,
+                "edit remesh [{}, {}, {}]: queue {:.1}ms + mesh {:.1}ms + drain {:.1}ms = {:.1}ms",
+                mesh.spos.x,
+                mesh.spos.y,
+                mesh.spos.z,
                 ms(t.started_at - t.enqueued_at),
                 ms(t.meshed_at - t.started_at),
                 ms(t.meshed_at.elapsed()),
@@ -736,22 +743,15 @@ pub fn update_game(
             );
         }
         let dropped = gfx.renderer.upload_chunk_mesh(&mesh);
-        let pos = mesh.pos;
         // Sections dropped on pool exhaustion were retired from the buffer; clear
-        // their meshed bit so the next rescan re-enqueues them.
-        if !dropped.is_empty()
-            && let Some(m) = game.meshed.get_mut(&pos)
-        {
-            for si in dropped {
-                m.mask &= !(1u32 << si);
-            }
+        // their meshed entry so the next rescan re-enqueues them.
+        if !dropped.is_empty() {
+            game.meshed.remove(&mesh.spos);
         }
-        for (si, vis) in mesh.visibility {
-            let e = game.section_vis_epoch.entry((pos, si)).or_insert(0);
-            if mesh.upload_epoch >= *e {
-                *e = mesh.upload_epoch;
-                game.section_vis.insert((pos, si), vis);
-            }
+        let e = game.section_vis_epoch.entry(mesh.spos).or_insert(0);
+        if mesh.upload_epoch >= *e {
+            *e = mesh.upload_epoch;
+            game.section_vis.insert(mesh.spos, mesh.visibility);
         }
     }
 

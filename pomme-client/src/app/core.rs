@@ -3,6 +3,7 @@ use std::ops::Add;
 use std::sync::Arc;
 use std::time::Instant;
 
+use azalea_core::position::{ChunkPos, ChunkSectionPos};
 use azalea_protocol::packets::game::{
     ServerboundClientCommand, ServerboundGamePacket, s_client_command, s_client_tick_end,
 };
@@ -377,13 +378,13 @@ impl AppCore {
                 NetworkEvent::ChunkUnloaded { pos } => {
                     game.chunk_store.unload_chunk(&pos);
                     game.block_entity_anim.drop_chunk(pos.x, pos.z);
-                    game.content_gen.remove(&pos);
-                    game.meshed.remove(&pos);
+                    game.content_gen.retain(|spos, _| ChunkPos::new(spos.x, spos.z) != pos);
+                    game.meshed.retain(|spos, _| ChunkPos::new(spos.x, spos.z) != pos);
                     game.vis_mask.remove(&pos);
                     game.vis_tiers.remove(&pos);
-                    game.section_gen.retain(|(p, _), _| *p != pos);
-                    game.section_vis.retain(|(p, _), _| *p != pos);
-                    game.section_vis_epoch.retain(|(p, _), _| *p != pos);
+                    game.section_gen.retain(|spos, _| ChunkPos::new(spos.x, spos.z) != pos);
+                    game.section_vis.retain(|spos, _| ChunkPos::new(spos.x, spos.z) != pos);
+                    game.section_vis_epoch.retain(|spos, _| ChunkPos::new(spos.x, spos.z) != pos);
 
                     renderer.remove_chunk_mesh(&pos);
                 }
@@ -986,24 +987,32 @@ impl AppCore {
             (game.player.position.x as i32).div_euclid(16),
             (game.player.position.z as i32).div_euclid(16),
         );
+        let min_y_section = game.chunk_store.min_y().div_euclid(16);
         // Edits mesh the affected section(s) immediately on the priority lane,
         // ungated by visibility.
         for &(col, si) in &priority_remesh {
-            game.enqueue_section_edit(col, si, chunk_lod(col, player_chunk));
+            let spos = ChunkSectionPos::new(col.x, min_y_section + si, col.z);
+            game.enqueue_section_edit(spos, chunk_lod(col, player_chunk));
         }
 
         // New chunk loads (and their neighbours, for border lighting) are only
         // marked dirty here; the visibility re-scan enqueues them gated by tier so
         // hidden/behind-camera columns don't waste meshing time.
+        let section_count = game.chunk_store.section_count();
         for &pos in &chunks_to_mesh {
-            game.bump_content_gen(pos);
+            for si in 0..section_count {
+                let spos = ChunkSectionPos::new(pos.x, min_y_section + si, pos.z);
+                game.bump_content_gen(spos);
+            }
         }
 
         // Refresh the frustum tiers (throttled to camera movement / new loads),
         // then enqueue everything that needs meshing — visible-first, with hidden
         // columns backfilled at a bounded rate so the world still completes.
         let loads_happened = !chunks_to_mesh.is_empty();
-        game.update_visibility(renderer, player_chunk, loads_happened);
+        let player_section_y = (game.player.eye_pos().y / 16.0).floor() as i32;
+        let player_spos = ChunkSectionPos::new(player_chunk.x, player_section_y, player_chunk.z);
+        game.update_visibility(renderer, player_spos, loads_happened);
         game.rescan_mesh_jobs(player_chunk);
 
         disconnect_reason
@@ -1101,8 +1110,10 @@ impl AppCore {
                 dirty_sections_for_block(&mut sections, b.x, b.y, b.z, min_y, n);
             }
             // Player edits are always adjacent (lod 0).
+            let min_y_section = min_y.div_euclid(16);
             for (col, si) in sections {
-                game.enqueue_section_edit(col, si, 0);
+                let spos = ChunkSectionPos::new(col.x, min_y_section + si, col.z);
+                game.enqueue_section_edit(spos, 0);
             }
         }
 
