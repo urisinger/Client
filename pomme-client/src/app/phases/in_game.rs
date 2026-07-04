@@ -20,7 +20,7 @@ use crate::net::connection::ConnectionHandle;
 use crate::player::LocalPlayer;
 use crate::player::interaction::{HitResult, InteractionState};
 use crate::player::tab_list::TabList;
-use crate::renderer::chunk::mesher::{BiomeClimate, MeshDispatcher};
+use crate::renderer::chunk::mesher::{BiomeClimate, ChunkMeshData, MeshDispatcher};
 use crate::renderer::chunk::occlusion_graph::{self, VisibilitySet};
 use crate::renderer::pipelines::entity_renderer::{
     EntityRenderInfo, WHITE_TINT, jeb_sheep_tint, wool_color_tint,
@@ -89,6 +89,7 @@ pub struct GameState {
     pub server_render_distance: u32,
     pub server_simulation_distance: u32,
     pub item_entity_store: ItemEntityStore,
+    pub particle_store: crate::particle::ParticleStore,
     pub block_entity_anim: BlockEntityAnimStore,
     pub benchmark: Option<Benchmark>,
     pub benchmark_result: Option<BenchmarkResult>,
@@ -122,6 +123,7 @@ pub struct GameState {
     /// `content_gen` above). Bumped per edited section so a result is
     /// dropped only when *that* section was edited again — editing one
     /// section never invalidates a sibling section's in-flight result.
+    /// Sections meshed together as one edit span share one gen value.
     pub section_gen: HashMap<(ChunkPos, i32), u64>,
     pub next_section_gen: u64,
     /// Per-section cave-cull visibility (vanilla `VisibilitySet`), keyed like
@@ -172,6 +174,15 @@ impl GameState {
             server_render_distance: 0,
             server_simulation_distance: 0,
             item_entity_store: ItemEntityStore::new(),
+            particle_store: {
+                let (grass, foliage, dry_foliage) = mesh_dispatcher.colormaps();
+                crate::particle::ParticleStore::new(
+                    renderer.atlas_uv_map().clone(),
+                    grass,
+                    foliage,
+                    dry_foliage,
+                )
+            },
             block_entity_anim: BlockEntityAnimStore::default(),
             player: LocalPlayer::new(),
             biome_climate: Arc::new(HashMap::new()),
@@ -298,11 +309,65 @@ impl GameState {
     /// visibility. Bumps that section's generation so the result is dropped
     /// only if the same section is edited again before it lands.
     pub fn enqueue_section_edit(&mut self, col: ChunkPos, si: i32, lod: u32) {
-        self.next_section_gen += 1;
-        let g = self.next_section_gen;
-        self.section_gen.insert((col, si), g);
+        let g = self.bump_section_gen(col, si..si + 1);
         self.mesh_dispatcher
             .enqueue(&self.chunk_store, col, lod, true, g, si..si + 1);
+    }
+
+    /// Vanilla `compileSync` under `PrioritizeChunkUpdates.PLAYER_AFFECTED`:
+    /// mesh and upload a column's player-edited sections on the spot so the
+    /// edit shows the same frame. (Vanilla defaults to NONE/async, but
+    /// pomme's async round-trip is several frames, which leaves a broken
+    /// block visibly lingering after its crack overlay completes.)
+    pub fn mesh_sections_edit_now(
+        &mut self,
+        renderer: &mut Renderer,
+        col: ChunkPos,
+        sections: std::ops::Range<i32>,
+    ) {
+        // The gen bump drops any in-flight priority result for these
+        // sections at drain time; stale bulk results are rejected by the
+        // buffer's per-section epoch gate (`ChunkMeshData::upload_epoch`).
+        let g = self.bump_section_gen(col, sections.clone());
+        let mesh = self
+            .mesh_dispatcher
+            .mesh_sections_now(&self.chunk_store, col, sections, g);
+        self.apply_mesh_upload(renderer, mesh);
+    }
+
+    /// One gen for the whole span: the drain stale-check compares every
+    /// section in a mesh's `replaced` range against its single
+    /// `content_gen`, so grouped sections must share a value.
+    fn bump_section_gen(&mut self, col: ChunkPos, sections: std::ops::Range<i32>) -> u64 {
+        self.next_section_gen += 1;
+        for si in sections {
+            self.section_gen.insert((col, si), self.next_section_gen);
+        }
+        self.next_section_gen
+    }
+
+    /// Upload a finished mesh and apply its bookkeeping: re-arm the rescan
+    /// for sections dropped on pool exhaustion, and adopt the per-section
+    /// visibility sets.
+    fn apply_mesh_upload(&mut self, renderer: &mut Renderer, mesh: ChunkMeshData) {
+        let dropped = renderer.upload_chunk_mesh(&mesh);
+        let pos = mesh.pos;
+        // Sections dropped on pool exhaustion were retired from the buffer;
+        // clear their meshed bit so the next rescan re-enqueues them.
+        if !dropped.is_empty()
+            && let Some(m) = self.meshed.get_mut(&pos)
+        {
+            for si in dropped {
+                m.mask &= !(1u32 << si);
+            }
+        }
+        for (si, vis) in mesh.visibility {
+            let e = self.section_vis_epoch.entry((pos, si)).or_insert(0);
+            if mesh.upload_epoch >= *e {
+                *e = mesh.upload_epoch;
+                self.section_vis.insert((pos, si), vis);
+            }
+        }
     }
 
     /// Drive the cave-cull occlusion walk: apply a finished async walk to the
@@ -711,7 +776,8 @@ pub fn update_game(
         return GameUpdateResult::Disconnected { reason };
     }
 
-    for mesh in game.mesh_dispatcher.drain_results() {
+    let meshes: Vec<_> = game.mesh_dispatcher.drain_results().collect();
+    for mesh in meshes {
         // Drop a mesh built from an out-of-date snapshot. Edits (priority lane,
         // single section) are keyed per section so editing one section never
         // drops a sibling's in-flight result; bulk loads keep the column key.
@@ -737,24 +803,7 @@ pub fn update_game(
                 ms(t.enqueued_at.elapsed()),
             );
         }
-        let dropped = gfx.renderer.upload_chunk_mesh(&mesh);
-        let pos = mesh.pos;
-        // Sections dropped on pool exhaustion were retired from the buffer; clear
-        // their meshed bit so the next rescan re-enqueues them.
-        if !dropped.is_empty()
-            && let Some(m) = game.meshed.get_mut(&pos)
-        {
-            for si in dropped {
-                m.mask &= !(1u32 << si);
-            }
-        }
-        for (si, vis) in mesh.visibility {
-            let e = game.section_vis_epoch.entry((pos, si)).or_insert(0);
-            if mesh.upload_epoch >= *e {
-                *e = mesh.upload_epoch;
-                game.section_vis.insert((pos, si), vis);
-            }
-        }
+        game.apply_mesh_upload(&mut gfx.renderer, mesh);
     }
 
     game.mesh_dispatcher
@@ -777,7 +826,8 @@ pub fn update_game(
     core.tick_accumulator += dt;
     while core.tick_accumulator >= TICK_RATE {
         core.tick_physics(&mut gfx.renderer, connection, game);
-        game.item_entity_store.tick();
+        game.item_entity_store.tick(&game.chunk_store);
+        game.particle_store.tick(&game.chunk_store);
         game.block_entity_anim.tick();
         core.tick_accumulator -= TICK_RATE;
     }
@@ -1458,6 +1508,12 @@ pub fn update_game(
         )
     };
 
+    let particle_quads = if benchmark_running {
+        Vec::new()
+    } else {
+        game.particle_store.extract(partial_tick)
+    };
+
     let effective_rd = if game.server_render_distance > 0 {
         core.menu.render_distance.min(game.server_render_distance)
     } else {
@@ -1493,6 +1549,7 @@ pub fn update_game(
         &entity_renders,
         &item_renders,
         &block_entity_renders,
+        &particle_quads,
         &weather_columns,
         if benchmark_running {
             crate::renderer::CloudMode::Off
@@ -1637,14 +1694,12 @@ fn stack_render_count(count: i32) -> usize {
 }
 
 fn get_entity_light(chunk_store: &ChunkStore, pos: Position) -> f32 {
-    use crate::renderer::chunk::mesher::LIGHT_TABLE;
-    let bx = pos.x.floor() as i32;
-    let by = pos.y.floor() as i32;
-    let bz = pos.z.floor() as i32;
-    let level = chunk_store
-        .get_sky_light(bx, by, bz)
-        .max(chunk_store.get_block_light(bx, by, bz));
-    LIGHT_TABLE[level as usize]
+    crate::renderer::chunk::mesher::world_brightness(
+        chunk_store,
+        pos.x.floor() as i32,
+        pos.y.floor() as i32,
+        pos.z.floor() as i32,
+    )
 }
 
 /// Builds the rain/snow columns in a square around the camera (vanilla

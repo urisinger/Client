@@ -212,6 +212,42 @@ impl Colormap {
     }
 }
 
+pub fn grass_color(climate: &BiomeClimate, colormap: &Colormap, x: i32, z: i32) -> [f32; 3] {
+    let base = climate
+        .grass_color_override
+        .unwrap_or_else(|| colormap.lookup(climate.temperature, climate.downfall));
+    apply_grass_modifier(climate.grass_color_modifier, base, x, z)
+}
+
+pub fn foliage_color(climate: &BiomeClimate, colormap: &Colormap) -> [f32; 3] {
+    climate
+        .foliage_color_override
+        .unwrap_or_else(|| colormap.lookup(climate.temperature, climate.downfall))
+}
+
+pub fn dry_foliage_color(climate: &BiomeClimate, colormap: &Colormap) -> [f32; 3] {
+    climate
+        .dry_foliage_color_override
+        .unwrap_or_else(|| colormap.lookup(climate.temperature, climate.downfall))
+}
+
+/// Average a biome color over the vanilla 5x5 horizontal blend
+/// (`BiomeColors` with the default blend radius of 2).
+pub fn blend_color(x: i32, z: i32, mut color_at: impl FnMut(i32, i32) -> [f32; 3]) -> [f32; 3] {
+    const RADIUS: i32 = 2;
+    const COUNT: f32 = ((RADIUS * 2 + 1) * (RADIUS * 2 + 1)) as f32;
+    let mut sum = [0.0f32; 3];
+    for dz in -RADIUS..=RADIUS {
+        for dx in -RADIUS..=RADIUS {
+            let c = color_at(x + dx, z + dz);
+            for (s, v) in sum.iter_mut().zip(c) {
+                *s += v;
+            }
+        }
+    }
+    sum.map(|s| s / COUNT)
+}
+
 fn apply_grass_modifier(modifier: GrassColorModifier, base: [f32; 3], x: i32, z: i32) -> [f32; 3] {
     match modifier {
         GrassColorModifier::None => base,
@@ -452,10 +488,18 @@ impl MeshDispatcher {
         self.biome_climate = climate;
     }
 
-    // Always async, matching vanilla's default `prioritizeChunkUpdates = NONE`.
-    // TODO: the PLAYER_AFFECTED/NEARBY modes add a synchronous same-frame rebuild
-    // (a `mesh_now` path); deferred — pomme meshes whole columns, so it'd hitch
-    // ~200ms.
+    /// (grass, foliage, dry foliage) colormaps, shared with the particle
+    /// store for break-particle tinting.
+    pub fn colormaps(&self) -> (Arc<Colormap>, Arc<Colormap>, Arc<Colormap>) {
+        (
+            Arc::clone(&self.grass_colormap),
+            Arc::clone(&self.foliage_colormap),
+            Arc::clone(&self.dry_foliage_colormap),
+        )
+    }
+
+    // Async worker path, vanilla's default `prioritizeChunkUpdates = NONE`.
+    // Player edits use `mesh_section_now` instead.
     pub fn enqueue(
         &self,
         chunk_store: &ChunkStore,
@@ -465,12 +509,6 @@ impl MeshDispatcher {
         content_gen: u64,
         sections: std::ops::Range<i32>,
     ) {
-        let registry = Arc::clone(&self.registry);
-        let uv_map = Arc::clone(&self.uv_map);
-        let grass_colormap = Arc::clone(&self.grass_colormap);
-        let foliage_colormap = Arc::clone(&self.foliage_colormap);
-        let dry_foliage_colormap = Arc::clone(&self.dry_foliage_colormap);
-        let biome_climate = Arc::clone(&self.biome_climate);
         let tx = if priority {
             self.priority_tx.clone()
         } else {
@@ -478,26 +516,6 @@ impl MeshDispatcher {
         };
         let enqueued_at = priority.then(std::time::Instant::now);
         let upload_epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed);
-
-        let chunks_needed = chunk::mesh_neighborhood(pos);
-        let chunk_arcs: Vec<_> = chunks_needed
-            .iter()
-            .map(|p| chunk_store.get_chunk(p))
-            .collect();
-
-        let min_y = chunk_store.min_y();
-        let height = chunk_store.height();
-
-        let light: std::collections::HashMap<(i32, i32), crate::world::chunk::ChunkLightData> =
-            chunks_needed
-                .iter()
-                .filter_map(|p| {
-                    chunk_store
-                        .light_data
-                        .get(&(p.x, p.z))
-                        .map(|ld| ((p.x, p.z), ld.clone()))
-                })
-                .collect();
 
         self.queue.push(PendingJob {
             pos,
@@ -508,19 +526,57 @@ impl MeshDispatcher {
             // An edit re-meshes an already-shown chunk (vanilla's "recompile").
             is_recompile: priority,
             enqueued_at,
-            chunks_needed,
-            chunk_arcs,
-            light,
-            registry,
-            uv_map,
-            grass_colormap,
-            foliage_colormap,
-            dry_foliage_colormap,
-            biome_climate,
-            min_y,
-            height,
+            snapshot: self.build_snapshot(chunk_store, pos),
+            registry: Arc::clone(&self.registry),
+            uv_map: Arc::clone(&self.uv_map),
             tx,
         });
+    }
+
+    /// Vanilla `compileSync` (`PrioritizeChunkUpdates.PLAYER_AFFECTED`): mesh
+    /// a column's edited sections on the calling thread so a player edit is
+    /// renderable the same frame, skipping the worker round-trip. One
+    /// snapshot serves the whole span.
+    pub fn mesh_sections_now(
+        &self,
+        chunk_store: &ChunkStore,
+        pos: ChunkPos,
+        sections: std::ops::Range<i32>,
+        content_gen: u64,
+    ) -> ChunkMeshData {
+        let snapshot = self.build_snapshot(chunk_store, pos);
+        let mut mesh =
+            mesh_chunk_snapshot(&snapshot, pos, &self.registry, &self.uv_map, 0, sections);
+        mesh.content_gen = content_gen;
+        mesh.upload_epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed);
+        mesh
+    }
+
+    /// Point-in-time snapshot of `pos`'s mesh neighbourhood: chunk arcs plus
+    /// a deep copy of their light data.
+    fn build_snapshot(&self, chunk_store: &ChunkStore, pos: ChunkPos) -> ChunkStoreSnapshot {
+        let chunks_needed = chunk::mesh_neighborhood(pos);
+        ChunkStoreSnapshot {
+            chunks: chunks_needed
+                .iter()
+                .map(|p| (*p, chunk_store.get_chunk(p)))
+                .collect(),
+            light: chunks_needed
+                .iter()
+                .filter_map(|p| {
+                    chunk_store
+                        .light_data
+                        .get(&(p.x, p.z))
+                        .map(|ld| ((p.x, p.z), ld.clone()))
+                })
+                .collect(),
+            grass_colormap: Arc::clone(&self.grass_colormap),
+            foliage_colormap: Arc::clone(&self.foliage_colormap),
+            dry_foliage_colormap: Arc::clone(&self.dry_foliage_colormap),
+            biome_climate: Arc::clone(&self.biome_climate),
+            min_y: chunk_store.min_y(),
+            height: chunk_store.height(),
+        }
     }
 
     /// Latest camera position, used to mesh the nearest pending chunk first.
@@ -558,39 +614,17 @@ struct PendingJob {
     sections: std::ops::Range<i32>,
     is_recompile: bool,
     enqueued_at: Option<std::time::Instant>,
-    chunks_needed: [ChunkPos; 5],
-    chunk_arcs: Vec<Option<Arc<parking_lot::RwLock<azalea_world::Chunk>>>>,
-    light: HashMap<(i32, i32), crate::world::chunk::ChunkLightData>,
+    snapshot: ChunkStoreSnapshot,
     registry: Arc<BlockRegistry>,
     uv_map: Arc<AtlasUVMap>,
-    grass_colormap: Arc<Colormap>,
-    foliage_colormap: Arc<Colormap>,
-    dry_foliage_colormap: Arc<Colormap>,
-    biome_climate: Arc<HashMap<u32, BiomeClimate>>,
-    min_y: i32,
-    height: u32,
     tx: crossbeam_channel::Sender<ChunkMeshData>,
 }
 
 impl PendingJob {
     fn run(self) {
         let started_at = self.enqueued_at.map(|_| std::time::Instant::now());
-        let snapshot = ChunkStoreSnapshot {
-            chunks: self
-                .chunks_needed
-                .into_iter()
-                .zip(self.chunk_arcs)
-                .collect(),
-            light: self.light,
-            grass_colormap: self.grass_colormap,
-            foliage_colormap: self.foliage_colormap,
-            dry_foliage_colormap: self.dry_foliage_colormap,
-            biome_climate: self.biome_climate,
-            min_y: self.min_y,
-            height: self.height,
-        };
         let mut mesh = mesh_chunk_snapshot(
-            &snapshot,
+            &self.snapshot,
             self.pos,
             &self.registry,
             &self.uv_map,
@@ -798,63 +832,27 @@ impl ChunkStoreSnapshot {
     }
 
     fn grass_color_at(&self, x: i32, y: i32, z: i32) -> [f32; 3] {
-        let climate = self.climate_at(x, y, z);
-        let base = climate.grass_color_override.unwrap_or_else(|| {
-            self.grass_colormap
-                .lookup(climate.temperature, climate.downfall)
-        });
-        apply_grass_modifier(climate.grass_color_modifier, base, x, z)
+        grass_color(&self.climate_at(x, y, z), &self.grass_colormap, x, z)
     }
 
     fn foliage_color_at(&self, x: i32, y: i32, z: i32) -> [f32; 3] {
-        let climate = self.climate_at(x, y, z);
-        climate.foliage_color_override.unwrap_or_else(|| {
-            self.foliage_colormap
-                .lookup(climate.temperature, climate.downfall)
-        })
+        foliage_color(&self.climate_at(x, y, z), &self.foliage_colormap)
     }
 
     fn dry_foliage_color_at(&self, x: i32, y: i32, z: i32) -> [f32; 3] {
-        let climate = self.climate_at(x, y, z);
-        climate.dry_foliage_color_override.unwrap_or_else(|| {
-            self.dry_foliage_colormap
-                .lookup(climate.temperature, climate.downfall)
-        })
+        dry_foliage_color(&self.climate_at(x, y, z), &self.dry_foliage_colormap)
     }
 
     fn grass_tint(&self, x: i32, y: i32, z: i32) -> [f32; 3] {
-        self.blend_color(x, y, z, Self::grass_color_at)
+        blend_color(x, z, |bx, bz| self.grass_color_at(bx, y, bz))
     }
 
     fn foliage_tint(&self, x: i32, y: i32, z: i32) -> [f32; 3] {
-        self.blend_color(x, y, z, Self::foliage_color_at)
+        blend_color(x, z, |bx, bz| self.foliage_color_at(bx, y, bz))
     }
 
     fn dry_foliage_tint(&self, x: i32, y: i32, z: i32) -> [f32; 3] {
-        self.blend_color(x, y, z, Self::dry_foliage_color_at)
-    }
-
-    fn blend_color(
-        &self,
-        x: i32,
-        y: i32,
-        z: i32,
-        color_fn: fn(&Self, i32, i32, i32) -> [f32; 3],
-    ) -> [f32; 3] {
-        const RADIUS: i32 = 2;
-        const COUNT: f32 = ((RADIUS * 2 + 1) * (RADIUS * 2 + 1)) as f32;
-        let mut r = 0.0f32;
-        let mut g = 0.0f32;
-        let mut b = 0.0f32;
-        for dz in -RADIUS..=RADIUS {
-            for dx in -RADIUS..=RADIUS {
-                let c = color_fn(self, x + dx, y, z + dz);
-                r += c[0];
-                g += c[1];
-                b += c[2];
-            }
-        }
-        [r / COUNT, g / COUNT, b / COUNT]
+        blend_color(x, z, |bx, bz| self.dry_foliage_color_at(bx, y, bz))
     }
 
     fn get_light(&self, x: i32, y: i32, z: i32) -> f32 {
@@ -877,6 +875,15 @@ pub const LIGHT_TABLE: [f32; 16] = [
     0.05, 0.067, 0.085, 0.106, 0.129, 0.156, 0.188, 0.227, 0.272, 0.328, 0.393, 0.472, 0.566,
     0.679, 0.815, 1.0,
 ];
+
+/// Brightness at a block position from the chunk store's light data:
+/// `LIGHT_TABLE[max(sky, block)]`.
+pub fn world_brightness(chunks: &ChunkStore, x: i32, y: i32, z: i32) -> f32 {
+    let level = chunks
+        .get_sky_light(x, y, z)
+        .max(chunks.get_block_light(x, y, z));
+    LIGHT_TABLE[level as usize]
+}
 
 struct GreedyBlockInfo {
     textures: FaceTextures,

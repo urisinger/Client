@@ -707,6 +707,7 @@ impl AppCore {
                     uuid,
                     entity_type,
                     position,
+                    velocity,
                     y_rot_deg,
                     x_rot_deg,
                     head_y_rot_deg,
@@ -733,12 +734,18 @@ impl AppCore {
                         }
                     }
                     if entity_type == azalea_registry::builtin::EntityKind::Item {
-                        game.item_entity_store.spawn_item(id, position);
+                        game.item_entity_store.spawn_item(id, position, velocity);
                     }
                 }
-                NetworkEvent::EntityMoved { id, dx, dy, dz } => {
+                NetworkEvent::EntityMoved {
+                    id,
+                    dx,
+                    dy,
+                    dz,
+                    on_ground,
+                } => {
                     game.entity_store.move_living_delta(id, dx, dy, dz);
-                    game.item_entity_store.move_delta(id, dx, dy, dz);
+                    game.item_entity_store.move_delta(id, dx, dy, dz, on_ground);
                 }
                 NetworkEvent::EntityMovedRotated {
                     id,
@@ -747,22 +754,53 @@ impl AppCore {
                     dz,
                     y_rot_deg,
                     x_rot_deg,
+                    on_ground,
                 } => {
                     game.entity_store.move_living_delta(id, dx, dy, dz);
                     game.entity_store
                         .update_living_rotation(id, y_rot_deg, x_rot_deg);
-                    game.item_entity_store.move_delta(id, dx, dy, dz);
+                    game.item_entity_store.move_delta(id, dx, dy, dz, on_ground);
+                }
+                NetworkEvent::EntityMotion { id, velocity } => {
+                    game.item_entity_store.set_motion(id, velocity);
                 }
                 NetworkEvent::EntityTeleported {
                     id,
                     position,
+                    velocity,
                     y_rot_deg,
                     x_rot_deg,
+                    on_ground,
                 } => {
                     game.entity_store.teleport_living(id, position);
                     game.entity_store
                         .update_living_rotation(id, y_rot_deg, x_rot_deg);
-                    game.item_entity_store.teleport(id, position);
+                    game.item_entity_store
+                        .teleport(id, position, velocity, on_ground);
+                }
+                NetworkEvent::LevelEvent {
+                    event_type,
+                    pos,
+                    data,
+                } => {
+                    // Vanilla `LevelEventHandler` case 2001 (block break).
+                    // The server excludes the breaking player from the
+                    // broadcast; the local break's effects come from
+                    // `predict_destroy`. TODO: the other level events.
+                    if event_type == 2001
+                        && let Ok(state) = azalea_block::BlockState::try_from(data)
+                    {
+                        if !state.is_air() {
+                            crate::player::interaction::play_break_sound(&self.audio, state, pos);
+                        }
+                        game.particle_store.add_destroy_block_effect(
+                            pos,
+                            state,
+                            renderer.registry(),
+                            &game.chunk_store,
+                            &game.biome_climate,
+                        );
+                    }
                 }
                 NetworkEvent::EntitiesRemoved { ids } => {
                     for id in &ids {
@@ -1092,6 +1130,11 @@ impl AppCore {
             game.player.game_mode == 1,
             input.selected_slot(),
             place_block,
+            &mut crate::player::interaction::BreakEffects {
+                particles: &mut game.particle_store,
+                registry: renderer.registry(),
+                biome_climate: &game.biome_climate,
+            },
         );
         if !dirty.is_empty() {
             let min_y = game.chunk_store.min_y();
@@ -1100,9 +1143,20 @@ impl AppCore {
             for b in dirty {
                 dirty_sections_for_block(&mut sections, b.x, b.y, b.z, min_y, n);
             }
-            // Player edits are always adjacent (lod 0).
+            // One span per column so each column builds its mesh snapshot
+            // once (the sections of an edit are contiguous per column).
+            let mut spans: Vec<(azalea_core::position::ChunkPos, i32, i32)> = Vec::new();
             for (col, si) in sections {
-                game.enqueue_section_edit(col, si, 0);
+                match spans.iter_mut().find(|(c, ..)| *c == col) {
+                    Some((_, lo, hi)) => {
+                        *lo = (*lo).min(si);
+                        *hi = (*hi).max(si);
+                    }
+                    None => spans.push((col, si, si)),
+                }
+            }
+            for (col, lo, hi) in spans {
+                game.mesh_sections_edit_now(renderer, col, lo..hi + 1);
             }
         }
 
