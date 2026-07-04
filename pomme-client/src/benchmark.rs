@@ -309,26 +309,27 @@ impl ChunkLoadResult {
 }
 
 enum ChunkPhase {
-    Reset,
+    ServerWait,
     Load,
 }
+
+const SERVER_WAIT_MIN_SECS: f32 = 1.0;
+const SERVER_WAIT_STABLE_SECS: f32 = 1.5;
+const SERVER_WAIT_MAX_SECS: f32 = 10.0;
 
 /// What the per-frame driver should do with the render distance this frame.
 pub enum ChunkLoadStep {
     /// Nothing to apply; keep waiting/measuring.
     Wait,
-    /// Apply this render distance and sync it to the server — the timed load
-    /// starts now.
-    Load(u32),
-    /// Loading finished; the driver should restore the original render
-    /// distance.
+    /// Clear chunk meshes and start timing the meshing/upload phase.
+    StartTiming,
+    /// Loading finished; the driver should restore the original render distance.
     Done(Box<ChunkLoadResult>),
 }
 
 /// Measures how long it takes to load every chunk in a chosen render-distance
-/// radius. First drops to [`CHUNK_LOAD_MIN_RD`] so the server unloads the far
-/// chunks, then raises to the target and times the fresh load until the
-/// loaded-chunk count stops rising.
+/// radius. First waits for the server to load all chunks, then times the CPU meshing
+/// and GPU uploading until all client cache chunks are uploaded to the GPU.
 pub struct ChunkLoadBench {
     phase: ChunkPhase,
     target_rd: u32,
@@ -342,16 +343,18 @@ pub struct ChunkLoadBench {
     start: Instant,
     last_count: u32,
     last_change: Instant,
-    /// Loaded count when the timed load began (the reset baseline).
+    /// Target count for the timed run (loaded count in client cache).
     baseline_count: u32,
     /// When the first chunk past the baseline landed.
     first_load_at: Option<Instant>,
     frame_ms_sum: f32,
     frame_ms_max: f32,
     frame_samples: u32,
-    /// How many reset→load cycles have finished (warmup + measured).
+    /// How many runs have finished (warmup + measured).
     runs_done: u32,
     completed: Vec<ChunkLoadRun>,
+    gpu_loaded_count: u32,
+    client_cached_count: u32,
 }
 
 impl ChunkLoadBench {
@@ -373,7 +376,7 @@ impl ChunkLoadBench {
         };
         let now = Instant::now();
         Self {
-            phase: ChunkPhase::Reset,
+            phase: ChunkPhase::ServerWait,
             target_rd,
             effective_rd,
             original_rd,
@@ -392,29 +395,38 @@ impl ChunkLoadBench {
             frame_samples: 0,
             runs_done: 0,
             completed: Vec::new(),
+            gpu_loaded_count: 0,
+            client_cached_count: 0,
         }
     }
 
-    pub fn update(&mut self, loaded_count: u32, frame_ms: f32) -> ChunkLoadStep {
+    pub fn update(&mut self, gpu_loaded: u32, client_cached: u32, frame_ms: f32) -> ChunkLoadStep {
+        self.gpu_loaded_count = gpu_loaded;
+        self.client_cached_count = client_cached;
+
         match self.phase {
-            ChunkPhase::Reset => {
-                // Wait for the unload to settle (count stops dropping) so the
-                // timed load always starts from a clean low baseline, even on a
-                // laggy connection.
-                if loaded_count != self.last_count {
-                    self.last_count = loaded_count;
+            ChunkPhase::ServerWait => {
+                // Wait for the client cache to settle (stop growing)
+                if client_cached != self.last_count {
+                    self.last_count = client_cached;
                     self.last_change = Instant::now();
                 }
-                let min_elapsed = self.reset_start.elapsed().as_secs_f32() >= CHUNK_RESET_MIN_SECS;
-                let settled = self.last_change.elapsed().as_secs_f32() >= CHUNK_RESET_STABLE_SECS;
-                if min_elapsed && settled {
-                    let now = Instant::now();
+                let elapsed = self.reset_start.elapsed().as_secs_f32();
+                let min_elapsed = elapsed >= SERVER_WAIT_MIN_SECS;
+                let settled = self.last_change.elapsed().as_secs_f32() >= SERVER_WAIT_STABLE_SECS;
+                
+                if min_elapsed && (settled || elapsed >= SERVER_WAIT_MAX_SECS) {
                     self.phase = ChunkPhase::Load;
-                    self.start = now;
-                    self.last_change = now;
-                    self.last_count = loaded_count;
-                    self.baseline_count = loaded_count;
-                    ChunkLoadStep::Load(self.target_rd)
+                    self.start = Instant::now();
+                    self.last_change = Instant::now();
+                    self.last_count = gpu_loaded;
+                    self.baseline_count = client_cached;
+                    self.first_load_at = None;
+                    self.frame_ms_sum = 0.0;
+                    self.frame_ms_max = 0.0;
+                    self.frame_samples = 0;
+                    
+                    ChunkLoadStep::StartTiming
                 } else {
                     ChunkLoadStep::Wait
                 }
@@ -424,66 +436,50 @@ impl ChunkLoadBench {
                 self.frame_ms_max = self.frame_ms_max.max(frame_ms);
                 self.frame_samples += 1;
 
-                if loaded_count != self.last_count {
-                    self.last_count = loaded_count;
+                if gpu_loaded != self.last_count {
+                    self.last_count = gpu_loaded;
                     self.last_change = Instant::now();
                 }
-                if self.first_load_at.is_none() && loaded_count > self.baseline_count {
+                if self.first_load_at.is_none() && gpu_loaded > 0 {
                     self.first_load_at = Some(Instant::now());
                 }
 
-                // Done when nearly the whole radius has loaded, or the stream has
-                // genuinely stalled (a capped/slow server), or the safety timeout.
-                let near_complete = loaded_count as f32
-                    >= expected_columns(self.target_rd) as f32 * CHUNK_LOAD_COMPLETE_FRAC;
-                let stalled = loaded_count > 0
-                    && self.last_change.elapsed().as_secs_f32() >= CHUNK_LOAD_STALL_SECS;
-                let timeout = self.start.elapsed().as_secs_f32() >= CHUNK_TIMEOUT_SECS;
-                if near_complete || stalled || timeout {
-                    let load_secs = self
-                        .last_change
-                        .saturating_duration_since(self.start)
-                        .as_secs_f32();
-                    let chunks_per_sec = if load_secs > 0.0 {
-                        loaded_count as f32 / load_secs
-                    } else {
-                        0.0
-                    };
-                    let time_to_first_secs = self
+                // Done when GPU loaded reaches or exceeds the cached chunks target (baseline_count)
+                let done = gpu_loaded >= self.baseline_count;
+
+                if done {
+                    let now = Instant::now();
+                    let elapsed = self.start.elapsed().as_secs_f32();
+                    let first_secs = self
                         .first_load_at
-                        .map(|t| t.saturating_duration_since(self.start).as_secs_f32())
+                        .map(|t| t.duration_since(self.start).as_secs_f32())
                         .unwrap_or(0.0);
-                    let avg_frame_ms = if self.frame_samples > 0 {
-                        self.frame_ms_sum / self.frame_samples as f32
-                    } else {
-                        0.0
-                    };
+
                     self.completed.push(ChunkLoadRun {
-                        chunk_count: loaded_count,
-                        load_secs,
-                        chunks_per_sec,
-                        time_to_first_secs,
-                        avg_frame_ms,
+                        load_secs: elapsed,
+                        chunks_per_sec: self.baseline_count as f32 / elapsed.max(0.001),
+                        time_to_first_secs: first_secs,
+                        avg_frame_ms: self.frame_ms_sum / self.frame_samples.max(1) as f32,
                         worst_frame_ms: self.frame_ms_max,
+                        chunk_count: self.baseline_count,
                     });
+
                     self.runs_done += 1;
 
                     if self.runs_done >= CHUNK_LOAD_TOTAL_RUNS {
                         return ChunkLoadStep::Done(Box::new(self.aggregate()));
                     }
 
-                    // Next cycle: drop back to the minimum RD and re-enter the reset
-                    // phase so the server unloads before the next timed load.
-                    let now = Instant::now();
-                    self.phase = ChunkPhase::Reset;
-                    self.reset_start = now;
+                    // Start next timing run immediately!
+                    self.start = now;
                     self.last_change = now;
-                    self.last_count = loaded_count;
+                    self.last_count = 0;
                     self.first_load_at = None;
                     self.frame_ms_sum = 0.0;
                     self.frame_ms_max = 0.0;
                     self.frame_samples = 0;
-                    ChunkLoadStep::Load(CHUNK_LOAD_MIN_RD)
+                    
+                    ChunkLoadStep::StartTiming
                 } else {
                     ChunkLoadStep::Wait
                 }
@@ -552,11 +548,39 @@ impl ChunkLoadBench {
     }
 
     pub fn loaded(&self) -> u32 {
-        self.last_count
+        self.gpu_loaded_count
+    }
+
+    pub fn client_cached(&self) -> u32 {
+        self.client_cached_count
     }
 
     pub fn resetting(&self) -> bool {
-        matches!(self.phase, ChunkPhase::Reset)
+        matches!(self.phase, ChunkPhase::ServerWait)
+    }
+
+    pub fn reset_elapsed_secs(&self) -> f32 {
+        self.reset_start.elapsed().as_secs_f32()
+    }
+
+    pub fn load_elapsed_secs(&self) -> f32 {
+        if matches!(self.phase, ChunkPhase::Load) {
+            self.start.elapsed().as_secs_f32()
+        } else {
+            0.0
+        }
+    }
+
+    pub fn avg_frame_ms(&self) -> f32 {
+        if self.frame_samples > 0 {
+            self.frame_ms_sum / self.frame_samples as f32
+        } else {
+            0.0
+        }
+    }
+
+    pub fn worst_frame_ms(&self) -> f32 {
+        self.frame_ms_max
     }
 }
 

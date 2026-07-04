@@ -37,8 +37,9 @@ pub fn update_connecting(
     if matches!(connect_phase, ConnectionPhase::Loading) {
         game.mesh_dispatcher
             .set_camera_position(*game.player.position);
-        for mesh in game.mesh_dispatcher.drain_results() {
-            gfx.renderer.upload_chunk_mesh(&mesh);
+        game.mesh_upload_queue.extend(game.mesh_dispatcher.drain_results());
+        if !game.mesh_upload_queue.is_empty() {
+            gfx.renderer.upload_mesh_batch(&mut game.mesh_upload_queue);
         }
 
         let ready = game.position_set && (game.dead || gfx.renderer.loaded_chunk_count() > 0);

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use azalea_block::BlockState;
-use azalea_core::position::{BlockPos, ChunkPos};
+
 pub use camera::CloudMode;
 use camera::{Camera, CameraUniform};
 use chunk::atlas::TextureAtlas;
@@ -858,14 +858,15 @@ impl Renderer {
             .wait_for_fences(&self.ctx.in_flight_fences, true, u64::MAX);
     }
 
-    /// Returns the section indices dropped due to pool exhaustion (need
-    /// re-mesh); empty on success.
-    pub fn upload_chunk_mesh(&mut self, mesh: &SectionMeshData) -> Vec<i32> {
-        self.chunk_buffers.upload(
+    pub fn upload_mesh_batch(
+        &mut self,
+        mesh_queue: &mut std::collections::VecDeque<SectionMeshData>,
+    ) -> Vec<(ChunkSectionPos, chunk::occlusion_graph::VisibilitySet, u64)> {
+        self.chunk_buffers.upload_mesh_batch(
             &self.ctx.device,
             &self.ctx.allocator,
             self.ctx.graphics_queue,
-            mesh,
+            mesh_queue,
         )
     }
 
@@ -1288,8 +1289,17 @@ impl Renderer {
             let eye = self.camera.position.as_vec3() + self.camera.third_person_offset();
             let cam_pos: [f32; 3] = eye.into();
 
+            let (render_distance, player_pos) = match &mode {
+                RenderMode::World { render_distance, .. } => (*render_distance, *self.camera.position),
+                _ => (12, glam::DVec3::ZERO),
+            };
+            let player_chunk = ChunkPos::new(
+                player_pos.x.div_euclid(16.0) as i32,
+                player_pos.z.div_euclid(16.0) as i32,
+            );
+
             self.chunk_buffers
-                .dispatch_cull(cmd, frame, &frustum, cam_pos);
+                .dispatch_cull(cmd, frame, &frustum, cam_pos, player_chunk, Some(render_distance));
         }
 
         let clear_values = [

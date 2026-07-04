@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -20,7 +20,7 @@ use crate::net::connection::ConnectionHandle;
 use crate::player::LocalPlayer;
 use crate::player::interaction::{HitResult, InteractionState};
 use crate::player::tab_list::TabList;
-use crate::renderer::chunk::mesher::{BiomeClimate, MeshDispatcher};
+use crate::renderer::chunk::mesher::{BiomeClimate, MeshDispatcher, SectionMeshData};
 use crate::renderer::chunk::occlusion_graph::{self, VisibilitySet};
 use crate::renderer::pipelines::entity_renderer::{
     EntityRenderInfo, WHITE_TINT, jeb_sheep_tint, wool_color_tint,
@@ -114,6 +114,7 @@ pub struct GameState {
     /// re-scan meshes only sections newly made visible (or re-meshes all on a
     /// lod/content change), so hidden sections never mesh.
     pub meshed: HashMap<ChunkSectionPos, MeshedSection>,
+    pub mesh_upload_queue: VecDeque<SectionMeshData>,
     /// Per-column bitmask of currently-visible section indices (bit `si` set =
     /// section is in-frustum and not occluded). Computed in
     /// `update_visibility`.
@@ -219,6 +220,7 @@ impl GameState {
             chunk_load_upload: None,
             content_gen: HashMap::new(),
             meshed: HashMap::new(),
+            mesh_upload_queue: VecDeque::new(),
             vis_mask: HashMap::new(),
             section_gen: HashMap::new(),
             next_section_gen: 0,
@@ -446,12 +448,12 @@ impl GameState {
             for si in 0..section_count {
                 let spos = ChunkSectionPos::new(pos.x, min_y_section + si, pos.z);
                 let content_gen = self.content_gen.get(&spos).copied().unwrap_or(0);
-                
+
                 let needs_mesh = match self.meshed.get(&spos) {
                     Some(m) if m.lod == lod && m.content_gen == content_gen => false,
                     _ => true,
                 };
-                
+
                 if needs_mesh {
                     self.mesh_dispatcher.enqueue_section(
                         &self.chunk_store,
@@ -460,13 +462,7 @@ impl GameState {
                         false,
                         content_gen,
                     );
-                    self.meshed.insert(
-                        spos,
-                        MeshedSection {
-                            lod,
-                            content_gen,
-                        },
-                    );
+                    self.meshed.insert(spos, MeshedSection { lod, content_gen });
                 }
             }
         }
@@ -742,17 +738,23 @@ pub fn update_game(
                 ms(t.enqueued_at.elapsed()),
             );
         }
-        let dropped = gfx.renderer.upload_chunk_mesh(&mesh);
-        // Sections dropped on pool exhaustion were retired from the buffer; clear
-        // their meshed entry so the next rescan re-enqueues them.
-        if !dropped.is_empty() {
-            game.meshed.remove(&mesh.spos);
+        game.mesh_upload_queue.push_back(mesh);
+    }
+
+    if !game.mesh_upload_queue.is_empty() {
+        let start = std::time::Instant::now();
+
+        let uploaded = gfx.renderer.upload_mesh_batch(&mut game.mesh_upload_queue);
+
+        for (spos, visibility, upload_epoch) in uploaded {
+            let e = game.section_vis_epoch.entry(spos).or_insert(0);
+            if upload_epoch >= *e {
+                *e = upload_epoch;
+                game.section_vis.insert(spos, visibility);
+            }
         }
-        let e = game.section_vis_epoch.entry(mesh.spos).or_insert(0);
-        if mesh.upload_epoch >= *e {
-            *e = mesh.upload_epoch;
-            game.section_vis.insert(mesh.spos, mesh.visibility);
-        }
+
+        let elapsed = start.elapsed();
     }
 
     game.mesh_dispatcher
@@ -1028,12 +1030,14 @@ pub fn update_game(
 
     if let Some(mut bench) = game.chunk_load_bench.take() {
         let count = gfx.renderer.loaded_chunk_count();
-        match bench.update(count, raw_dt * 1000.0) {
+        let client_cached = game.chunk_store.loaded_positions().len() as u32;
+        match bench.update(count, client_cached, raw_dt * 1000.0) {
             ChunkLoadStep::Wait => {
                 game.chunk_load_bench = Some(bench);
             }
-            ChunkLoadStep::Load(rd) => {
-                apply_render_distance(core, game, connection, rd);
+            ChunkLoadStep::StartTiming => {
+                gfx.renderer.clear_chunk_meshes();
+                game.meshed.clear();
                 game.chunk_load_bench = Some(bench);
             }
             ChunkLoadStep::Done(result) => {
@@ -1059,24 +1063,90 @@ pub fn update_game(
     }
 
     if let Some(ref bench) = game.chunk_load_bench {
-        let progress = format!("run {}/{}", bench.current_run(), bench.total_runs());
-        let label = if bench.resetting() {
-            format!("Resetting world... ({progress})")
+        let progress = format!("Run {}/{}", bench.current_run(), bench.total_runs());
+        let mut info_lines = Vec::new();
+
+        info_lines.push(format!("=== CHUNK LOAD BENCHMARK ({}) ===", progress));
+
+        if bench.resetting() {
+            let expected = (bench.target_rd() * 2 + 1).pow(2);
+            info_lines.push(format!(
+                "Phase: Waiting for server chunks (Target RD: {})",
+                bench.target_rd()
+            ));
+            info_lines.push(format!(
+                "Chunks (Client Cache): {} / ~{}",
+                bench.client_cached(),
+                expected
+            ));
+            info_lines.push(format!(
+                "Elapsed Wait Time: {:.2}s",
+                bench.reset_elapsed_secs()
+            ));
         } else {
-            format!(
-                "Loading RD {}... {} chunks ({progress})",
-                bench.target_rd(),
-                bench.loaded()
-            )
-        };
-        elements.push(MenuElement::Text {
-            x: sw / 2.0,
-            y: 28.0,
-            text: label,
-            scale: 8.0 * gs,
-            color: [1.0, 1.0, 1.0, 1.0],
-            centered: true,
+            let expected = bench.client_cached();
+            info_lines.push(format!(
+                "Phase: Timing meshing/upload (Target RD: {})",
+                bench.target_rd()
+            ));
+            info_lines.push(format!(
+                "Chunks (GPU Mesh): {} / {}",
+                bench.loaded(),
+                expected
+            ));
+            info_lines.push(format!("Chunks (Client Cache): {}", bench.client_cached()));
+            info_lines.push(format!(
+                "Pending Mesh Jobs: {}",
+                game.mesh_dispatcher.pending_jobs()
+            ));
+            info_lines.push(format!(
+                "Elapsed Load Time: {:.2}s",
+                bench.load_elapsed_secs()
+            ));
+        }
+
+        info_lines.push(String::new()); // Blank spacing line
+
+        info_lines.push(format!(
+            "FPS: {:.1} (avg: {:.1} ms, worst: {:.1} ms)",
+            1.0 / raw_dt.max(0.0001),
+            bench.avg_frame_ms(),
+            bench.worst_frame_ms()
+        ));
+        info_lines.push(format!("GPU: {}", gfx.renderer.gpu_name()));
+        info_lines.push(format!(
+            "System Threads: {}",
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        ));
+
+        let padding = 10.0 * gs;
+        let line_height = 14.0 * gs;
+        let box_w = 320.0 * gs;
+        let box_h = (info_lines.len() as f32 * 14.0 + 8.0) * gs;
+        let box_x = 10.0 * gs;
+        let box_y = 10.0 * gs;
+
+        elements.push(MenuElement::Rect {
+            x: box_x,
+            y: box_y,
+            w: box_w,
+            h: box_h,
+            corner_radius: 4.0 * gs,
+            color: [0.0, 0.0, 0.0, 0.75],
         });
+
+        for (idx, line) in info_lines.into_iter().enumerate() {
+            elements.push(MenuElement::Text {
+                x: box_x + padding,
+                y: box_y + padding + (idx as f32 * line_height),
+                text: line,
+                scale: 6.0 * gs,
+                color: [1.0, 1.0, 1.0, 1.0],
+                centered: false,
+            });
+        }
     }
 
     if let Some(ref result) = game.chunk_load_result {
@@ -1595,9 +1665,8 @@ pub fn update_game(
             game.chunk_load_result = None;
             game.pause_screen = PauseScreen::Main;
             game.paused = false;
-            // Drop to the minimum render distance so the server unloads the far
-            // chunks; the driver raises it to the target once the reset settles.
-            apply_render_distance(core, game, connection, crate::benchmark::CHUNK_LOAD_MIN_RD);
+            // Initialize the server request to the target render distance.
+            apply_render_distance(core, game, connection, core.menu.render_distance);
             core.apply_cursor_grab(&gfx.window, Some(game));
         }
         PauseAction::ReportBugs => {

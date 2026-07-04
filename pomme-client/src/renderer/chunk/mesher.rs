@@ -179,7 +179,6 @@ fn tint_color(tint: Tint, grass: [f32; 3], foliage: [f32; 3], dry_foliage: [f32;
     }
 }
 
-const MAX_MESH_UPLOADS_PER_FRAME: usize = 16;
 
 pub struct Colormap {
     pixels: Vec<[u8; 3]>,
@@ -515,11 +514,15 @@ impl MeshDispatcher {
         self.queue.set_camera(pos);
     }
 
+    pub fn pending_jobs(&self) -> usize {
+        self.queue.pending_jobs()
+    }
+
     pub fn drain_results(&self) -> impl Iterator<Item = SectionMeshData> + '_ {
         // Edits drain fully and first; bulk chunk loads stay capped per frame.
         self.priority_rx
             .try_iter()
-            .chain(self.result_rx.try_iter().take(MAX_MESH_UPLOADS_PER_FRAME))
+            .chain(self.result_rx.try_iter())
     }
 }
 
@@ -553,6 +556,7 @@ struct PendingJob {
 impl PendingJob {
     fn run(self) {
         let started_at = self.enqueued_at.map(|_| std::time::Instant::now());
+
 
         let mut mesh = mesh_section(
             &self.snapshot,
@@ -625,6 +629,10 @@ impl MeshQueue {
 
     fn set_camera(&self, camera: glam::DVec3) {
         self.state.lock().unwrap().camera = camera;
+    }
+
+    fn pending_jobs(&self) -> usize {
+        self.state.lock().unwrap().tasks.len()
     }
 
     fn close(&self) {

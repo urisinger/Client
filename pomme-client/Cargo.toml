@@ -21,6 +21,7 @@ reqwest = { workspace = true, features = ["blocking"] }
 pyronyx = { workspace = true, features = ["rwh_06"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tracy-client = "0.16"
 
 tracing-appender = "0.2"
 pomme-gpu-allocator = { path = "../pomme-gpu-allocator" }
