@@ -306,6 +306,7 @@ impl InteractionState {
         creative: bool,
         selected_slot: u8,
         place_block: Option<BlockState>,
+        hands_empty: bool,
         effects: &mut BreakEffects,
     ) -> Vec<BlockPos> {
         let mut dirty_chunks = Vec::new();
@@ -359,8 +360,15 @@ impl InteractionState {
         if input.action_just_pressed(input::Action::Use)
             || (input.performing_action(input::Action::Use) && self.use_delay == 0)
         {
-            let success =
-                self.use_item_on(sender, chunks, player_pos, place_block, &mut dirty_chunks);
+            let suppress_block_use = input.performing_action(input::Action::Sneak) && !hands_empty;
+            let success = self.use_item_on(
+                sender,
+                chunks,
+                player_pos,
+                place_block,
+                suppress_block_use,
+                &mut dirty_chunks,
+            );
             if success {
                 let _ = input.weak_rumble_for_instant();
             }
@@ -484,6 +492,7 @@ impl InteractionState {
         chunks: &ChunkStore,
         player_pos: DVec3,
         place_block: Option<BlockState>,
+        suppress_block_use: bool,
         dirty_chunks: &mut Vec<BlockPos>,
     ) -> bool {
         if self.is_destroying {
@@ -510,6 +519,16 @@ impl InteractionState {
             },
             seq: self.seq,
         }));
+
+        // Clicking a menu-opening block uses it instead of placing (unless
+        // sneaking with something in hand, vanilla `isSecondaryUseActive`),
+        // so don't predict a placement the server won't do.
+        if !suppress_block_use {
+            let target = chunks.get_block_state(hit.block_pos.x, hit.block_pos.y, hit.block_pos.z);
+            if opens_menu(target) {
+                return true;
+            }
+        }
 
         self.predict_place(hit, place_block, chunks, player_pos, dirty_chunks);
         true
@@ -731,6 +750,12 @@ impl InteractionState {
             self.destroy_progress = 0.0;
         }
     }
+}
+
+/// Whether right-clicking this block opens a menu we render (so a use
+/// interaction won't place a block).
+fn opens_menu(state: BlockState) -> bool {
+    crate::world::block::block_id(state) == "crafting_table"
 }
 
 fn destroy_progress(state: BlockState, on_ground: bool, creative: bool) -> f32 {

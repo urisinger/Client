@@ -142,8 +142,9 @@ pub fn handle_game_packet(
                 },
             ));
         }
-        ClientboundGamePacket::ContainerSetContent(p) if p.container_id == 0 => {
-            let _ = event_tx.try_send(NetworkEvent::InventoryContent {
+        ClientboundGamePacket::ContainerSetContent(p) => {
+            let _ = event_tx.try_send(NetworkEvent::ContainerContent {
+                container_id: p.container_id,
                 items: p.items.clone(),
                 carried: p.carried_item.clone(),
                 state_id: p.state_id,
@@ -154,14 +155,23 @@ pub fn handle_game_packet(
                 item: p.contents.clone(),
             });
         }
-        ClientboundGamePacket::ContainerSetSlot(p)
-            if p.container_id == 0 || p.container_id == -2 =>
-        {
-            let _ = event_tx.try_send(NetworkEvent::InventorySlot {
+        ClientboundGamePacket::ContainerSetSlot(p) => {
+            let _ = event_tx.try_send(NetworkEvent::ContainerSlot {
+                container_id: p.container_id,
                 index: p.slot,
                 item: p.item_stack.clone(),
                 state_id: p.state_id,
             });
+        }
+        ClientboundGamePacket::OpenScreen(p) => {
+            let _ = event_tx.try_send(NetworkEvent::OpenScreen {
+                container_id: p.container_id,
+                menu_type: p.menu_type,
+                title: p.title.to_string(),
+            });
+        }
+        ClientboundGamePacket::ContainerClose(_) => {
+            let _ = event_tx.try_send(NetworkEvent::ContainerClosed);
         }
         ClientboundGamePacket::SetHealth(p) => {
             let _ = event_tx.try_send(NetworkEvent::PlayerHealth {

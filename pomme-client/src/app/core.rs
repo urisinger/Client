@@ -506,14 +506,29 @@ impl AppCore {
                         game.player.armor = armor;
                     }
                 }
-                NetworkEvent::InventoryContent {
+                NetworkEvent::ContainerContent {
+                    container_id,
                     items,
                     carried,
                     state_id,
                 } => {
-                    game.player.inventory.set_contents(items);
-                    game.cursor_item = carried;
-                    game.container_state_id = state_id;
+                    // State ids are per-menu (vanilla scopes them to the menu
+                    // the packet addresses); the rendered carried stack is the
+                    // open menu's, so an inventory sync must not clobber it.
+                    if container_id == 0 {
+                        game.player.inventory.set_contents(items);
+                        game.sync_container_from_inventory();
+                        game.inventory_state_id = state_id;
+                        if game.open_container.is_none() {
+                            game.cursor_item = carried;
+                        }
+                    } else if game.open_menu_id() == Some(container_id) {
+                        for (i, item) in items.into_iter().enumerate() {
+                            game.set_menu_slot(i, item);
+                        }
+                        game.cursor_item = carried;
+                        game.set_container_state_id(state_id);
+                    }
                 }
                 NetworkEvent::CursorItem { item } => {
                     game.cursor_item = item;
@@ -521,13 +536,70 @@ impl AppCore {
                 NetworkEvent::Registries(registries) => {
                     game.registries = registries;
                 }
-                NetworkEvent::InventorySlot {
+                NetworkEvent::ContainerSlot {
+                    container_id,
                     index,
                     item,
                     state_id,
                 } => {
-                    game.container_state_id = state_id;
-                    game.player.inventory.set_slot(index as usize, item);
+                    // Direct inventory updates (-2) carry no menu state id.
+                    if container_id == 0 || container_id == -2 {
+                        game.player.inventory.set_slot(index as usize, item);
+                        game.sync_container_from_inventory();
+                        if container_id == 0 {
+                            game.inventory_state_id = state_id;
+                        }
+                    } else if game.open_menu_id() == Some(container_id) {
+                        game.set_menu_slot(index as usize, item);
+                        game.set_container_state_id(state_id);
+                    }
+                }
+                NetworkEvent::OpenScreen {
+                    container_id,
+                    menu_type,
+                    title,
+                } => {
+                    use azalea_inventory::ItemStack;
+                    use azalea_registry::builtin::MenuKind;
+                    if menu_type == MenuKind::Crafting {
+                        // Vanilla setScreen replaces whatever screen is up,
+                        // including the pause menu.
+                        game.paused = false;
+                        game.inventory_open = false;
+                        game.close_creative_inventory();
+                        game.inv_drag = None;
+                        game.inv_last_click = None;
+                        game.open_container = Some(crate::app::phases::in_game::OpenContainer {
+                            id: container_id,
+                            title,
+                            slots: vec![ItemStack::Empty; crate::ui::crafting_table::SLOT_COUNT],
+                            state_id: 0,
+                        });
+                        game.sync_container_from_inventory();
+                        // The new menu replaces any previous one server-side;
+                        // don't send a close for the replaced menu (the server
+                        // would apply it to this one).
+                        game.container_was_open = Some(container_id);
+                        self.apply_cursor_grab(window, Some(game));
+                    } else {
+                        // TODO: render the remaining menu screens (chest,
+                        // furnace, ...). Until then tell the server we closed
+                        // the menu so its container state stays consistent.
+                        use azalea_protocol::packets::game::s_container_close::ServerboundContainerClose;
+                        connection
+                            .packet_tx
+                            .send(ServerboundGamePacket::ContainerClose(
+                                ServerboundContainerClose { container_id },
+                            ));
+                    }
+                }
+                NetworkEvent::ContainerClosed => {
+                    // Vanilla closes whatever menu is open regardless of the
+                    // packet's container id.
+                    game.close_menu();
+                    // The server initiated the close; don't echo one back.
+                    game.container_was_open = None;
+                    self.apply_cursor_grab(window, Some(game));
                 }
                 NetworkEvent::ChatMessage { spans } => {
                     game.chat.push_message(spans);
@@ -1120,16 +1192,20 @@ impl AppCore {
             game.player.game_mode == 1,
         );
 
-        let place_block = {
-            let slot = input.selected_slot() as usize;
-            match game.player.inventory.hotbar_slots().get(slot) {
-                Some(stack) if !matches!(stack, azalea_inventory::ItemStack::Empty) => {
-                    let name = crate::player::inventory::item_resource_name(stack.kind());
-                    renderer.registry().placeable_block_for_item(&name)
-                }
-                _ => None,
+        let main_hand = game
+            .player
+            .inventory
+            .hotbar_slots()
+            .get(input.selected_slot() as usize);
+        let place_block = match main_hand {
+            Some(stack) if !stack.is_empty() => {
+                let name = crate::player::inventory::item_resource_name(stack.kind());
+                renderer.registry().placeable_block_for_item(&name)
             }
+            _ => None,
         };
+        let hands_empty =
+            main_hand.is_none_or(|s| s.is_empty()) && game.player.inventory.offhand().is_empty();
 
         let dirty = game.interaction.tick(
             input,
@@ -1141,6 +1217,7 @@ impl AppCore {
             game.player.game_mode == 1,
             input.selected_slot(),
             place_block,
+            hands_empty,
             &mut crate::player::interaction::BreakEffects {
                 particles: &mut game.particle_store,
                 registry: renderer.registry(),

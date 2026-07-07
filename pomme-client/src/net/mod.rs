@@ -59,16 +59,24 @@ pub enum NetworkEvent {
         entity_id: i32,
         armor: u32,
     },
-    InventoryContent {
+    ContainerContent {
+        container_id: i32,
         items: Vec<ItemStack>,
         carried: ItemStack,
         state_id: u32,
     },
-    InventorySlot {
+    ContainerSlot {
+        container_id: i32,
         index: u16,
         item: ItemStack,
         state_id: u32,
     },
+    OpenScreen {
+        container_id: i32,
+        menu_type: azalea_registry::builtin::MenuKind,
+        title: String,
+    },
+    ContainerClosed,
     CursorItem {
         item: ItemStack,
     },
