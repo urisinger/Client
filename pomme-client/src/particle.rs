@@ -20,6 +20,7 @@ use crate::renderer::chunk::mesher::{
 };
 use crate::renderer::pipelines::particle::MAX_PARTICLE_QUADS as MAX_PARTICLES;
 use crate::world::block::registry::{BlockRegistry, Tint};
+use crate::world::block::{block_id, is_air};
 use crate::world::chunk::ChunkStore;
 
 /// Vanilla `ParticleGroup.RESERVOIR_START` — above this, new particles are
@@ -321,12 +322,12 @@ impl ParticleStore {
         chunks: &ChunkStore,
         biome_climate: &HashMap<u32, BiomeClimate>,
     ) {
-        if state.is_air() {
+        if is_air(state) {
             return;
         }
-        let block: Box<dyn azalea_block::BlockTrait> = state.into();
+        let block_id = block_id(state);
         // The only vanilla `noTerrainParticles` blocks.
-        if matches!(block.id(), "barrier" | "structure_void") {
+        if matches!(block_id, "barrier" | "structure_void") {
             return;
         }
 
@@ -337,7 +338,7 @@ impl ParticleStore {
         let faces = registry.get_textures(state);
         if let Some(faces) = faces
             && faces.tint != Tint::None
-            && block.id() != "grass_block"
+            && block_id != "grass_block"
         {
             let tint = self.blend_tint(faces.tint, pos, chunks, biome_climate);
             for (c, t) in color.iter_mut().zip(tint) {
