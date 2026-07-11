@@ -1,3 +1,4 @@
+use azalea_buf::{AzBuf, AzBufVar};
 use azalea_core::position::ChunkPos;
 use azalea_core::registry_holder::RegistryHolder;
 use azalea_protocol::packets::game::{ClientboundGamePacket, ServerboundGamePacket};
@@ -649,4 +650,83 @@ fn send_entity_moved(
         dz: delta.za as f64 / 4096.0,
         on_ground,
     });
+}
+
+/// Consume `ClientboundLevelParticles` from the raw packet bytes, before
+/// azalea's typed decode. azalea 26.2's `Particle` wire enum is out of sync
+/// with the particle registry (the new 26.2 particles are appended at the end
+/// instead of inserted in registry order), misdecoding every type id past
+/// `bubble`; pomme reads the id itself and skips the type-specific payload,
+/// which is the packet's last field. Returns whether the packet was consumed.
+pub fn handle_raw_game_packet(raw: &[u8], event_tx: &Sender<NetworkEvent>) -> bool {
+    let mut cur = std::io::Cursor::new(raw);
+    if u32::azalea_read_var(&mut cur).ok() != Some(level_particles_packet_id()) {
+        return false;
+    }
+    match parse_level_particles(&mut cur) {
+        Ok(Some(event)) => {
+            let _ = event_tx.try_send(event);
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("Skipping malformed LevelParticles packet: {e}"),
+    }
+    true
+}
+
+/// The wire layout of vanilla `ClientboundLevelParticlesPacket.write`, up to
+/// the particle type id.
+fn parse_level_particles(
+    cur: &mut std::io::Cursor<&[u8]>,
+) -> Result<Option<NetworkEvent>, azalea_buf::BufReadError> {
+    let override_limiter = bool::azalea_read(cur)?;
+    let _always_show = bool::azalea_read(cur)?;
+    let pos = glam::dvec3(
+        f64::azalea_read(cur)?,
+        f64::azalea_read(cur)?,
+        f64::azalea_read(cur)?,
+    );
+    let x_dist = f32::azalea_read(cur)?;
+    let y_dist = f32::azalea_read(cur)?;
+    let z_dist = f32::azalea_read(cur)?;
+    let max_speed = f32::azalea_read(cur)?;
+    // Signed on the wire; Java's `i < count` loop no-ops on negative counts.
+    let count = i32::azalea_read(cur)?.max(0) as u32;
+    let Some(kind) = crate::particle::ServerParticleKind::from_id(u32::azalea_read_var(cur)?)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(NetworkEvent::LevelParticles {
+        kind,
+        override_limiter,
+        pos,
+        x_dist,
+        y_dist,
+        z_dist,
+        max_speed,
+        count,
+    }))
+}
+
+/// `ClientboundLevelParticles`' packet id, taken from azalea's own dispatch
+/// table so it tracks protocol updates.
+fn level_particles_packet_id() -> u32 {
+    use azalea_protocol::packets::ProtocolPacket;
+
+    static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| {
+        ClientboundGamePacket::LevelParticles(
+            azalea_protocol::packets::game::c_level_particles::ClientboundLevelParticles {
+                override_limiter: false,
+                always_show: false,
+                pos: azalea_core::position::Vec3::default(),
+                x_dist: 0.0,
+                y_dist: 0.0,
+                z_dist: 0.0,
+                max_speed: 0.0,
+                count: 0,
+                particle: azalea_entity::particle::Particle::AngryVillager,
+            },
+        )
+        .id()
+    })
 }
