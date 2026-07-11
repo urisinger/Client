@@ -231,7 +231,7 @@ impl InputState {
                     self.recent_actions.remove(&Action::ChangePerspective);
                 }
                 if self.action_just_pressed(Action::OpenChat) {
-                    if !game.paused && !game.gui_open() {
+                    if !game.paused && !game.gui_open() && !game.chat.is_open() {
                         game.chat.open();
                         should_apply_cursor_grab = true;
                     }
@@ -239,7 +239,7 @@ impl InputState {
                     self.recent_actions.remove(&Action::OpenChat);
                 }
                 if self.action_just_pressed(Action::OpenCommands) {
-                    if !game.paused && !game.gui_open() {
+                    if !game.paused && !game.gui_open() && !game.chat.is_open() {
                         game.chat.open_with_slash();
                         should_apply_cursor_grab = true;
                     }
