@@ -430,6 +430,7 @@ pub(super) fn push_bottom_text(
     screen_w: f32,
     screen_h: f32,
     gs: f32,
+    version: &str,
     text_width_fn: &dyn Fn(&str, f32) -> f32,
 ) {
     let fs = 7.0 * gs;
@@ -440,7 +441,7 @@ pub(super) fn push_bottom_text(
     elements.push(MenuElement::Text {
         x: pad,
         y,
-        text: "Minecraft 1.21.11".into(),
+        text: format!("Minecraft {version}"),
         scale: fs,
         color: col,
         centered: false,
