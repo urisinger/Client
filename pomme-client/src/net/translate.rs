@@ -47,9 +47,21 @@ pub struct Translation {
     set_player_team_id: u32,
 }
 
+/// Protocols the wire translation fully covers. 1.21.11 (774) has embedded
+/// tables, but its game translation hasn't landed yet, so it stays
+/// un-joinable and untranslated.
+const TRANSLATED: &[i32] = &[775];
+
+/// Whether a server speaking `protocol` can be joined: the native latest
+/// version, or an older one with a complete wire translation. Gates both
+/// wire-version negotiation and the server list's compatibility marker.
+pub fn joinable(protocol: i32) -> bool {
+    protocol == LATEST.protocol || TRANSLATED.contains(&protocol)
+}
+
 /// The translation for the wire version negotiated with the current server,
 /// or `None` when the client speaks it natively (the latest version, or one
-/// without embedded protocol data, which connects untranslated as before).
+/// outside `TRANSLATED`, which connects untranslated as before).
 pub fn active() -> Option<&'static Translation> {
     let protocol = crate::version::session_protocol();
     if protocol == LATEST.protocol {
@@ -71,10 +83,11 @@ pub fn active() -> Option<&'static Translation> {
 }
 
 impl Translation {
-    /// The translation for one protocol number, or `None` when it needs no
-    /// translation (the latest version) or has no embedded protocol data.
+    /// The translation for one protocol number, or `None` outside
+    /// `TRANSLATED`: the frame rewrites below are version-specific, so
+    /// embedded data alone isn't enough (and the latest version needs none).
     pub(crate) fn for_protocol(protocol: i32) -> Option<Translation> {
-        if protocol == LATEST.protocol {
+        if !TRANSLATED.contains(&protocol) {
             return None;
         }
         let table = PacketTable::for_protocol(protocol)?;
