@@ -1,16 +1,16 @@
-use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use azalea_block::BlockState;
 use azalea_core::heightmap_kind::HeightmapKind;
 use azalea_core::position::{BlockPos, ChunkPos};
 use azalea_world::chunk::Chunk;
-use azalea_world::chunk::partial::PartialChunkStorage;
-use azalea_world::chunk::storage::ChunkStorage;
+use crossbeam_epoch::{self as epoch, Atomic, Owned};
 use parking_lot::RwLock;
 use thiserror::Error;
 
 use super::block_entity::StoredBlockEntity;
+use crate::util::ChunkRing;
 
 const OVERWORLD_HEIGHT: u32 = 384;
 const OVERWORLD_MIN_Y: i32 = -64;
@@ -73,55 +73,125 @@ impl ChunkLightData {
     }
 }
 
-pub struct ChunkStore {
-    pub chunk_storage: ChunkStorage,
-    pub partial_storage: PartialChunkStorage,
-    pub light_data: std::collections::HashMap<(i32, i32), ChunkLightData>,
-    pub block_entities: std::collections::HashMap<BlockPos, StoredBlockEntity>,
+pub const fn pack_chunk_pos(pos: ChunkPos) -> u64 {
+    let x = (pos.x as u64) & 0x0000_0000_FFFF_FFFF;
+    let z = (pos.z as u64) & 0x0000_0000_FFFF_FFFF;
+    (x << 32) | z
 }
 
-impl ChunkStore {
+pub const fn unpack_chunk_pos(val: u64) -> ChunkPos {
+    let x = (val >> 32) as i32;
+    let z = val as i32;
+    ChunkPos { x, z }
+}
+
+/// Shared, lock-free chunk store accessible by main thread and worker threads
+/// via `crossbeam-epoch`.
+pub struct SharedChunkStore {
+    view_center: AtomicU64,
+    pub(crate) chunk_radius: u32,
+    view_range: u32,
+    chunks: ChunkRing<Atomic<Chunk>>,
+    pub light_data: ChunkRing<Atomic<ChunkLightData>>,
+    height: u32,
+    min_y: i32,
+}
+
+impl SharedChunkStore {
     pub fn new(view_distance: u32) -> Self {
         Self::new_with_dimension(view_distance, OVERWORLD_HEIGHT, OVERWORLD_MIN_Y)
     }
 
     pub fn new_with_dimension(view_distance: u32, height: u32, min_y: i32) -> Self {
+        let chunk_radius = view_distance.max(64);
+        let view_range = chunk_radius * 2 + 1;
         Self {
-            chunk_storage: ChunkStorage::new(height, min_y),
-            partial_storage: PartialChunkStorage::new(view_distance.max(64)),
-            light_data: std::collections::HashMap::new(),
-            block_entities: std::collections::HashMap::new(),
+            view_center: AtomicU64::new(pack_chunk_pos(ChunkPos::new(0, 0))),
+            chunk_radius,
+            view_range,
+            height,
+            min_y,
+            chunks: ChunkRing::from_fn(|_, _| Atomic::null()),
+            light_data: ChunkRing::from_fn(|_, _| Atomic::null()),
         }
     }
 
+    pub fn update_view_center(&self, view_center: ChunkPos) {
+        self.view_center
+            .store(pack_chunk_pos(view_center), Ordering::Release);
+    }
+
+    pub fn view_center(&self) -> ChunkPos {
+        unpack_chunk_pos(self.view_center.load(Ordering::Acquire))
+    }
+
     pub fn loaded_positions(&self) -> Vec<ChunkPos> {
-        self.light_data
-            .keys()
-            .map(|&(x, z)| ChunkPos::new(x, z))
-            .collect()
+        let guard = epoch::pin();
+        let center = self.view_center();
+        let r = self.chunk_radius as i32;
+        let mut list = Vec::new();
+        for x in (center.x - r)..=(center.x + r) {
+            for z in (center.z - r)..=(center.z + r) {
+                let pos = ChunkPos::new(x, z);
+                if !self
+                    .chunks
+                    .get(pos)
+                    .load(Ordering::Acquire, &guard)
+                    .is_null()
+                {
+                    list.push(pos);
+                }
+            }
+        }
+        list
+    }
+
+    pub fn has_chunk(&self, pos: ChunkPos) -> bool {
+        let guard = epoch::pin();
+        !self
+            .chunks
+            .get(pos)
+            .load(Ordering::Acquire, &guard)
+            .is_null()
+    }
+
+    pub fn get_chunk_guard<'g>(&self, pos: ChunkPos, guard: &'g epoch::Guard) -> Option<&'g Chunk> {
+        let shared = self.chunks.get(pos).load(Ordering::Acquire, guard);
+        unsafe { shared.as_ref() }
     }
 
     pub fn load_chunk(
-        &mut self,
+        &self,
         pos: ChunkPos,
         data: &[u8],
         heightmaps: &[(HeightmapKind, Box<[u64]>)],
     ) -> Result<(), ChunkError> {
-        let mut cursor = Cursor::new(data);
-        self.partial_storage
-            .replace_with_packet_data(&pos, &mut cursor, heightmaps, &mut self.chunk_storage)
-            .map_err(|e| ChunkError::Parse(e.to_string()))
+        let mut cursor = std::io::Cursor::new(data);
+        let chunk =
+            Chunk::read_with_dimension_height(&mut cursor, self.height, self.min_y, heightmaps)
+                .map_err(|e| ChunkError::Parse(e.to_string()))?;
+        let guard = epoch::pin();
+        let old_ptr = self
+            .chunks
+            .get(pos)
+            .swap(Owned::new(chunk), Ordering::Release, &guard);
+        if !old_ptr.is_null() {
+            unsafe {
+                guard.defer_destroy(old_ptr);
+            }
+        }
+        Ok(())
     }
 
     pub fn store_light(
-        &mut self,
+        &self,
         pos: ChunkPos,
         sky_updates: &[Box<[u8]>],
         block_updates: &[Box<[u8]>],
         sky_y_mask: &azalea_core::bitset::BitSet,
         block_y_mask: &azalea_core::bitset::BitSet,
     ) {
-        let num_sections = (self.chunk_storage.height() / 16 + 2) as usize;
+        let num_sections = (self.height / 16 + 2) as usize;
         let mut sky_sections = vec![None; num_sections];
         let mut block_sections = vec![None; num_sections];
 
@@ -149,20 +219,31 @@ impl ChunkStore {
             }
         }
 
-        self.light_data.insert(
-            (pos.x, pos.z),
-            ChunkLightData {
-                sky_sections,
-                block_sections,
-                min_y: self.chunk_storage.min_y(),
-            },
-        );
+        let light = ChunkLightData {
+            sky_sections,
+            block_sections,
+            min_y: self.min_y,
+        };
+
+        let guard = epoch::pin();
+        let old_ptr = self
+            .light_data
+            .get(pos)
+            .swap(Owned::new(light), Ordering::Release, &guard);
+        if !old_ptr.is_null() {
+            unsafe {
+                guard.defer_destroy(old_ptr);
+            }
+        }
     }
 
     pub fn get_sky_light(&self, x: i32, y: i32, z: i32) -> u8 {
         let cx = x.div_euclid(16);
         let cz = z.div_euclid(16);
-        if let Some(light) = self.light_data.get(&(cx, cz)) {
+        let pos = ChunkPos::new(cx, cz);
+        let guard = epoch::pin();
+        let shared = self.light_data.get(pos).load(Ordering::Acquire, &guard);
+        if let Some(light) = unsafe { shared.as_ref() } {
             light.get_sky_light(x.rem_euclid(16), y, z.rem_euclid(16))
         } else {
             15
@@ -172,16 +253,146 @@ impl ChunkStore {
     pub fn get_block_light(&self, x: i32, y: i32, z: i32) -> u8 {
         let cx = x.div_euclid(16);
         let cz = z.div_euclid(16);
-        if let Some(light) = self.light_data.get(&(cx, cz)) {
+        let pos = ChunkPos::new(cx, cz);
+        let guard = epoch::pin();
+        let shared = self.light_data.get(pos).load(Ordering::Acquire, &guard);
+        if let Some(light) = unsafe { shared.as_ref() } {
             light.get_block_light(x.rem_euclid(16), y, z.rem_euclid(16))
         } else {
             0
         }
     }
 
+    pub fn unload_chunk(&self, pos: &ChunkPos) {
+        let guard = epoch::pin();
+        let old_chunk =
+            self.chunks
+                .get(*pos)
+                .swap(epoch::Shared::null(), Ordering::Release, &guard);
+        if !old_chunk.is_null() {
+            unsafe {
+                guard.defer_destroy(old_chunk);
+            }
+        }
+        let old_light =
+            self.light_data
+                .get(*pos)
+                .swap(epoch::Shared::null(), Ordering::Release, &guard);
+        if !old_light.is_null() {
+            unsafe {
+                guard.defer_destroy(old_light);
+            }
+        }
+    }
+
+    pub fn set_block_state(&self, x: i32, y: i32, z: i32, state: BlockState) {
+        let chunk_pos = ChunkPos::new(x.div_euclid(16), z.div_euclid(16));
+        let guard = epoch::pin();
+        let shared = self.chunks.get(chunk_pos).load(Ordering::Acquire, &guard);
+        let Some(chunk_ref) = (unsafe { shared.as_ref() }) else {
+            return;
+        };
+        let mut new_chunk: Chunk = chunk_ref.clone();
+        let block_pos = azalea_core::position::ChunkBlockPos {
+            x: x.rem_euclid(16) as u8,
+            y,
+            z: z.rem_euclid(16) as u8,
+        };
+        new_chunk.set_block_state(&block_pos, state, self.min_y);
+        let old_ptr =
+            self.chunks
+                .get(chunk_pos)
+                .swap(Owned::new(new_chunk), Ordering::Release, &guard);
+        if !old_ptr.is_null() {
+            unsafe {
+                guard.defer_destroy(old_ptr);
+            }
+        }
+    }
+
+    pub fn get_block_state(&self, x: i32, y: i32, z: i32) -> BlockState {
+        let chunk_pos = ChunkPos::new(x.div_euclid(16), z.div_euclid(16));
+        let guard = epoch::pin();
+        let shared = self.chunks.get(chunk_pos).load(Ordering::Acquire, &guard);
+        let Some(chunk_ref) = (unsafe { shared.as_ref() }) else {
+            return BlockState::AIR;
+        };
+        block_state_from_section(chunk_ref, x, y, z, self.min_y)
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn min_y(&self) -> i32 {
+        self.min_y
+    }
+
+    pub fn section_count(&self) -> i32 {
+        (self.height / 16) as i32
+    }
+
+    pub fn motion_blocking_height(&self, x: i32, z: i32) -> i32 {
+        let chunk_pos = ChunkPos::new(x.div_euclid(16), z.div_euclid(16));
+        let guard = epoch::pin();
+        let shared = self.chunks.get(chunk_pos).load(Ordering::Acquire, &guard);
+        let Some(chunk_ref) = (unsafe { shared.as_ref() }) else {
+            return self.min_y;
+        };
+        chunk_ref
+            .heightmaps
+            .get(&HeightmapKind::MotionBlocking)
+            .map(|h| h.get_first_available(x.rem_euclid(16) as u8, z.rem_euclid(16) as u8))
+            .unwrap_or(self.min_y)
+    }
+
+    pub fn biome_id(&self, x: i32, y: i32, z: i32) -> u32 {
+        let chunk_pos = ChunkPos::new(x.div_euclid(16), z.div_euclid(16));
+        let guard = epoch::pin();
+        let shared = self.chunks.get(chunk_pos).load(Ordering::Acquire, &guard);
+        let Some(chunk_ref) = (unsafe { shared.as_ref() }) else {
+            return 0;
+        };
+        let biome_pos = azalea_core::position::ChunkBiomePos {
+            x: (x.rem_euclid(16) / 4) as u8,
+            y,
+            z: (z.rem_euclid(16) / 4) as u8,
+        };
+        let biome = chunk_ref
+            .get_biome(biome_pos, self.min_y)
+            .unwrap_or_default();
+        u32::from(biome)
+    }
+}
+
+/// Main-thread-only ChunkStore holding shared lock-free chunk store and
+/// main-thread block entities map.
+pub struct ChunkStore {
+    pub shared: Arc<SharedChunkStore>,
+    pub block_entities: std::collections::HashMap<BlockPos, StoredBlockEntity>,
+}
+
+impl ChunkStore {
+    pub fn new(view_distance: u32) -> Self {
+        Self {
+            shared: Arc::new(SharedChunkStore::new(view_distance)),
+            block_entities: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn new_with_dimension(view_distance: u32, height: u32, min_y: i32) -> Self {
+        Self {
+            shared: Arc::new(SharedChunkStore::new_with_dimension(
+                view_distance,
+                height,
+                min_y,
+            )),
+            block_entities: std::collections::HashMap::new(),
+        }
+    }
+
     pub fn unload_chunk(&mut self, pos: &ChunkPos) {
-        self.light_data.remove(&(pos.x, pos.z));
-        self.partial_storage.limited_set(pos, None);
+        self.shared.unload_chunk(pos);
         let cx = pos.x;
         let cz = pos.z;
         self.block_entities
@@ -189,84 +400,80 @@ impl ChunkStore {
     }
 
     pub fn set_center(&mut self, pos: ChunkPos) {
-        self.partial_storage.update_view_center(pos);
+        self.shared.update_view_center(pos);
     }
 
-    pub fn get_chunk(&self, pos: &ChunkPos) -> Option<Arc<RwLock<Chunk>>> {
-        self.chunk_storage.get(pos).map(|c| Arc::clone(&c))
+    #[inline]
+    pub fn loaded_positions(&self) -> Vec<ChunkPos> {
+        self.shared.loaded_positions()
     }
 
+    #[inline]
+    pub fn load_chunk(
+        &self,
+        pos: ChunkPos,
+        data: &[u8],
+        heightmaps: &[(HeightmapKind, Box<[u64]>)],
+    ) -> Result<(), ChunkError> {
+        self.shared.load_chunk(pos, data, heightmaps)
+    }
+
+    #[inline]
+    pub fn store_light(
+        &self,
+        pos: ChunkPos,
+        sky_updates: &[Box<[u8]>],
+        block_updates: &[Box<[u8]>],
+        sky_y_mask: &azalea_core::bitset::BitSet,
+        block_y_mask: &azalea_core::bitset::BitSet,
+    ) {
+        self.shared
+            .store_light(pos, sky_updates, block_updates, sky_y_mask, block_y_mask);
+    }
+
+    #[inline]
+    pub fn get_sky_light(&self, x: i32, y: i32, z: i32) -> u8 {
+        self.shared.get_sky_light(x, y, z)
+    }
+
+    #[inline]
+    pub fn get_block_light(&self, x: i32, y: i32, z: i32) -> u8 {
+        self.shared.get_block_light(x, y, z)
+    }
+
+    #[inline]
     pub fn set_block_state(&self, x: i32, y: i32, z: i32, state: BlockState) {
-        let chunk_pos = ChunkPos::new(x.div_euclid(16), z.div_euclid(16));
-        let Some(chunk_lock) = self.get_chunk(&chunk_pos) else {
-            return;
-        };
-        let mut chunk = chunk_lock.write();
-        let block_pos = azalea_core::position::ChunkBlockPos {
-            x: x.rem_euclid(16) as u8,
-            y,
-            z: z.rem_euclid(16) as u8,
-        };
-        chunk.set_block_state(&block_pos, state, self.chunk_storage.min_y());
+        self.shared.set_block_state(x, y, z, state);
     }
 
+    #[inline]
     pub fn get_block_state(&self, x: i32, y: i32, z: i32) -> BlockState {
-        let chunk_pos = ChunkPos::new(x.div_euclid(16), z.div_euclid(16));
-        let Some(chunk_lock) = self.get_chunk(&chunk_pos) else {
-            return BlockState::AIR;
-        };
-        let chunk = chunk_lock.read();
-        block_state_from_section(&chunk, x, y, z, self.chunk_storage.min_y())
+        self.shared.get_block_state(x, y, z)
     }
 
+    #[inline]
     pub fn height(&self) -> u32 {
-        self.chunk_storage.height()
+        self.shared.height()
     }
 
+    #[inline]
     pub fn min_y(&self) -> i32 {
-        self.chunk_storage.min_y()
+        self.shared.min_y()
     }
 
-    /// Number of 16³ block sections in a column (zero-based section index range
-    /// `0..section_count`).
+    #[inline]
     pub fn section_count(&self) -> i32 {
-        (self.height() / 16) as i32
+        self.shared.section_count()
     }
 
-    /// Top non-motion-blocking Y for the column (vanilla MOTION_BLOCKING
-    /// surface, i.e. one above the highest solid block). Used to position
-    /// weather columns. Returns `min_y` when the chunk or its heightmap is
-    /// missing.
+    #[inline]
     pub fn motion_blocking_height(&self, x: i32, z: i32) -> i32 {
-        let chunk_pos = ChunkPos::new(x.div_euclid(16), z.div_euclid(16));
-        let Some(chunk_lock) = self.get_chunk(&chunk_pos) else {
-            return self.min_y();
-        };
-        let chunk = chunk_lock.read();
-        chunk
-            .heightmaps
-            .get(&HeightmapKind::MotionBlocking)
-            .map(|h| h.get_first_available(x.rem_euclid(16) as u8, z.rem_euclid(16) as u8))
-            .unwrap_or(self.min_y())
+        self.shared.motion_blocking_height(x, z)
     }
 
-    /// Registry id of the biome at a block position (matches the mesher's biome
-    /// lookup). Returns 0 when the chunk is missing.
+    #[inline]
     pub fn biome_id(&self, x: i32, y: i32, z: i32) -> u32 {
-        let chunk_pos = ChunkPos::new(x.div_euclid(16), z.div_euclid(16));
-        let Some(chunk_lock) = self.get_chunk(&chunk_pos) else {
-            return 0;
-        };
-        let chunk = chunk_lock.read();
-        let biome_pos = azalea_core::position::ChunkBiomePos {
-            x: (x.rem_euclid(16) / 4) as u8,
-            y,
-            z: (z.rem_euclid(16) / 4) as u8,
-        };
-        let biome = chunk
-            .get_biome(biome_pos, self.chunk_storage.min_y())
-            .unwrap_or_default();
-        u32::from(biome)
+        self.shared.biome_id(x, y, z)
     }
 }
 
@@ -275,11 +482,9 @@ pub fn block_state_from_section(chunk: &Chunk, x: i32, y: i32, z: i32, min_y: i3
     if section_idx >= chunk.sections.len() {
         return BlockState::AIR;
     }
-
     let local_x = x.rem_euclid(16) as u8;
     let local_y = (y - min_y).rem_euclid(16) as u8;
     let local_z = z.rem_euclid(16) as u8;
-
     chunk.sections[section_idx].get_block_state(azalea_core::position::ChunkSectionBlockPos {
         x: local_x,
         y: local_y,

@@ -64,6 +64,9 @@ fn main() {
         ("weather.frag", shaderc::ShaderKind::Fragment),
         ("clouds.vert", shaderc::ShaderKind::Vertex),
         ("clouds.frag", shaderc::ShaderKind::Fragment),
+        ("hiz_copy.comp", shaderc::ShaderKind::Compute),
+        ("hiz_reduce.comp", shaderc::ShaderKind::Compute),
+        ("visibility.comp", shaderc::ShaderKind::Compute),
     ];
 
     for (file, kind) in &shaders {

@@ -8,7 +8,7 @@ use super::aabb::Aabb;
 use super::collision::{no_collision, resolve_collision};
 use crate::app::input::{self, InputState};
 use crate::player::{CROUCH_HEIGHT, LocalPlayer, STANDING_HEIGHT};
-use crate::world::chunk::ChunkStore;
+use crate::world::chunk::SharedChunkStore;
 
 const GRAVITY: f64 = 0.08;
 const JUMP_VELOCITY: f64 = 0.42;
@@ -38,7 +38,7 @@ const SPRINT_HUNGER_THRESHOLD: u32 = 6;
 const DEFAULT_SPRINT_WINDOW: u32 = 7;
 const MINOR_COLLISION_ANGLE: f64 = 0.13962634;
 
-pub fn tick(player: &mut LocalPlayer, input: &InputState, chunk_store: &ChunkStore) {
+pub fn tick(player: &mut LocalPlayer, input: &InputState, chunk_store: &SharedChunkStore) {
     player.update_water_state(chunk_store);
     update_crouch_state(player, input, chunk_store);
     player.tick_eye_height();
@@ -83,7 +83,7 @@ pub fn tick(player: &mut LocalPlayer, input: &InputState, chunk_store: &ChunkSto
 fn tick_land(
     player: &mut LocalPlayer,
     input: &InputState,
-    chunk_store: &ChunkStore,
+    chunk_store: &SharedChunkStore,
     forward: f64,
     strafe: f64,
     sin_y_rot: f64,
@@ -134,7 +134,7 @@ fn tick_land(
 fn tick_water(
     player: &mut LocalPlayer,
     input: &InputState,
-    chunk_store: &ChunkStore,
+    chunk_store: &SharedChunkStore,
     forward: f64,
     strafe: f64,
     sin_y_rot: f64,
@@ -188,7 +188,7 @@ fn tick_water(
 fn apply_collision(
     player: &mut LocalPlayer,
     input: &InputState,
-    chunk_store: &ChunkStore,
+    chunk_store: &SharedChunkStore,
     forward: f64,
     strafe: f64,
     sin_y_rot: f64,
@@ -277,7 +277,11 @@ fn update_sprint_state(
 
 // Forces the crouch pose under ceilings too low to stand in; flying, riding
 // and sleeping aren't simulated.
-fn update_crouch_state(player: &mut LocalPlayer, input: &InputState, chunk_store: &ChunkStore) {
+fn update_crouch_state(
+    player: &mut LocalPlayer,
+    input: &InputState,
+    chunk_store: &SharedChunkStore,
+) {
     player.crouching = player.game_mode != 3
         && !player.swimming
         && can_fit_with_height(chunk_store, player.position.into(), CROUCH_HEIGHT)
@@ -285,7 +289,7 @@ fn update_crouch_state(player: &mut LocalPlayer, input: &InputState, chunk_store
             || !can_fit_with_height(chunk_store, player.position.into(), STANDING_HEIGHT));
 }
 
-fn can_fit_with_height(chunk_store: &ChunkStore, pos: DVec3, height: f64) -> bool {
+fn can_fit_with_height(chunk_store: &SharedChunkStore, pos: DVec3, height: f64) -> bool {
     no_collision(
         chunk_store,
         &Aabb::from_center(pos, PLAYER_HALF_WIDTH, height / 2.0).deflate(1.0e-7),
@@ -295,7 +299,7 @@ fn can_fit_with_height(chunk_store: &ChunkStore, pos: DVec3, height: f64) -> boo
 // While holding shift on the ground, clamp the horizontal move so the player
 // can't fall further than the step height.
 fn back_off_from_edge(
-    chunk_store: &ChunkStore,
+    chunk_store: &SharedChunkStore,
     bb: &Aabb,
     delta: DVec3,
     shift_down: bool,
@@ -343,7 +347,7 @@ fn back_off_from_edge(
 }
 
 fn can_fall_at_least(
-    chunk_store: &ChunkStore,
+    chunk_store: &SharedChunkStore,
     bb: &Aabb,
     dx: f64,
     dz: f64,

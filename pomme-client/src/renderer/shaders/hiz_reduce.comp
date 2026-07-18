@@ -1,0 +1,24 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0, r32f) readonly uniform image2D input_mip;
+layout(binding = 1, r32f) writeonly uniform image2D output_mip;
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(output_mip);
+    if (pos.x >= size.x || pos.y >= size.y) {
+        return;
+    }
+    
+    ivec2 src_pos = pos * 2;
+    ivec2 src_size = imageSize(input_mip);
+    
+    float s00 = imageLoad(input_mip, src_pos).r;
+    float s10 = imageLoad(input_mip, clamp(src_pos + ivec2(1, 0), ivec2(0), src_size - 1)).r;
+    float s01 = imageLoad(input_mip, clamp(src_pos + ivec2(0, 1), ivec2(0), src_size - 1)).r;
+    float s11 = imageLoad(input_mip, clamp(src_pos + ivec2(1, 1), ivec2(0), src_size - 1)).r;
+    
+    float max_d = max(max(s00, s10), max(s01, s11));
+    
+    imageStore(output_mip, pos, vec4(max_d, 0.0, 0.0, 0.0));
+}

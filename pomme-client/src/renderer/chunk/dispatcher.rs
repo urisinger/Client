@@ -1,0 +1,481 @@
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+
+use azalea_core::position::{ChunkPos, ChunkSectionPos};
+use crossbeam_epoch as epoch;
+use crossbeam_epoch::Atomic;
+use glam::DVec3;
+
+use super::chunk::LocalSection;
+use super::mesher::{
+    BiomeClimate, Colormap, RemeshTiming, SectionMeshData, SectionStoreSnapshot, mesh_section,
+};
+use crate::renderer::Renderer;
+use crate::renderer::camera::Camera;
+use crate::renderer::chunk::atlas::AtlasUVMap;
+use crate::resource_pack::ResourcePackManager;
+use crate::util::{ChunkRing, SectionRing};
+use crate::world::block::registry::BlockRegistry;
+use crate::world::chunk::SharedChunkStore;
+/// Per-section lock-ordered metadata, aligned to 64 bytes to eliminate false
+/// sharing across adjacent sections in the cache line.
+#[repr(align(64))]
+pub struct SectionMeta {
+    pub ver: AtomicU64,       // Monotonic, bumped on any mutation to this slot
+    pub pos: AtomicU64,       // Packed ChunkSectionPos identity of current slot occupant
+    pub target_lod: AtomicU8, // Target LOD level assigned to this section slot
+}
+impl Default for SectionMeta {
+    fn default() -> Self {
+        Self {
+            ver: AtomicU64::new(0),
+            pos: AtomicU64::new(u64::MAX),
+            target_lod: AtomicU8::new(0),
+        }
+    }
+}
+pub const fn pack_section_pos(pos: ChunkSectionPos) -> u64 {
+    let x = (pos.x as u64) & 0x00FF_FFFF;
+    let z = (pos.z as u64) & 0x00FF_FFFF;
+    let y = (pos.y as u64) & 0x0000_FFFF;
+    x | (z << 24) | (y << 48)
+}
+pub const fn unpack_section_pos(val: u64) -> ChunkSectionPos {
+    let x_raw = (val & 0x00FF_FFFF) as u32;
+    let z_raw = ((val >> 24) & 0x00FF_FFFF) as u32;
+    let y_raw = ((val >> 48) & 0x0000_FFFF) as u32;
+    let x = if x_raw & 0x0080_0000 != 0 {
+        (x_raw | 0xFF00_0000) as i32
+    } else {
+        x_raw as i32
+    };
+    let z = if z_raw & 0x0080_0000 != 0 {
+        (z_raw | 0xFF00_0000) as i32
+    } else {
+        z_raw as i32
+    };
+    let y = if y_raw & 0x0080_0000 != 0 {
+        (y_raw | 0xFFFF_0000) as i32
+    } else {
+        y_raw as i32
+    };
+    ChunkSectionPos::new(x, y, z)
+}
+pub struct ChunkMeshing {
+    /// Section metadata ring: single 64-byte cache line per section slot
+    pub section_meta: Arc<SectionRing<SectionMeta>>,
+    /// Shared: workers clear/re-set bits, edits set bits
+    pub update_set: Arc<ChunkRing<AtomicU32>>,
+    result_rx: crossbeam_channel::Receiver<SectionMeshData>,
+    queue: Arc<MeshQueue>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    next_epoch: AtomicU64,
+    registry: Arc<BlockRegistry>,
+    uv_map: Arc<AtlasUVMap>,
+    grass_colormap: Arc<Colormap>,
+    foliage_colormap: Arc<Colormap>,
+    dry_foliage_colormap: Arc<Colormap>,
+    biome_climate: Arc<HashMap<u32, BiomeClimate>>,
+}
+impl ChunkMeshing {
+    pub fn new(
+        renderer: &Renderer,
+        shared_chunk_store: Arc<SharedChunkStore>,
+        biome_climate: Arc<HashMap<u32, BiomeClimate>>,
+        resource_packs: Option<&ResourcePackManager>,
+    ) -> Self {
+        renderer.create_chunk_meshing(shared_chunk_store, biome_climate, resource_packs)
+    }
+    pub fn notify(&self) {
+        for worker in &self.workers {
+            worker.thread().unpark();
+        }
+    }
+    pub fn create(
+        shared_chunk_store: Arc<SharedChunkStore>,
+        registry: BlockRegistry,
+        uv_map: AtlasUVMap,
+        grass_colormap: Colormap,
+        foliage_colormap: Colormap,
+        dry_foliage_colormap: Colormap,
+        biome_climate: Arc<HashMap<u32, BiomeClimate>>,
+    ) -> Self {
+        let (result_tx, result_rx) = crossbeam_channel::unbounded();
+        let section_meta = Arc::new(SectionRing::from_fn(|_, _, _| SectionMeta::default()));
+        let update_set = Arc::new(ChunkRing::from_fn(|_, _| AtomicU32::new(0)));
+        let queue = Arc::new(MeshQueue::new());
+        let worker_count = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1).max(1))
+            .unwrap_or(1);
+        let registry = Arc::new(registry);
+        let uv_map = Arc::new(uv_map);
+        let grass_colormap = Arc::new(grass_colormap);
+        let foliage_colormap = Arc::new(foliage_colormap);
+        let dry_foliage_colormap = Arc::new(dry_foliage_colormap);
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let queue = Arc::clone(&queue);
+            let shared_chunk_store = Arc::clone(&shared_chunk_store);
+            let section_meta = Arc::clone(&section_meta);
+            let update_set = Arc::clone(&update_set);
+            let registry = Arc::clone(&registry);
+            let uv_map = Arc::clone(&uv_map);
+            let grass_colormap = Arc::clone(&grass_colormap);
+            let foliage_colormap = Arc::clone(&foliage_colormap);
+            let dry_foliage_colormap = Arc::clone(&dry_foliage_colormap);
+            let biome_climate = Arc::clone(&biome_climate);
+            let tx = result_tx.clone();
+            workers.push(
+                std::thread::Builder::new()
+                    .name("chunk-mesher".into())
+                    .spawn(move || {
+                        queue.run_worker(
+                            shared_chunk_store,
+                            section_meta,
+                            update_set,
+                            registry,
+                            uv_map,
+                            grass_colormap,
+                            foliage_colormap,
+                            dry_foliage_colormap,
+                            biome_climate,
+                            tx,
+                        )
+                    })
+                    .expect("spawn chunk-mesher thread"),
+            );
+        }
+        Self {
+            section_meta,
+            update_set,
+            result_rx,
+            queue,
+            workers,
+            next_epoch: AtomicU64::new(1),
+            registry,
+            uv_map,
+            grass_colormap,
+            foliage_colormap,
+            dry_foliage_colormap,
+            biome_climate,
+        }
+    }
+    pub fn clear(&mut self) {
+        for x in 0..129 {
+            for z in 0..129 {
+                let chunk_pos = ChunkPos::new(x as i32 - 64, z as i32 - 64);
+                self.update_set
+                    .get(chunk_pos)
+                    .store(0xFFFF_FFFF, Ordering::Release);
+            }
+        }
+    }
+    pub fn on_chunk_unload(&mut self, pos: ChunkPos) {
+        for y_idx in 0..32 {
+            let spos = ChunkSectionPos::new(pos.x, y_idx - 4, pos.z);
+            let meta = self.section_meta.get(spos);
+            meta.pos.store(u64::MAX, Ordering::Release);
+            meta.ver.fetch_add(1, Ordering::Release);
+        }
+        self.update_set.get(pos).store(0, Ordering::Release);
+    }
+    pub fn recreate_dispatcher(
+        &mut self,
+        renderer: &Renderer,
+        shared_chunk_store: Arc<SharedChunkStore>,
+        biome_climate: Arc<HashMap<u32, BiomeClimate>>,
+    ) {
+        *self = renderer.create_chunk_meshing(shared_chunk_store, biome_climate, None);
+    }
+    pub fn set_biome_climate(&mut self, climate: Arc<HashMap<u32, BiomeClimate>>) {
+        self.biome_climate = climate;
+    }
+    pub fn bump_content_gen(&mut self, pos: ChunkSectionPos) -> u64 {
+        let meta = self.section_meta.get(pos);
+        let chunk_pos = ChunkPos::new(pos.x, pos.z);
+        let rel_y = (pos.y + 4).clamp(0, 31) as u32;
+        meta.pos.store(pack_section_pos(pos), Ordering::Release);
+        let new_ver = meta.ver.fetch_add(1, Ordering::Release) + 1;
+        self.update_set
+            .get(chunk_pos)
+            .fetch_or(1 << rel_y, Ordering::Release);
+        new_ver
+    }
+    pub fn enqueue_section_edit(
+        &mut self,
+        shared_chunk_store: &SharedChunkStore,
+        pos: ChunkSectionPos,
+        lod: u32,
+    ) {
+        let meta = self.section_meta.get(pos);
+        let chunk_pos = ChunkPos::new(pos.x, pos.z);
+        let min_y_sec = shared_chunk_store.min_y().div_euclid(16);
+        let rel_y = (pos.y - min_y_sec).clamp(0, 31) as u32;
+        meta.pos.store(pack_section_pos(pos), Ordering::Release);
+        meta.target_lod.store(lod as u8, Ordering::Release);
+        meta.ver.fetch_add(1, Ordering::Release);
+        self.update_set
+            .get(chunk_pos)
+            .fetch_or(1 << rel_y, Ordering::Release);
+    }
+    /// Per-frame rescan: Bitwise AND of `vis_mask` and `update_set`,
+    /// distance-sorted nearest to camera.
+    pub fn rescan_mesh_jobs(
+        &mut self,
+        shared_chunk_store: &SharedChunkStore,
+        player_chunk: ChunkPos,
+        visibility: &ChunkRing<u32>,
+        visibility_center: ChunkPos,
+        camera_pos: &DVec3,
+    ) {
+        let min_y_section = shared_chunk_store.min_y().div_euclid(16);
+        let section_count = shared_chunk_store.section_count();
+        let mut candidate_jobs = Vec::new();
+        for pos in shared_chunk_store.loaded_positions() {
+            let in_range = (pos.x - visibility_center.x).abs() <= 64
+                && (pos.z - visibility_center.z).abs() <= 64;
+            let vis_mask = if in_range {
+                *visibility.get(pos)
+            } else {
+                0xFFFFFFFF
+            };
+            let update_mask = self.update_set.get(pos).load(Ordering::Acquire);
+            let active_mask = vis_mask & update_mask;
+            let lod = crate::app::core::chunk_lod(pos, player_chunk);
+            for si in 0..section_count {
+                let spos = ChunkSectionPos::new(pos.x, min_y_section + si, pos.z);
+                let meta = self.section_meta.get(spos);
+                let current_lod = meta.target_lod.load(Ordering::Acquire) as u32;
+                let lod_changed = current_lod != lod;
+                let is_dirty = (active_mask & (1 << si)) != 0;
+                let packed_pos = meta.pos.load(Ordering::Acquire);
+                let identity_changed = packed_pos != pack_section_pos(spos);
+                if is_dirty || lod_changed || identity_changed {
+                    if lod_changed {
+                        meta.target_lod.store(lod as u8, Ordering::Release);
+                        meta.ver.fetch_add(1, Ordering::Release);
+                    }
+                    meta.pos.store(pack_section_pos(spos), Ordering::Release);
+                    let upload_epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed);
+                    candidate_jobs.push(PendingJob {
+                        pos: spos,
+                        lod,
+                        upload_epoch,
+                        enqueued_at: None,
+                    });
+                }
+            }
+        }
+        candidate_jobs.sort_by(
+            |PendingJob { pos: pos_a, .. }, PendingJob { pos: pos_b, .. }| {
+                let da = (pos_a.x as f64 * 16.0 + 8.0 - camera_pos.x).powi(2)
+                    + (pos_a.y as f64 * 16.0 + 8.0 - camera_pos.y).powi(2)
+                    + (pos_a.z as f64 * 16.0 + 8.0 - camera_pos.z).powi(2);
+                let db = (pos_b.x as f64 * 16.0 + 8.0 - camera_pos.x).powi(2)
+                    + (pos_b.y as f64 * 16.0 + 8.0 - camera_pos.y).powi(2)
+                    + (pos_b.z as f64 * 16.0 + 8.0 - camera_pos.z).powi(2);
+                da.partial_cmp(&db).unwrap()
+            },
+        );
+        self.queue.send(candidate_jobs);
+        self.notify();
+    }
+    pub fn drain_results(&self) -> impl Iterator<Item = SectionMeshData> + '_ {
+        self.result_rx.try_iter()
+    }
+    pub fn pending_jobs(&self) -> usize {
+        self.queue.pending_jobs()
+    }
+}
+impl Drop for ChunkMeshing {
+    fn drop(&mut self) {
+        self.queue.close();
+        self.notify();
+        for handle in self.workers.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+#[derive(Clone)]
+struct PendingJob {
+    pos: ChunkSectionPos,
+    lod: u32,
+    upload_epoch: u64,
+    enqueued_at: Option<std::time::Instant>,
+}
+struct ReMarkGuard<'a> {
+    update_set: &'a ChunkRing<AtomicU32>,
+    pos: ChunkPos,
+    rel_y: u32,
+    defused: bool,
+}
+impl<'a> Drop for ReMarkGuard<'a> {
+    fn drop(&mut self) {
+        if !self.defused {
+            self.update_set
+                .get(self.pos)
+                .fetch_or(1 << self.rel_y, Ordering::Release);
+        }
+    }
+}
+impl PendingJob {
+    fn run(
+        self,
+        shared_chunk_store: &SharedChunkStore,
+        section_meta: &SectionRing<SectionMeta>,
+        update_set: &ChunkRing<AtomicU32>,
+        registry: &BlockRegistry,
+        uv_map: &AtlasUVMap,
+        grass_colormap: &Colormap,
+        foliage_colormap: &Colormap,
+        dry_foliage_colormap: &Colormap,
+        biome_climate: &HashMap<u32, BiomeClimate>,
+        tx: &crossbeam_channel::Sender<SectionMeshData>,
+    ) {
+        let chunk_pos = ChunkPos::new(self.pos.x, self.pos.z);
+        let rel_y = (self.pos.y + 4).clamp(0, 31) as u32;
+        // Stage 1: Claim — Clear bit in update_set (Acquire)
+        update_set
+            .get(chunk_pos)
+            .fetch_and(!(1 << rel_y), Ordering::Acquire);
+        let claim_ver = section_meta.get(self.pos).ver.load(Ordering::Acquire);
+        let claim_pos_packed = section_meta.get(self.pos).pos.load(Ordering::Acquire);
+        let claim_pos = if claim_pos_packed != u64::MAX {
+            unpack_section_pos(claim_pos_packed)
+        } else {
+            self.pos
+        };
+        let claim_lod = section_meta
+            .get(self.pos)
+            .target_lod
+            .load(Ordering::Acquire) as u32;
+        let mut guard = ReMarkGuard {
+            update_set,
+            pos: chunk_pos,
+            rel_y,
+            defused: false,
+        };
+        let started_at = self.enqueued_at.map(|_| std::time::Instant::now());
+        // Stage 2: Fetch — Create SectionStoreSnapshot on worker thread from
+        // SharedChunkStore
+        let snapshot = SectionStoreSnapshot {
+            section: LocalSection::new_boxed(shared_chunk_store, claim_pos),
+            grass_colormap: Arc::new(grass_colormap.clone()),
+            foliage_colormap: Arc::new(foliage_colormap.clone()),
+            dry_foliage_colormap: Arc::new(dry_foliage_colormap.clone()),
+            biome_climate: Arc::new(biome_climate.clone()),
+            min_y: shared_chunk_store.min_y(),
+            height: shared_chunk_store.height(),
+        };
+        // Stage 3: Execute — Mesh section
+        let mut mesh = mesh_section(
+            &snapshot,
+            claim_pos,
+            registry,
+            uv_map,
+            claim_lod,
+            claim_ver,
+            self.upload_epoch,
+        );
+        if let (Some(enqueued_at), Some(started_at)) = (self.enqueued_at, started_at) {
+            mesh.timing = Some(RemeshTiming {
+                enqueued_at,
+                started_at,
+                meshed_at: std::time::Instant::now(),
+            });
+        }
+        // Stage 4: Return — Send mesh tagged with claim_ver
+        guard.defused = true;
+        let _ = tx.send(mesh);
+    }
+}
+struct QueueState {
+    tasks: Box<[PendingJob]>,
+    head: AtomicU32,
+}
+struct MeshQueue {
+    state: Atomic<QueueState>,
+    closed: AtomicBool,
+}
+impl MeshQueue {
+    fn new() -> Self {
+        Self {
+            state: Atomic::init(QueueState {
+                tasks: vec![].into_boxed_slice(),
+                head: AtomicU32::new(0),
+            }),
+            closed: AtomicBool::new(false),
+        }
+    }
+    fn send(&self, jobs: Vec<PendingJob>) {
+        let new_state = QueueState {
+            tasks: jobs.into_boxed_slice(),
+            head: AtomicU32::new(0),
+        };
+        self.state
+            .store(epoch::Owned::new(new_state), Ordering::SeqCst);
+    }
+    fn pending_jobs(&self) -> usize {
+        let guard = epoch::pin();
+        unsafe {
+            self.state
+                .load(Ordering::Acquire, &guard)
+                .as_ref()
+                .unwrap()
+                .tasks
+                .len()
+        }
+    }
+    fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+    }
+    fn run_worker(
+        &self,
+        shared_chunk_store: Arc<SharedChunkStore>,
+        section_meta: Arc<SectionRing<SectionMeta>>,
+        update_set: Arc<ChunkRing<AtomicU32>>,
+        registry: Arc<BlockRegistry>,
+        uv_map: Arc<AtlasUVMap>,
+        grass_colormap: Arc<Colormap>,
+        foliage_colormap: Arc<Colormap>,
+        dry_foliage_colormap: Arc<Colormap>,
+        biome_climate: Arc<HashMap<u32, BiomeClimate>>,
+        tx: crossbeam_channel::Sender<SectionMeshData>,
+    ) {
+        loop {
+            let job = loop {
+                if self.closed.load(Ordering::Relaxed) {
+                    return;
+                }
+                let guard = epoch::pin();
+                let state = unsafe { self.state.load(Ordering::Acquire, &guard).as_ref().unwrap() };
+                let idx = state.head.fetch_add(1, Ordering::AcqRel);
+                if let Some(job) = state.tasks.get(idx as usize) {
+                    break job.clone();
+                }
+                drop(guard);
+                thread::park();
+            };
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                job.run(
+                    &shared_chunk_store,
+                    &section_meta,
+                    &update_set,
+                    &registry,
+                    &uv_map,
+                    &grass_colormap,
+                    &foliage_colormap,
+                    &dry_foliage_colormap,
+                    &biome_climate,
+                    &tx,
+                )
+            }))
+            .is_err()
+            {
+                tracing::error!("chunk mesh job panicked; worker continuing");
+            }
+        }
+    }
+}

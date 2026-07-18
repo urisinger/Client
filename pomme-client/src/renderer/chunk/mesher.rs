@@ -1,21 +1,15 @@
 use std::collections::HashMap;
-use std::ops::Mul;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 
 use azalea_block::BlockState;
-use azalea_core::position::{ChunkPos, ChunkSectionPos};
+use azalea_core::position::ChunkSectionPos;
 use pyronyx::vk;
 
 use super::greedy;
-use super::occlusion_graph::{VisibilitySet, compute_visibility};
 use crate::renderer::chunk::atlas::{AtlasRegion, AtlasUVMap};
 use crate::renderer::chunk::chunk::LocalSection;
 use crate::world::block::model::{BakedModel, Direction};
 use crate::world::block::registry::{BlockRegistry, FaceTextures, Tint};
-use crate::world::chunk;
-use crate::world::chunk::ChunkStore;
-
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ChunkVertex {
@@ -23,10 +17,8 @@ pub struct ChunkVertex {
     pub tex_coords: [u16; 2],
     pub light_tint: u32,
 }
-
 impl ChunkVertex {
     pub const STRIDE: u32 = size_of::<Self>() as u32;
-
     pub fn binding_description() -> vk::VertexInputBindingDescription {
         vk::VertexInputBindingDescription {
             binding: 0,
@@ -34,7 +26,6 @@ impl ChunkVertex {
             input_rate: vk::VertexInputRate::Vertex,
         }
     }
-
     pub fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 3] {
         [
             vk::VertexInputAttributeDescription {
@@ -58,19 +49,16 @@ impl ChunkVertex {
         ]
     }
 }
-
 pub fn pack_uv(u: f32, v: f32) -> [u16; 2] {
     [
         (u.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16,
         (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16,
     ]
 }
-
 pub fn pack_light_tint(light: f32, tint: u32) -> u32 {
     let l = (light.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
     l | (tint & 0xFFFFFF00)
 }
-
 pub const fn pack_tint_shifted(rgb: [f32; 3]) -> u32 {
     const fn channel(v: f32) -> u32 {
         let c = (v * 255.0 + 0.5) as i32;
@@ -84,9 +72,7 @@ pub const fn pack_tint_shifted(rgb: [f32; 3]) -> u32 {
     }
     (channel(rgb[0]) << 8) | (channel(rgb[1]) << 16) | (channel(rgb[2]) << 24)
 }
-
 pub const PACKED_WHITE_SHIFTED: u32 = pack_tint_shifted([1.0, 1.0, 1.0]);
-
 /// One 16³ section's geometry. Indices are section-local (0-based into
 /// `vertices`) so each section can be uploaded as a self-contained draw with
 /// its own tight AABB, giving per-section cull granularity instead of
@@ -106,15 +92,16 @@ pub struct SectionMeshData {
     /// in-flight bulk mesh can never clobber a section a newer edit already
     /// uploaded (the edit always enqueues a higher epoch after its write).
     pub upload_epoch: u64,
-    /// Per-section cave-cull visibility, one entry per index in `replaced`
-    /// (including now-empty sections, which connect all faces).
-    pub visibility: VisibilitySet,
     /// Latency stamps for edit remeshes (diagnostic); `None` for bulk loads.
     pub timing: Option<RemeshTiming>,
 }
-
 impl SectionMeshData {
-    pub fn new(spos: ChunkSectionPos, relative_si: i32, content_gen: u64, upload_epoch: u64) -> Self {
+    pub fn new(
+        spos: ChunkSectionPos,
+        relative_si: i32,
+        content_gen: u64,
+        upload_epoch: u64,
+    ) -> Self {
         Self {
             spos,
             relative_si,
@@ -123,22 +110,18 @@ impl SectionMeshData {
             water_indices: Vec::with_capacity(256),
             content_gen,
             upload_epoch,
-            visibility: VisibilitySet::all(),
             timing: None,
         }
     }
-
     pub fn is_empty(&self) -> bool {
         self.vertices.is_empty() || (self.indices.is_empty() && self.water_indices.is_empty())
     }
 }
-
 pub struct RemeshTiming {
     pub enqueued_at: std::time::Instant,
     pub started_at: std::time::Instant,
     pub meshed_at: std::time::Instant,
 }
-
 #[derive(Clone, Copy, Debug, Default)]
 pub enum GrassColorModifier {
     #[default]
@@ -146,7 +129,6 @@ pub enum GrassColorModifier {
     DarkForest,
     Swamp,
 }
-
 #[derive(Clone, Copy, Debug)]
 pub struct BiomeClimate {
     pub temperature: f32,
@@ -156,7 +138,6 @@ pub struct BiomeClimate {
     pub foliage_color_override: Option<[f32; 3]>,
     pub dry_foliage_color_override: Option<[f32; 3]>,
 }
-
 impl Default for BiomeClimate {
     fn default() -> Self {
         Self {
@@ -169,7 +150,6 @@ impl Default for BiomeClimate {
         }
     }
 }
-
 fn tint_color(tint: Tint, grass: [f32; 3], foliage: [f32; 3], dry_foliage: [f32; 3]) -> u32 {
     match tint {
         Tint::None => PACKED_WHITE_SHIFTED,
@@ -178,12 +158,10 @@ fn tint_color(tint: Tint, grass: [f32; 3], foliage: [f32; 3], dry_foliage: [f32;
         Tint::DryFoliage => pack_tint_shifted(dry_foliage),
     }
 }
-
-
+#[derive(Clone)]
 pub struct Colormap {
     pixels: Vec<[u8; 3]>,
 }
-
 impl Colormap {
     pub fn load(
         jar_assets_dir: &std::path::Path,
@@ -207,7 +185,6 @@ impl Colormap {
             .unwrap_or_else(|| vec![[145, 189, 89]; 256 * 256]);
         Self { pixels }
     }
-
     fn lookup(&self, temperature: f32, downfall: f32) -> [f32; 3] {
         let t = temperature.clamp(0.0, 1.0);
         let d = (downfall.clamp(0.0, 1.0)) * t;
@@ -218,7 +195,6 @@ impl Colormap {
         [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]
     }
 }
-
 fn apply_grass_modifier(modifier: GrassColorModifier, base: [f32; 3], x: i32, z: i32) -> [f32; 3] {
     match modifier {
         GrassColorModifier::None => base,
@@ -253,11 +229,9 @@ fn apply_grass_modifier(modifier: GrassColorModifier, base: [f32; 3], x: i32, z:
         }
     }
 }
-
 fn to_u8(f: f32) -> u8 {
     (f * 255.0).round() as u8
 }
-
 struct SimplexNoise {
     perm: [u8; 256],
     #[allow(dead_code)]
@@ -265,7 +239,6 @@ struct SimplexNoise {
     #[allow(dead_code)]
     yo: f64,
 }
-
 const GRADIENT: [[i32; 3]; 16] = [
     [1, 1, 0],
     [-1, 1, 0],
@@ -284,7 +257,6 @@ const GRADIENT: [[i32; 3]; 16] = [
     [-1, 1, 0],
     [0, -1, -1],
 ];
-
 impl SimplexNoise {
     fn new_biome_info() -> Self {
         let mut rng = JavaRng::new(2345);
@@ -301,42 +273,33 @@ impl SimplexNoise {
         }
         Self { perm, xo, yo }
     }
-
     fn p(&self, i: i32) -> i32 {
         self.perm[(i & 0xFF) as usize] as i32
     }
-
     fn value_2d(&self, x: f64, y: f64) -> f64 {
         let sqrt3: f64 = 3.0_f64.sqrt();
         let f2 = 0.5 * (sqrt3 - 1.0);
         let g2 = (3.0 - sqrt3) / 6.0;
-
         let s = (x + y) * f2;
         let i = (x + s).floor() as i32;
         let j = (y + s).floor() as i32;
         let t = (i + j) as f64 * g2;
         let x0 = x - (i as f64 - t);
         let y0 = y - (j as f64 - t);
-
         let (i1, j1) = if x0 > y0 { (1, 0) } else { (0, 1) };
-
         let x1 = x0 - i1 as f64 + g2;
         let y1 = y0 - j1 as f64 + g2;
         let x2 = x0 - 1.0 + 2.0 * g2;
         let y2 = y0 - 1.0 + 2.0 * g2;
-
         let gi0 = (self.p(i + self.p(j)) % 12) as usize;
         let gi1 = (self.p(i + i1 + self.p(j + j1)) % 12) as usize;
         let gi2 = (self.p(i + 1 + self.p(j + 1)) % 12) as usize;
-
         let n0 = corner_noise(gi0, x0, y0, 0.0, 0.5);
         let n1 = corner_noise(gi1, x1, y1, 0.0, 0.5);
         let n2 = corner_noise(gi2, x2, y2, 0.0, 0.5);
-
         70.0 * (n0 + n1 + n2)
     }
 }
-
 fn corner_noise(gi: usize, x: f64, y: f64, z: f64, falloff: f64) -> f64 {
     let t = falloff - x * x - y * y - z * z;
     if t < 0.0 {
@@ -347,23 +310,19 @@ fn corner_noise(gi: usize, x: f64, y: f64, z: f64, falloff: f64) -> f64 {
         t2 * t2 * (g[0] as f64 * x + g[1] as f64 * y + g[2] as f64 * z)
     }
 }
-
 struct JavaRng {
     seed: i64,
 }
-
 impl JavaRng {
     fn new(seed: i64) -> Self {
         Self {
             seed: (seed ^ 0x5DEECE66D) & ((1i64 << 48) - 1),
         }
     }
-
     fn next(&mut self, bits: u32) -> i32 {
         self.seed = (self.seed.wrapping_mul(0x5DEECE66D).wrapping_add(0xB)) & ((1i64 << 48) - 1);
         (self.seed >> (48 - bits)) as i32
     }
-
     fn next_int(&mut self, bound: i32) -> i32 {
         if bound & (bound - 1) == 0 {
             return ((bound as i64 * self.next(31) as i64) >> 31) as i32;
@@ -376,343 +335,27 @@ impl JavaRng {
             }
         }
     }
-
     fn next_double(&mut self) -> f64 {
         let hi = self.next(26) as i64;
         let lo = self.next(27) as i64;
         ((hi << 27) + lo) as f64 / ((1i64 << 53) as f64)
     }
 }
-
 pub fn int_to_rgb(color: i32) -> [f32; 3] {
     let r = ((color >> 16) & 0xFF) as f32 / 255.0;
     let g = ((color >> 8) & 0xFF) as f32 / 255.0;
     let b = (color & 0xFF) as f32 / 255.0;
     [r, g, b]
 }
-
-pub struct MeshDispatcher {
-    result_rx: crossbeam_channel::Receiver<SectionMeshData>,
-    result_tx: crossbeam_channel::Sender<SectionMeshData>,
-    // Edits drain ahead of and uncapped by the bulk load lane (see drain_results).
-    priority_rx: crossbeam_channel::Receiver<SectionMeshData>,
-    priority_tx: crossbeam_channel::Sender<SectionMeshData>,
-    queue: Arc<MeshQueue>,
-    workers: Vec<std::thread::JoinHandle<()>>,
-    // Monotonic per-enqueue stamp; see `ChunkMeshData::upload_epoch`. Starts at 1
-    // so 0 means "never uploaded" on the buffer side.
-    next_epoch: AtomicU64,
-    registry: Arc<BlockRegistry>,
-    uv_map: Arc<AtlasUVMap>,
-    grass_colormap: Arc<Colormap>,
-    foliage_colormap: Arc<Colormap>,
-    dry_foliage_colormap: Arc<Colormap>,
-    biome_climate: Arc<HashMap<u32, BiomeClimate>>,
+pub(crate) struct SectionStoreSnapshot {
+    pub(crate) section: Box<LocalSection>,
+    pub(crate) grass_colormap: Arc<Colormap>,
+    pub(crate) foliage_colormap: Arc<Colormap>,
+    pub(crate) dry_foliage_colormap: Arc<Colormap>,
+    pub(crate) biome_climate: Arc<HashMap<u32, BiomeClimate>>,
+    pub(crate) min_y: i32,
+    pub(crate) height: u32,
 }
-
-impl MeshDispatcher {
-    pub fn new(
-        registry: BlockRegistry,
-        uv_map: AtlasUVMap,
-        grass_colormap: Colormap,
-        foliage_colormap: Colormap,
-        dry_foliage_colormap: Colormap,
-        biome_climate: Arc<HashMap<u32, BiomeClimate>>,
-    ) -> Self {
-        let (result_tx, result_rx) = crossbeam_channel::unbounded();
-        let (priority_tx, priority_rx) = crossbeam_channel::unbounded();
-
-        let queue = Arc::new(MeshQueue::new());
-        // One worker per core minus one, leaving a core for the main/render thread.
-        let worker_count = std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(1).max(1))
-            .unwrap_or(1);
-        let mut workers = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            let queue = Arc::clone(&queue);
-            workers.push(
-                std::thread::Builder::new()
-                    .name("chunk-mesher".into())
-                    .spawn(move || queue.run_worker())
-                    .expect("spawn chunk-mesher thread"),
-            );
-        }
-
-        Self {
-            result_rx,
-            result_tx,
-            priority_rx,
-            priority_tx,
-            queue,
-            workers,
-            next_epoch: AtomicU64::new(1),
-            registry: Arc::new(registry),
-            uv_map: Arc::new(uv_map),
-            grass_colormap: Arc::new(grass_colormap),
-            foliage_colormap: Arc::new(foliage_colormap),
-            dry_foliage_colormap: Arc::new(dry_foliage_colormap),
-            biome_climate,
-        }
-    }
-
-    pub fn set_biome_climate(&mut self, climate: Arc<HashMap<u32, BiomeClimate>>) {
-        self.biome_climate = climate;
-    }
-
-    // Always async, matching vanilla's default `prioritizeChunkUpdates = NONE`.
-    // TODO: the PLAYER_AFFECTED/NEARBY modes add a synchronous same-frame rebuild
-    // (a `mesh_now` path); deferred — pomme meshes whole columns, so it'd hitch
-    // ~200ms.
-    pub fn enqueue_section(
-        &self,
-        chunk_store: &ChunkStore,
-        pos: ChunkSectionPos,
-        lod: u32,
-        priority: bool,
-        content_gen: u64,
-    ) {
-        let min_y = chunk_store.min_y();
-        let height = chunk_store.height();
-        let snapshot = SectionStoreSnapshot {
-            section: LocalSection::new_boxed(chunk_store, pos),
-            grass_colormap: Arc::clone(&self.grass_colormap),
-            foliage_colormap: Arc::clone(&self.foliage_colormap),
-            dry_foliage_colormap: Arc::clone(&self.dry_foliage_colormap),
-            biome_climate: Arc::clone(&self.biome_climate),
-            min_y,
-            height,
-        };
-        let registry = Arc::clone(&self.registry);
-        let uv_map = Arc::clone(&self.uv_map);
-        let tx = if priority {
-            self.priority_tx.clone()
-        } else {
-            self.result_tx.clone()
-        };
-        let enqueued_at = priority.then(std::time::Instant::now);
-        let upload_epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed);
-
-        self.queue.push(PendingJob {
-            pos,
-            lod,
-            content_gen,
-            upload_epoch,
-            // An edit re-meshes an already-shown chunk (vanilla's "recompile").
-            is_recompile: priority,
-            enqueued_at,
-            snapshot,
-
-            registry,
-            uv_map,
-
-            tx,
-        });
-    }
-
-    /// Latest camera position, used to mesh the nearest pending chunk first.
-    pub fn set_camera_position(&self, pos: glam::DVec3) {
-        self.queue.set_camera(pos);
-    }
-
-    pub fn pending_jobs(&self) -> usize {
-        self.queue.pending_jobs()
-    }
-
-    pub fn drain_results(&self) -> impl Iterator<Item = SectionMeshData> + '_ {
-        // Edits drain fully and first; bulk chunk loads stay capped per frame.
-        self.priority_rx
-            .try_iter()
-            .chain(self.result_rx.try_iter())
-    }
-}
-
-impl Drop for MeshDispatcher {
-    fn drop(&mut self) {
-        self.queue.close();
-        for handle in self.workers.drain(..) {
-            let _ = handle.join();
-        }
-    }
-}
-
-const MAX_RECOMPILE_QUOTA: i32 = 2;
-
-/// A pending chunk-mesh job: a point-in-time snapshot of the neighbourhood plus
-/// everything `mesh_chunk_snapshot` needs. Gathered on the calling thread
-/// (chunk data isn't shareable across threads), then meshed by a worker.
-struct PendingJob {
-    pos: ChunkSectionPos,
-    lod: u32,
-    content_gen: u64,
-    upload_epoch: u64,
-    is_recompile: bool,
-    enqueued_at: Option<std::time::Instant>,
-    snapshot: SectionStoreSnapshot,
-    registry: Arc<BlockRegistry>,
-    uv_map: Arc<AtlasUVMap>,
-    tx: crossbeam_channel::Sender<SectionMeshData>,
-}
-
-impl PendingJob {
-    fn run(self) {
-        let started_at = self.enqueued_at.map(|_| std::time::Instant::now());
-
-
-        let mut mesh = mesh_section(
-            &self.snapshot,
-            self.pos,
-            &self.registry,
-            &self.uv_map,
-            self.lod,
-            self.content_gen,
-            self.upload_epoch,
-        );
-        if let (Some(enqueued_at), Some(started_at)) = (self.enqueued_at, started_at) {
-            mesh.timing = Some(RemeshTiming {
-                enqueued_at,
-                started_at,
-                meshed_at: std::time::Instant::now(),
-            });
-        }
-        let _ = self.tx.send(mesh);
-    }
-}
-
-struct QueueState {
-    tasks: Vec<PendingJob>,
-    // Consecutive edits served ahead of an initial load before one is forced, so
-    // streaming never starves (vanilla SectionTaskDynamicQueue.MAX_RECOMPILE_QUOTA).
-    recompile_quota: i32,
-    camera: glam::DVec3,
-}
-
-/// Re-orderable mesh queue, a port of vanilla `SectionTaskDynamicQueue`. The
-/// best task is chosen at poll time rather than fixed at submission, so a
-/// freshly enqueued edit is taken before the already-queued chunk-load backlog.
-struct MeshQueue {
-    state: Mutex<QueueState>,
-    available: Condvar,
-    closed: AtomicBool,
-}
-
-impl MeshQueue {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(QueueState {
-                tasks: Vec::new(),
-                recompile_quota: MAX_RECOMPILE_QUOTA,
-                camera: glam::DVec3::ZERO,
-            }),
-            available: Condvar::new(),
-            closed: AtomicBool::new(false),
-        }
-    }
-
-    fn push(&self, job: PendingJob) {
-        let mut state = self.state.lock().unwrap();
-        // A re-edit of a still-queued section replaces the queued job in place
-        // instead of duplicating it. Bulk loads can't duplicate (`meshed` gates
-        // them), so only edits need this.
-        if job.is_recompile
-            && let Some(existing) = state
-                .tasks
-                .iter_mut()
-                .find(|t| t.is_recompile && t.pos == job.pos)
-        {
-            *existing = job;
-        } else {
-            state.tasks.push(job);
-        }
-        drop(state);
-        self.available.notify_one();
-    }
-
-    fn set_camera(&self, camera: glam::DVec3) {
-        self.state.lock().unwrap().camera = camera;
-    }
-
-    fn pending_jobs(&self) -> usize {
-        self.state.lock().unwrap().tasks.len()
-    }
-
-    fn close(&self) {
-        self.closed.store(true, Ordering::Relaxed);
-        self.available.notify_all();
-    }
-
-    fn run_worker(&self) {
-        loop {
-            let mut state = self.state.lock().unwrap();
-            let job = loop {
-                if self.closed.load(Ordering::Relaxed) {
-                    return;
-                }
-                if let Some(job) = poll(&mut state) {
-                    break job;
-                }
-                state = self.available.wait(state).unwrap();
-            };
-            drop(state);
-            // A panicking job must not kill the worker thread; its column stays
-            // unmeshed (its `meshed` bit is set), but meshing continues.
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run())).is_err() {
-                tracing::error!("chunk mesh job panicked; worker continuing");
-            }
-        }
-    }
-}
-
-/// Pick the next task: nearest to the camera, preferring edits (recompiles)
-/// over initial loads when the edit is closer, bounded by the recompile quota.
-/// Mirrors vanilla `SectionTaskDynamicQueue.poll`.
-fn poll(state: &mut QueueState) -> Option<PendingJob> {
-    let camera = state.camera;
-    let dist_sq = |task: &PendingJob| {
-        let dx = (task.pos.x as f64 * 16.0 + 8.0) - camera.x;
-        let dz = (task.pos.z as f64 * 16.0 + 8.0) - camera.z;
-        dx * dx + dz * dz
-    };
-
-    // Both lanes mesh nearest-first; edits (recompiles) are preferred over initial
-    // loads when closer, bounded by the recompile quota. Occlusion gates drawing,
-    // not meshing, so meshing order is purely distance-based.
-    let mut best_initial: Option<(usize, f64)> = None;
-    let mut best_recompile: Option<(usize, f64)> = None;
-    for (i, task) in state.tasks.iter().enumerate() {
-        let dist = dist_sq(task);
-        if task.is_recompile {
-            if best_recompile.is_none_or(|(_, d)| dist < d) {
-                best_recompile = Some((i, dist));
-            }
-        } else if best_initial.is_none_or(|(_, d)| dist < d) {
-            best_initial = Some((i, dist));
-        }
-    }
-
-    if let Some((ri, rd)) = best_recompile {
-        let take_recompile = match best_initial {
-            None => true,
-            Some((_, id)) => state.recompile_quota > 0 && rd < id,
-        };
-        if take_recompile {
-            state.recompile_quota -= 1;
-            return Some(state.tasks.swap_remove(ri));
-        }
-    }
-    state.recompile_quota = MAX_RECOMPILE_QUOTA;
-    best_initial.map(|(ii, _)| state.tasks.swap_remove(ii))
-}
-
-struct SectionStoreSnapshot {
-    section: Box<LocalSection>,
-    grass_colormap: Arc<Colormap>,
-    foliage_colormap: Arc<Colormap>,
-    dry_foliage_colormap: Arc<Colormap>,
-    biome_climate: Arc<HashMap<u32, BiomeClimate>>,
-    min_y: i32,
-    height: u32,
-}
-
 impl SectionStoreSnapshot {
     fn climate_at(&self, x: i32, y: i32, z: i32) -> BiomeClimate {
         let biome = self.section.get_biome(x, y, z);
@@ -721,7 +364,6 @@ impl SectionStoreSnapshot {
             .copied()
             .unwrap_or_default()
     }
-
     fn grass_color_at(&self, x: i32, y: i32, z: i32) -> [f32; 3] {
         let climate = self.climate_at(x, y, z);
         let base = climate.grass_color_override.unwrap_or_else(|| {
@@ -730,7 +372,6 @@ impl SectionStoreSnapshot {
         });
         apply_grass_modifier(climate.grass_color_modifier, base, x, z)
     }
-
     fn foliage_color_at(&self, x: i32, y: i32, z: i32) -> [f32; 3] {
         let climate = self.climate_at(x, y, z);
         climate.foliage_color_override.unwrap_or_else(|| {
@@ -738,7 +379,6 @@ impl SectionStoreSnapshot {
                 .lookup(climate.temperature, climate.downfall)
         })
     }
-
     fn dry_foliage_color_at(&self, x: i32, y: i32, z: i32) -> [f32; 3] {
         let climate = self.climate_at(x, y, z);
         climate.dry_foliage_color_override.unwrap_or_else(|| {
@@ -746,19 +386,15 @@ impl SectionStoreSnapshot {
                 .lookup(climate.temperature, climate.downfall)
         })
     }
-
     fn grass_tint(&self, x: i32, y: i32, z: i32) -> [f32; 3] {
         self.blend_color(x, y, z, Self::grass_color_at)
     }
-
     fn foliage_tint(&self, x: i32, y: i32, z: i32) -> [f32; 3] {
         self.blend_color(x, y, z, Self::foliage_color_at)
     }
-
     fn dry_foliage_tint(&self, x: i32, y: i32, z: i32) -> [f32; 3] {
         self.blend_color(x, y, z, Self::dry_foliage_color_at)
     }
-
     fn blend_color(
         &self,
         x: i32,
@@ -781,32 +417,27 @@ impl SectionStoreSnapshot {
         }
         [r / COUNT, g / COUNT, b / COUNT]
     }
-
     fn get_light(&self, x: i32, y: i32, z: i32) -> f32 {
-        LIGHT_TABLE[self.section.get_light(x, y, z) as usize]
+        let light = self.section.get_light(x, y, z);
+        LIGHT_TABLE[light as usize]
     }
 }
-
 pub const LIGHT_TABLE: [f32; 16] = [
     0.05, 0.067, 0.085, 0.106, 0.129, 0.156, 0.188, 0.227, 0.272, 0.328, 0.393, 0.472, 0.566,
     0.679, 0.815, 1.0,
 ];
-
 struct GreedyBlockInfo {
     textures: FaceTextures,
 }
-
 struct BlockTypeMap {
     state_to_id: HashMap<BlockState, u16>,
     id_to_info: Vec<GreedyBlockInfo>,
 }
-
 impl BlockTypeMap {
     fn build(snapshot: &SectionStoreSnapshot, registry: &BlockRegistry) -> Self {
         let mut state_to_id = HashMap::new();
         let mut id_to_info: Vec<GreedyBlockInfo> = Vec::new();
         let mut next_id = 1u16;
-
         for lz in -1..17 {
             for lx in -1..17 {
                 for ly in -1..17 {
@@ -836,20 +467,17 @@ impl BlockTypeMap {
                 }
             }
         }
-
         Self {
             state_to_id,
             id_to_info,
         }
     }
-
     fn get_id(&self, state: BlockState) -> u16 {
         if state.is_air() {
             return 0;
         }
         self.state_to_id.get(&state).copied().unwrap_or(0)
     }
-
     fn get_info(&self, id: u16) -> Option<&GreedyBlockInfo> {
         if id == 0 {
             return None;
@@ -857,9 +485,7 @@ impl BlockTypeMap {
         self.id_to_info.get((id - 1) as usize)
     }
 }
-
 const SECTION_SIZE: usize = 16;
-
 fn face_texture_name(textures: &FaceTextures, face: greedy::Face) -> &str {
     match face {
         greedy::Face::Up => &textures.top,
@@ -870,9 +496,7 @@ fn face_texture_name(textures: &FaceTextures, face: greedy::Face) -> &str {
         greedy::Face::Back => &textures.north,
     }
 }
-
 use super::block_ao::AO_BRIGHTNESS;
-
 #[allow(clippy::too_many_arguments)]
 fn greedy_mesh_section(
     vertices: &mut Vec<ChunkVertex>,
@@ -882,13 +506,12 @@ fn greedy_mesh_section(
     type_map: &BlockTypeMap,
     uv_map: &AtlasUVMap,
     spos: ChunkSectionPos,
-) -> VisibilitySet {
+) {
     type M = greedy::GreedyMesher<SECTION_SIZE>;
     let mut mesher = M::new();
     let mut voxels = vec![0u16; M::CS_P3];
     let mut occluders = vec![false; M::CS_P3];
     let mut light = vec![0.0f32; M::CS_P3];
-
     for ly in 0..18 {
         for lx in 0..18 {
             for lz in 0..18 {
@@ -901,25 +524,20 @@ fn greedy_mesh_section(
             }
         }
     }
-
     let transparent_set = std::collections::BTreeSet::new();
     mesher.mesh(&voxels, &occluders, &light, &transparent_set);
-
     for face_idx in 0..6 {
         let face = greedy::Face::from(face_idx);
         let dir_shade = face.shade_light();
-
         for quad in &mesher.quads[face_idx] {
             let block_id = quad.voxel_id();
             let info = match type_map.get_info(block_id) {
                 Some(i) => i,
                 None => continue,
             };
-
             let tex_name = face_texture_name(&info.textures, face);
             let region = uv_map.get_region(tex_name);
             let verts_uvs = face.vertices(quad);
-
             let [x0, y0, z0] = verts_uvs[0].0;
             let lx = x0 as i32;
             let ly = y0 as i32;
@@ -930,18 +548,15 @@ fn greedy_mesh_section(
                 snapshot.foliage_tint(lx, ly, lz),
                 snapshot.dry_foliage_tint(lx, ly, lz),
             );
-
             let ao = quad.ao_levels();
             // Per-vertex smooth light (averaged across chunk borders in the mesher); `i`
             // matches `ao`.
             let lights: [f32; 4] = core::array::from_fn(|i| {
                 AO_BRIGHTNESS[ao[i] as usize] * (quad.light[i] as f32 / 255.0) * dir_shade
             });
-
             let base = vertices.len() as u32;
             let u_span = region.u_max - region.u_min;
             let v_span = region.v_max - region.v_min;
-
             for (i, (pos, uv)) in verts_uvs.iter().enumerate() {
                 vertices.push(ChunkVertex {
                     position: [
@@ -956,7 +571,6 @@ fn greedy_mesh_section(
                     light_tint: pack_light_tint(lights[i], tint),
                 });
             }
-
             if lights[0] + lights[2] > lights[1] + lights[3] {
                 indices.extend_from_slice(&[
                     base + 1,
@@ -971,15 +585,8 @@ fn greedy_mesh_section(
             }
         }
     }
-
-    // Section visibility (cave culling) shares the opacity grid the mesher just
-    // built: the section's 16³ cells sit at padded coords +1.
-    compute_visibility(|x, y, z| {
-        occluders[greedy::pad_linearize::<SECTION_SIZE>(x + 1, y + 1, z + 1)]
-    })
 }
-
-fn mesh_section(
+pub(crate) fn mesh_section(
     snapshot: &SectionStoreSnapshot,
     spos: ChunkSectionPos,
     registry: &BlockRegistry,
@@ -991,17 +598,14 @@ fn mesh_section(
     let relative_si = spos.y - snapshot.min_y.div_euclid(16);
     let mut mesh = SectionMeshData::new(spos, relative_si, content_gen, upload_epoch);
     let mut logged_missing: std::collections::HashSet<String> = std::collections::HashSet::new();
-
     let step = 1i32 << lod;
     let step_usize = step as usize;
-
     let type_map = if lod == 0 {
         Some(BlockTypeMap::build(snapshot, registry))
     } else {
         None
     };
-
-    mesh.visibility = if let Some(ref tm) = type_map {
+    if let Some(ref tm) = type_map {
         greedy_mesh_section(
             &mut mesh.vertices,
             &mut mesh.indices,
@@ -1011,12 +615,8 @@ fn mesh_section(
             uv_map,
             spos,
         )
-    } else {
-        VisibilitySet::all()
-    };
-
+    }
     let wpos = spos * 16;
-
     // 2. Complex & Fluid Pass (Block-by-Block)
     for local_z in (0..16).step_by(step_usize) {
         for local_x in (0..16).step_by(step_usize) {
@@ -1024,7 +624,6 @@ fn mesh_section(
                 // Array indices are natively usize in the for loop
                 let mut state = snapshot.section.get_block_state(local_x, local_y, local_z);
                 let mut kind = classify_block(state);
-
                 // LOD Air Look-ahead
                 if lod > 0 && matches!(kind, BlockKind::Air) {
                     let end_y = (local_y as i32 + step).min(16);
@@ -1038,13 +637,11 @@ fn mesh_section(
                         }
                     }
                 }
-
                 // If it's still air, jump to next loop (iterator handles the step
                 // automatically)
                 if matches!(kind, BlockKind::Air) {
                     continue;
                 }
-
                 // CULLING: Skip blocks already handled by the greedy mesher
                 if lod == 0 {
                     if let Some(ref tm) = type_map {
@@ -1053,12 +650,10 @@ fn mesh_section(
                         }
                     }
                 }
-
                 let bx = wpos.x + local_x as i32;
                 let by = wpos.y + local_y as i32;
                 let bz = wpos.z + local_z as i32;
                 let block_pos = [bx as f32, by as f32, bz as f32];
-
                 // Route this block's geometry
                 if lod > 0 {
                     emit_lod_cube(
@@ -1151,10 +746,8 @@ fn mesh_section(
             }
         }
     }
-
     mesh
 }
-
 #[allow(clippy::too_many_arguments)]
 fn emit_baked_model(
     vertices: &mut Vec<ChunkVertex>,
@@ -1179,7 +772,6 @@ fn emit_baked_model(
                 continue;
             }
         }
-
         let region = uv_map.get_region(&quad.texture);
         let tint = tint_color(
             quad.tint,
@@ -1204,7 +796,6 @@ fn emit_baked_model(
         );
     }
 }
-
 #[allow(clippy::too_many_arguments)]
 fn emit_cube_faces(
     vertices: &mut Vec<ChunkVertex>,
@@ -1224,7 +815,6 @@ fn emit_cube_faces(
         snapshot.foliage_tint(lx, ly, lz),
         snapshot.dry_foliage_tint(lx, ly, lz),
     );
-
     for (i, dir) in CUBE_FACE_DIRS.iter().enumerate() {
         let offset = dir.offset();
         let neighbor =
@@ -1234,7 +824,6 @@ fn emit_cube_faces(
         if registry.occludes_neighbor(neighbor) {
             continue;
         }
-
         let face_tex = match i {
             0 => &textures.top,
             1 => &textures.bottom,
@@ -1246,7 +835,6 @@ fn emit_cube_faces(
         let region = uv_map.get_region(face_tex);
         let (positions, uvs, _) = cube_face_geometry(*dir);
         let lights = compute_face_ao(snapshot, registry, lx, ly, lz, *dir);
-
         let is_side = i >= 2;
         if let Some(overlay) = textures.side_overlay.as_deref().filter(|_| is_side) {
             emit_face(
@@ -1284,14 +872,12 @@ fn emit_cube_faces(
         }
     }
 }
-
 enum BlockKind {
     Air,
     Water,
     Lava,
     Solid,
 }
-
 fn classify_block(state: azalea_block::BlockState) -> BlockKind {
     if state.is_air() {
         return BlockKind::Air;
@@ -1306,14 +892,11 @@ fn classify_block(state: azalea_block::BlockState) -> BlockKind {
         _ => BlockKind::Solid,
     }
 }
-
 // TODO: biome-based water color
 // TODO: per-corner height averaging for smooth water surfaces
 // TODO: flowing water texture (water_flow) with direction-based rotation
 // TODO: per-level height for flowing water (level / 9.0 per corner)
-
 const FLUID_MAX_HEIGHT: f32 = 8.0 / 9.0;
-
 #[allow(clippy::too_many_arguments)]
 fn block_face_tex_tint(
     state: azalea_block::BlockState,
@@ -1354,7 +937,6 @@ fn block_face_tex_tint(
         }
     }
 }
-
 #[allow(clippy::too_many_arguments)]
 fn emit_fluid(
     vertices: &mut Vec<ChunkVertex>,
@@ -1370,33 +952,27 @@ fn emit_fluid(
 ) {
     let (region, tint) =
         block_face_tex_tint(state, Direction::Up, uv_map, snapshot, registry, lx, ly, lz);
-
     for dir in &CUBE_FACE_DIRS {
         let offset = dir.offset();
         let neighbor =
             snapshot
                 .section
                 .get_block_state(lx + offset[0], ly + offset[1], lz + offset[2]);
-
         if matches!(classify_block(neighbor), BlockKind::Water | BlockKind::Lava)
             || registry.occludes_neighbor(neighbor)
         {
             continue;
         }
-
         let (mut positions, uvs, light) = cube_face_geometry(*dir);
-
         if matches!(dir, Direction::Up) {
             // A water/lava block above would have culled this face already, so
             // the surface always sits at the lowered fluid height.
             for p in &mut positions {
                 p[1] = FLUID_MAX_HEIGHT;
             }
-
             emit_face(
                 vertices, indices, block_pos, &positions, &uvs, [light; 4], region, tint,
             );
-
             // Vanilla's backward up-face: the surface seen from below (underwater
             // looking up). Reversed winding so it survives back-face culling.
             let rev_positions = [positions[0], positions[3], positions[2], positions[1]];
@@ -1413,13 +989,11 @@ fn emit_fluid(
             );
             continue;
         }
-
         emit_face(
             vertices, indices, block_pos, &positions, &uvs, [light; 4], region, tint,
         );
     }
 }
-
 #[allow(clippy::too_many_arguments)]
 fn emit_multipart(
     vertices: &mut Vec<ChunkVertex>,
@@ -1444,7 +1018,6 @@ fn emit_multipart(
                 continue;
             }
         }
-
         let region = uv_map.get_region(&quad.texture);
         let tint = tint_color(
             quad.tint,
@@ -1464,7 +1037,6 @@ fn emit_multipart(
         );
     }
 }
-
 #[allow(clippy::too_many_arguments)]
 fn emit_lod_cube(
     vertices: &mut Vec<ChunkVertex>,
@@ -1491,7 +1063,6 @@ fn emit_lod_cube(
     } else {
         1.0
     };
-
     for dir in &CUBE_FACE_DIRS {
         let offset = dir.offset();
         let nx = lx + offset[0] * step;
@@ -1504,10 +1075,8 @@ fn emit_lod_cube(
         if is_fluid && matches!(classify_block(neighbor), BlockKind::Water | BlockKind::Lava) {
             continue;
         }
-
         let (region, tint) =
             block_face_tex_tint(state, *dir, uv_map, snapshot, registry, lx, ly, lz);
-
         let (positions, uvs, light) = cube_face_geometry(*dir);
         let s = step as f32;
         let sy = if is_fluid { fluid_top } else { s };
@@ -1529,9 +1098,7 @@ fn emit_lod_cube(
         indices.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
     }
 }
-
 const MISSING_TINT: u32 = pack_tint_shifted([1.0, 0.0, 1.0]);
-
 #[allow(clippy::too_many_arguments)]
 fn emit_missing_cube(
     vertices: &mut Vec<ChunkVertex>,
@@ -1552,7 +1119,6 @@ fn emit_missing_cube(
         if registry.occludes_neighbor(neighbor) {
             continue;
         }
-
         let (positions, _, light) = cube_face_geometry(*dir);
         let base = vertices.len() as u32;
         for pos in &positions {
@@ -1569,7 +1135,6 @@ fn emit_missing_cube(
         indices.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
     }
 }
-
 pub(crate) const CUBE_FACE_DIRS: [Direction; 6] = [
     Direction::Up,
     Direction::Down,
@@ -1578,7 +1143,6 @@ pub(crate) const CUBE_FACE_DIRS: [Direction; 6] = [
     Direction::East,
     Direction::West,
 ];
-
 #[allow(clippy::too_many_arguments)]
 fn emit_face(
     vertices: &mut Vec<ChunkVertex>,
@@ -1593,7 +1157,6 @@ fn emit_face(
     let base = vertices.len() as u32;
     let u_span = region.u_max - region.u_min;
     let v_span = region.v_max - region.v_min;
-
     for i in 0..4 {
         vertices.push(ChunkVertex {
             position: [
@@ -1608,14 +1171,12 @@ fn emit_face(
             light_tint: pack_light_tint(lights[i], tint),
         });
     }
-
     if lights[0] + lights[2] > lights[1] + lights[3] {
         indices.extend_from_slice(&[base + 1, base + 2, base + 3, base + 3, base, base + 1]);
     } else {
         indices.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
     }
 }
-
 fn shade_brightness(state: azalea_block::BlockState, registry: &BlockRegistry) -> f32 {
     // TODO: non-occluding full cubes (leaves, glass, ice) still darken adjacent
     // faces here. Vanilla's are `isViewBlocking=never` and don't contribute AO.
@@ -1625,7 +1186,6 @@ fn shade_brightness(state: azalea_block::BlockState, registry: &BlockRegistry) -
         1.0
     }
 }
-
 /// Centre-relative offset of vanilla's `AdjacencyInfo.corners[0]` neighbour
 /// (`centre + dir + corners[0]`), the `shade0` occlusion fallback.
 fn corners0_offset(dir: Direction) -> [i32; 3] {
@@ -1644,7 +1204,6 @@ fn corners0_offset(dir: Direction) -> [i32; 3] {
         Direction::East => [1, -1, 0],
     }
 }
-
 fn compute_face_ao(
     snapshot: &SectionStoreSnapshot,
     registry: &BlockRegistry,
@@ -1666,13 +1225,11 @@ fn compute_face_ao(
         Direction::North | Direction::South => 0.8,
         Direction::East | Direction::West => 0.6,
     };
-
     let c0 = corners0_offset(dir);
     let shade0 = s(c0[0], c0[1], c0[2]);
     let vertex_ao = |side1: f32, side2: f32, corner: f32| -> f32 {
         super::block_ao::vertex_brightness(side1, side2, corner, shade0)
     };
-
     let (ao, lights) = match dir {
         Direction::Up => {
             let n = [0, 1, 0];
@@ -1799,11 +1356,9 @@ fn compute_face_ao(
         ao[3] * lights[3] * dir_shade,
     ]
 }
-
 fn avg4(a: f32, b: f32, c: f32, d: f32) -> f32 {
     (a + b + c + d) * 0.25
 }
-
 pub(crate) fn cube_face_geometry(dir: Direction) -> ([[f32; 3]; 4], [[f32; 2]; 4], f32) {
     match dir {
         Direction::Up => (

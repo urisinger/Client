@@ -7,7 +7,7 @@ use glam::{DVec3, dvec3};
 use super::aabb::Aabb;
 use super::block_shape;
 use crate::entity::components::Velocity;
-use crate::world::chunk::ChunkStore;
+use crate::world::chunk::SharedChunkStore;
 
 static NO_COLLISION: LazyLock<HashSet<BlockKind>> = LazyLock::new(|| {
     HashSet::from([
@@ -258,7 +258,7 @@ pub fn has_collision(state: azalea_block::BlockState) -> bool {
     !NO_COLLISION.contains(&kind)
 }
 
-pub fn collect_block_aabbs(chunk_store: &ChunkStore, region: &Aabb) -> Vec<Aabb> {
+pub fn collect_block_aabbs(chunk_store: &SharedChunkStore, region: &Aabb) -> Vec<Aabb> {
     let mut aabbs = Vec::new();
 
     let min_x = region.min.x.floor() as i32;
@@ -293,7 +293,7 @@ pub fn collect_block_aabbs(chunk_store: &ChunkStore, region: &Aabb) -> Vec<Aabb>
     aabbs
 }
 
-pub fn no_collision(chunk_store: &ChunkStore, aabb: &Aabb) -> bool {
+pub fn no_collision(chunk_store: &SharedChunkStore, aabb: &Aabb) -> bool {
     collect_block_aabbs(chunk_store, aabb)
         .iter()
         .all(|block| !block.intersects(aabb))
@@ -339,7 +339,7 @@ fn collide_along_axes(
 }
 
 pub fn resolve_collision(
-    chunk_store: &ChunkStore,
+    chunk_store: &SharedChunkStore,
     player_aabb: Aabb,
     velocity: Velocity,
     step_height: f64,

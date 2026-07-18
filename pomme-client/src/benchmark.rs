@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use crate::renderer::RenderTimings;
+use crate::renderer::timings::RenderTimings;
 
 const DURATION_SECS: f32 = 10.0;
 const WARMUP_FRAMES: u32 = 30;
@@ -19,9 +19,14 @@ fn iso8601_utc_now() -> String {
 #[derive(Clone, serde::Serialize)]
 pub struct FrameSample {
     pub frame_ms: f32,
-    pub fence_ms: f32,
     pub cull_ms: f32,
-    pub draw_ms: f32,
+    pub gui_bake_ms: f32,
+    pub terrain_ms: f32,
+    pub entities_ms: f32,
+    pub translucent_ms: f32,
+    pub ui_ms: f32,
+    pub hiz_ms: f32,
+    pub visibility_ms: f32,
     pub chunk_count: u32,
     pub entity_count: u32,
 }
@@ -30,9 +35,14 @@ pub struct FrameSample {
 pub struct SpikeSample {
     pub frame_index: u32,
     pub frame_ms: f32,
-    pub fence_ms: f32,
     pub cull_ms: f32,
-    pub draw_ms: f32,
+    pub gui_bake_ms: f32,
+    pub terrain_ms: f32,
+    pub entities_ms: f32,
+    pub translucent_ms: f32,
+    pub ui_ms: f32,
+    pub hiz_ms: f32,
+    pub visibility_ms: f32,
     pub chunk_count: u32,
     pub entity_count: u32,
 }
@@ -64,9 +74,14 @@ pub struct BenchmarkResult {
     pub avg_frame_ms: f32,
     pub p1_frame_ms: f32,
     pub p99_frame_ms: f32,
-    pub avg_fence_ms: f32,
     pub avg_cull_ms: f32,
-    pub avg_draw_ms: f32,
+    pub avg_gui_bake_ms: f32,
+    pub avg_terrain_ms: f32,
+    pub avg_entities_ms: f32,
+    pub avg_translucent_ms: f32,
+    pub avg_ui_ms: f32,
+    pub avg_hiz_ms: f32,
+    pub avg_visibility_ms: f32,
     pub peak_chunk_count: u32,
     pub peak_entity_count: u32,
     pub spike_count: u32,
@@ -103,9 +118,14 @@ impl Benchmark {
 
         let sample = FrameSample {
             frame_ms,
-            fence_ms: timings.fence_ms,
-            cull_ms: timings.cull_ms,
-            draw_ms: timings.draw_ms,
+            cull_ms: timings.cull_ms(),
+            gui_bake_ms: timings.gui_bake_ms(),
+            terrain_ms: timings.terrain_ms(),
+            entities_ms: timings.entities_ms(),
+            translucent_ms: timings.translucent_ms(),
+            ui_ms: timings.ui_ms(),
+            hiz_ms: timings.hiz_ms(),
+            visibility_ms: timings.visibility_ms(),
             chunk_count,
             entity_count,
         };
@@ -114,9 +134,14 @@ impl Benchmark {
             self.spikes.push(SpikeSample {
                 frame_index: self.samples.len() as u32,
                 frame_ms: sample.frame_ms,
-                fence_ms: sample.fence_ms,
                 cull_ms: sample.cull_ms,
-                draw_ms: sample.draw_ms,
+                gui_bake_ms: sample.gui_bake_ms,
+                terrain_ms: sample.terrain_ms,
+                entities_ms: sample.entities_ms,
+                translucent_ms: sample.translucent_ms,
+                ui_ms: sample.ui_ms,
+                hiz_ms: sample.hiz_ms,
+                visibility_ms: sample.visibility_ms,
                 chunk_count: sample.chunk_count,
                 entity_count: sample.entity_count,
             });
@@ -136,9 +161,15 @@ impl Benchmark {
         let p1_idx = ((count as f32 * 0.99) as usize).min(count - 1);
         let p99_idx = (count as f32 * 0.01) as usize;
 
-        let fence_sum: f32 = self.samples.iter().map(|s| s.fence_ms).sum();
         let cull_sum: f32 = self.samples.iter().map(|s| s.cull_ms).sum();
-        let draw_sum: f32 = self.samples.iter().map(|s| s.draw_ms).sum();
+        let gui_bake_sum: f32 = self.samples.iter().map(|s| s.gui_bake_ms).sum();
+        let terrain_sum: f32 = self.samples.iter().map(|s| s.terrain_ms).sum();
+        let entities_sum: f32 = self.samples.iter().map(|s| s.entities_ms).sum();
+        let translucent_sum: f32 = self.samples.iter().map(|s| s.translucent_ms).sum();
+        let ui_sum: f32 = self.samples.iter().map(|s| s.ui_ms).sum();
+        let hiz_sum: f32 = self.samples.iter().map(|s| s.hiz_ms).sum();
+        let visibility_sum: f32 = self.samples.iter().map(|s| s.visibility_ms).sum();
+
         let peak_chunks = self
             .samples
             .iter()
@@ -170,9 +201,14 @@ impl Benchmark {
             avg_frame_ms: avg_ms,
             p1_frame_ms: frame_times[p1_idx],
             p99_frame_ms: frame_times[p99_idx],
-            avg_fence_ms: fence_sum / count as f32,
             avg_cull_ms: cull_sum / count as f32,
-            avg_draw_ms: draw_sum / count as f32,
+            avg_gui_bake_ms: gui_bake_sum / count as f32,
+            avg_terrain_ms: terrain_sum / count as f32,
+            avg_entities_ms: entities_sum / count as f32,
+            avg_translucent_ms: translucent_sum / count as f32,
+            avg_ui_ms: ui_sum / count as f32,
+            avg_hiz_ms: hiz_sum / count as f32,
+            avg_visibility_ms: visibility_sum / count as f32,
             peak_chunk_count: peak_chunks,
             peak_entity_count: peak_entities,
             spike_count: self.spikes.len() as u32,

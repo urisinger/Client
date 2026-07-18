@@ -3,26 +3,31 @@ pub mod camera;
 pub mod chunk;
 mod context;
 pub mod entity_model;
+pub mod hiz;
 pub mod pipelines;
 pub(crate) mod shader;
 mod swapchain;
+pub(crate) mod timings;
 pub(crate) mod util;
+pub mod visibility;
 
 pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use azalea_block::BlockState;
-
+use azalea_core::position::{BlockPos, ChunkPos, ChunkSectionPos};
 pub use camera::CloudMode;
 use camera::{Camera, CameraUniform};
 use chunk::atlas::TextureAtlas;
 use chunk::buffer::ChunkBufferStore;
-use chunk::mesher::{MeshDispatcher, SectionMeshData};
+use chunk::dispatcher::ChunkMeshing;
+use chunk::mesher::SectionMeshData;
 use context::VulkanContext;
 use glam::dvec3;
+use hiz::HizPipeline;
 use pipelines::block_entity::BlockEntityPipeline;
 pub use pipelines::block_entity::BlockEntityRenderInfo;
 use pipelines::block_overlay::BlockOverlayPipeline;
@@ -40,6 +45,7 @@ use pyronyx::khr::swapchain::{SwapchainDevice, SwapchainQueue};
 use pyronyx::vk;
 use swapchain::Swapchain;
 use thiserror::Error;
+use visibility::VisibilityPipeline;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
@@ -48,6 +54,8 @@ use crate::assets::AssetIndex;
 use crate::entity::components::{LookDirection, Position};
 use crate::renderer::pipelines::chunk_borders::ChunkBorderPipeline;
 use crate::renderer::pipelines::item_entity::ItemEntityPipeline;
+use crate::renderer::timings::{RenderTimings, Timer, Timestamp};
+use crate::util::ChunkRing;
 use crate::world::block::registry::BlockRegistry;
 
 #[derive(Error, Debug)]
@@ -66,46 +74,21 @@ pub struct PlayerPreview {
     pub cursor: (f32, f32),
 }
 
-enum RenderMode<'a> {
-    World {
-        overlay: Vec<MenuElement>,
-        swing_progress: f32,
-        held_item: Option<pipelines::held_item::HeldItemInfo>,
-        destroy_info: Option<(BlockPos, u32, BlockState)>,
-        show_chunk_borders: bool,
-        sky: SkyState,
-        entities: &'a [EntityRenderInfo],
-        item_entities: &'a [pipelines::item_entity::ItemRenderInfo],
-        block_entities: &'a [BlockEntityRenderInfo],
-        weather: &'a [WeatherColumn],
-        cloud_mode: CloudMode,
-        render_distance: u32,
-        player_preview: Option<PlayerPreview>,
-        eyes_in_water: bool,
-    },
-    MainMenu {
-        scroll: f32,
-        blur: f32,
-        elements: Vec<MenuElement>,
-        cursor: (f32, f32),
-        show_skin: bool,
-    },
-}
-
-#[derive(Default, Clone)]
-pub struct RenderTimings {
-    pub frame_ms: f32,
-    pub fence_ms: f32,
-    pub acquire_ms: f32,
-    pub cull_ms: f32,
-    pub draw_ms: f32,
-    pub present_ms: f32,
+struct FrameCtx {
+    frame: usize,
+    image_index: u32,
+    cmd: vk::CommandBuffer,
+    extent: vk::Extent2D,
+    viewport: vk::Viewport,
+    scissor: vk::Rect2D,
 }
 
 pub struct Renderer {
     ctx: VulkanContext,
     swapchain: Swapchain,
-    camera: Camera,
+    pub camera: Camera,
+
+    pub mesh_queue: VecDeque<SectionMeshData>,
 
     registry: BlockRegistry,
     jar_assets_dir: PathBuf,
@@ -136,7 +119,11 @@ pub struct Renderer {
     vsync: bool,
     width: u32,
     height: u32,
+    query_pools: Option<[vk::QueryPool; MAX_FRAMES_IN_FLIGHT]>,
+    query_reset: [bool; MAX_FRAMES_IN_FLIGHT],
     last_timings: RenderTimings,
+    hiz_pipeline: HizPipeline,
+    visibility_pipeline: VisibilityPipeline,
 }
 
 impl Renderer {
@@ -393,9 +380,36 @@ impl Renderer {
             asset_index,
         );
 
+        let query_pools = if ctx.features.timestamp_queries {
+            Some(std::array::from_fn(|_| {
+                let count = Timestamp::Count as u32;
+                let info = vk::QueryPoolCreateInfo {
+                    query_type: vk::QueryType::Timestamp,
+                    query_count: count,
+                    ..Default::default()
+                };
+
+                ctx.device.create_query_pool(&info, None).unwrap()
+            }))
+        } else {
+            None
+        };
+
+        let properties = ctx.physical_device.get_properties();
+        let timestamp_period = properties.limits.timestamp_period;
+        let hiz_pipeline = HizPipeline::new(
+            &ctx.device,
+            &ctx.allocator,
+            swapchain_extent.width,
+            swapchain_extent.height,
+            swapchain_state.depth_view,
+        );
+        let visibility_pipeline =
+            VisibilityPipeline::new(&ctx.device, &ctx.allocator, &hiz_pipeline);
         Ok(Self {
             ctx,
             swapchain: swapchain_state,
+            mesh_queue: VecDeque::new(),
             camera,
             registry,
             jar_assets_dir: jar_assets_dir.to_path_buf(),
@@ -424,7 +438,15 @@ impl Renderer {
             vsync,
             width: swapchain_extent.width,
             height: swapchain_extent.height,
-            last_timings: RenderTimings::default(),
+
+            query_pools,
+            query_reset: Default::default(),
+            last_timings: RenderTimings {
+                ticks: [0; _],
+                timestamp_period,
+            },
+            hiz_pipeline,
+            visibility_pipeline,
         })
     }
 
@@ -674,6 +696,15 @@ impl Renderer {
             self.blur_pipeline.blurred_view(),
             self.blur_pipeline.blurred_sampler(),
         );
+        self.hiz_pipeline.resize(
+            &self.ctx.device,
+            &self.ctx.allocator,
+            self.width,
+            self.height,
+            self.swapchain.depth_view,
+        );
+        self.visibility_pipeline
+            .update_hiz_descriptors(&self.ctx.device, &self.hiz_pipeline);
 
         let sem_info = vk::SemaphoreCreateInfo::default();
         self.render_finished_per_image = Vec::with_capacity(self.swapchain.images.len());
@@ -845,12 +876,6 @@ impl Renderer {
         self.chunk_buffers.sections_drawn()
     }
 
-    /// Push the CPU visibility graph's per-column visible-section masks to the
-    /// chunk buffer store, which omits occluded sections from the GPU cull.
-    pub fn set_chunk_visibility(&mut self, vis: HashMap<ChunkPos, u32>) {
-        self.chunk_buffers.set_chunk_visibility(vis);
-    }
-
     pub fn wait_for_all_frames(&self) {
         let _ = self
             .ctx
@@ -858,15 +883,12 @@ impl Renderer {
             .wait_for_fences(&self.ctx.in_flight_fences, true, u64::MAX);
     }
 
-    pub fn upload_mesh_batch(
-        &mut self,
-        mesh_queue: &mut std::collections::VecDeque<SectionMeshData>,
-    ) -> Vec<(ChunkSectionPos, chunk::occlusion_graph::VisibilitySet, u64)> {
+    pub fn upload_mesh_batch(&mut self) -> Vec<(ChunkSectionPos, u64)> {
         self.chunk_buffers.upload_mesh_batch(
             &self.ctx.device,
             &self.ctx.allocator,
             self.ctx.graphics_queue,
-            mesh_queue,
+            &mut self.mesh_queue,
         )
     }
 
@@ -883,13 +905,14 @@ impl Renderer {
         &self.registry
     }
 
-    pub fn create_mesh_dispatcher(
+    pub fn create_chunk_meshing(
         &self,
+        shared_chunk_store: std::sync::Arc<crate::world::chunk::SharedChunkStore>,
         biome_climate: std::sync::Arc<
             std::collections::HashMap<u32, crate::renderer::chunk::mesher::BiomeClimate>,
         >,
         packs: Option<&crate::resource_pack::ResourcePackManager>,
-    ) -> MeshDispatcher {
+    ) -> ChunkMeshing {
         let grass_colormap = crate::renderer::chunk::mesher::Colormap::load(
             &self.jar_assets_dir,
             &self.asset_index,
@@ -908,7 +931,8 @@ impl Renderer {
             "minecraft/textures/colormap/dry_foliage.png",
             packs,
         );
-        MeshDispatcher::new(
+        ChunkMeshing::create(
+            shared_chunk_store,
             self.registry.clone(),
             self.atlas.uv_map.clone(),
             grass_colormap,
@@ -923,67 +947,6 @@ impl Renderer {
         self.chunk_border_pipeline
             .update_lines(cam.x, cam.y, cam.z, min_y, max_y);
     }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn render_world(
-        &mut self,
-        window: &Window,
-        hide_cursor: bool,
-        overlay: Vec<MenuElement>,
-        swing_progress: f32,
-        held_item: Option<(String, f32)>,
-        destroy_info: Option<(BlockPos, u32, BlockState)>,
-        show_chunk_borders: bool,
-        sky: SkyState,
-        entities: &[EntityRenderInfo],
-        item_entities: &[pipelines::item_entity::ItemRenderInfo],
-        block_entities: &[BlockEntityRenderInfo],
-        weather: &[WeatherColumn],
-        cloud_mode: CloudMode,
-        render_distance: u32,
-        player_preview: Option<PlayerPreview>,
-        eyes_in_water: bool,
-    ) -> Result<(), RendererError> {
-        let held_item = held_item.map(|(name, light)| {
-            let has_3d_model = self.ensure_item_mesh(&name).is_block_model;
-            pipelines::held_item::HeldItemInfo {
-                name,
-                light,
-                has_3d_model,
-            }
-        });
-        // Clear to the sky color: the strip between the sky disc's edge and the
-        // terrain shows the clear color, so it must match the sky/terrain or it
-        // reads as a horizon band (visible at night). Underwater, clear to the
-        // water fog color so background gaps read as water rather than sky.
-        let clear_col = if eyes_in_water {
-            camera::WATER_FOG_COLOR
-        } else {
-            sky.sky_color()
-        };
-        self.render_frame(
-            window,
-            hide_cursor,
-            [clear_col[0], clear_col[1], clear_col[2], 1.0],
-            RenderMode::World {
-                overlay,
-                swing_progress,
-                held_item,
-                destroy_info,
-                show_chunk_borders,
-                sky,
-                entities,
-                item_entities,
-                block_entities,
-                weather,
-                cloud_mode,
-                render_distance,
-                player_preview,
-                eyes_in_water,
-            },
-        )
-    }
-
     pub fn render_menu(
         &mut self,
         window: &Window,
@@ -993,18 +956,141 @@ impl Renderer {
         cursor: (f32, f32),
         show_skin: bool,
     ) -> Result<(), RendererError> {
-        self.render_frame(
-            window,
-            false,
-            [0.0, 0.0, 0.0, 1.0],
-            RenderMode::MainMenu {
-                scroll,
-                blur,
-                elements,
-                cursor,
-                show_skin,
+        if self.swapchain_dirty {
+            self.recreate_swapchain()?;
+        }
+
+        let frame = self.ctx.frame_index;
+        let fence = self.ctx.in_flight_fences[frame];
+
+        self.ctx.device.wait_for_fences(&[fence], true, u64::MAX)?;
+
+        let ctx = self.begin_frame(window, false)?;
+
+        let clear_values = [
+            vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 1.0],
+                },
             },
-        )
+            vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            },
+        ];
+
+        let item_atlas_uvs = self.run_gui_bake(&ctx, &elements);
+
+        let use_blur = blur > 0.01;
+
+        let (rp, fb) = if use_blur {
+            (
+                self.swapchain.render_pass_scene,
+                self.swapchain.framebuffers_scene[ctx.image_index as usize],
+            )
+        } else {
+            (
+                self.swapchain.render_pass,
+                self.swapchain.framebuffers[ctx.image_index as usize],
+            )
+        };
+
+        let render_pass_info = vk::RenderPassBeginInfo {
+            render_pass: rp,
+            framebuffer: fb,
+            render_area: vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: self.swapchain.extent,
+            },
+            clear_value_count: clear_values.len() as u32,
+            clear_values: clear_values.as_ptr(),
+            ..Default::default()
+        };
+
+        ctx.cmd
+            .begin_render_pass(&render_pass_info, vk::SubpassContents::Inline);
+        ctx.cmd.set_viewport(0, &[ctx.viewport]);
+        ctx.cmd.set_scissor(0, &[ctx.scissor]);
+
+        let sw = self.swapchain.extent.width as f32;
+        let sh = self.swapchain.extent.height as f32;
+        let aspect = sw / sh.max(1.0);
+
+        // Panorama background
+        self.panorama_pipeline
+            .draw(&self.ctx.device, ctx.cmd, scroll, aspect, 0.0);
+
+        // Split at BlurBackdrop marker
+        let split = elements
+            .iter()
+            .position(|e| matches!(e, MenuElement::BlurBackdrop));
+        let mut vbase = 0u32;
+        if let Some(i) = split {
+            vbase =
+                self.menu_pipeline
+                    .draw_from(ctx.cmd, sw, sh, &elements[..i], &item_atlas_uvs, 0);
+        }
+
+        // Blur pass
+        if use_blur {
+            ctx.cmd.end_render_pass();
+
+            let swapchain_image = self.swapchain.images[ctx.image_index as usize];
+            let iterations = ((blur * 3.0).ceil() as u32).clamp(1, 4);
+            self.blur_pipeline.execute(
+                ctx.cmd,
+                swapchain_image,
+                self.swapchain.extent.width,
+                self.swapchain.extent.height,
+                iterations,
+            );
+
+            let load_rp_info = vk::RenderPassBeginInfo {
+                render_pass: self.swapchain.render_pass_load,
+                framebuffer: self.swapchain.framebuffers_load[ctx.image_index as usize],
+                render_area: vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: self.swapchain.extent,
+                },
+                clear_value_count: clear_values.len() as u32,
+                clear_values: clear_values.as_ptr(),
+                ..Default::default()
+            };
+            ctx.cmd
+                .begin_render_pass(&load_rp_info, vk::SubpassContents::Inline);
+            ctx.cmd.set_viewport(0, &[ctx.viewport]);
+            ctx.cmd.set_scissor(0, &[ctx.scissor]);
+        }
+
+        // Skin preview
+        if show_skin {
+            self.skin_preview.draw(
+                &self.ctx.device,
+                ctx.cmd,
+                frame,
+                aspect,
+                0.7,
+                0.5,
+                cursor.0,
+                cursor.1,
+                sw,
+                sh,
+            );
+        }
+
+        // Post-blur elements
+        let fg = match split {
+            Some(i) => &elements[i + 1..],
+            None => &elements[..],
+        };
+        self.menu_pipeline
+            .draw_from(ctx.cmd, sw, sh, fg, &item_atlas_uvs, vbase);
+
+        ctx.cmd.end_render_pass();
+
+        self.end_frame(&ctx)
     }
 
     pub fn reload_assets(
@@ -1188,30 +1274,17 @@ impl Renderer {
             })
     }
 
-    fn render_frame(
+    fn begin_frame(
         &mut self,
         window: &Window,
         hide_cursor: bool,
-        clear_color: [f32; 4],
-        mode: RenderMode<'_>,
-    ) -> Result<(), RendererError> {
-        if self.swapchain_dirty {
-            self.recreate_swapchain()?;
-        }
-
+    ) -> Result<FrameCtx, RendererError> {
         let frame = self.ctx.frame_index;
         let fence = self.ctx.in_flight_fences[frame];
         let image_available = self.ctx.image_available_semaphores[frame];
         let cmd = self.ctx.command_buffers[frame];
-
-        let t_fence = std::time::Instant::now();
-        self.ctx.device.wait_for_fences(&[fence], true, u64::MAX)?;
-        let fence_ms = t_fence.elapsed().as_secs_f32() * 1000.0;
-
-        // Fence signalled: reclaim chunk slices the GPU is now provably done with.
         self.chunk_buffers.begin_frame();
 
-        let t_acquire = std::time::Instant::now();
         let image = match self.ctx.device.acquire_next_image(
             self.swapchain.handle,
             u64::MAX,
@@ -1221,39 +1294,13 @@ impl Renderer {
             Ok(image) => image,
             Err(vk::Error::OutOfDateKHR) => {
                 self.swapchain_dirty = true;
-                return Ok(());
+                return Err(RendererError::Vulkan(vk::Error::OutOfDateKHR));
             }
             Err(e) => return Err(e.into()),
         };
 
         self.swapchain_dirty |= image.suboptimal;
         let image_index = image.value;
-        let acquire_ms = t_acquire.elapsed().as_secs_f32() * 1000.0;
-
-        let render_finished = self.render_finished_per_image[image_index as usize];
-
-        if let RenderMode::World {
-            ref sky,
-            render_distance,
-            eyes_in_water,
-            ..
-        } = mode
-        {
-            let uniform = CameraUniform::new(
-                &self.camera,
-                sky.sky_color(),
-                render_distance,
-                eyes_in_water,
-            );
-            self.chunk_pipeline.update_camera(frame, &uniform);
-            self.block_overlay_pipeline.update_camera(frame, &uniform);
-            self.entity_renderer.update_camera(frame, &uniform);
-            self.block_entity_pipeline.update_camera(frame, &uniform);
-            self.chunk_border_pipeline.update_camera(frame, &uniform);
-            self.item_entity_pipeline.update_camera(frame, &uniform);
-            self.weather_pipeline.update_camera(frame, &uniform);
-            self.cloud_pipeline.update_camera(frame, &uniform);
-        }
 
         if hide_cursor {
             window.set_cursor_visible(false);
@@ -1267,7 +1314,6 @@ impl Renderer {
             ..Default::default()
         };
         cmd.begin(&begin_info)?;
-
         let extent = self.swapchain.extent;
         let viewport = vk::Viewport {
             x: 0.0,
@@ -1282,45 +1328,21 @@ impl Renderer {
             extent,
         };
 
-        if matches!(&mode, RenderMode::World { .. }) {
-            let frustum = self.camera.frustum_planes();
-            // The eye (including the third-person offset) is the origin the chunk
-            // vertex shader renders relative to, so the cull must use it too.
-            let eye = self.camera.position.as_vec3() + self.camera.third_person_offset();
-            let cam_pos: [f32; 3] = eye.into();
+        Ok(FrameCtx {
+            frame,
+            image_index,
+            cmd,
+            extent,
+            viewport,
+            scissor,
+        })
+    }
 
-            let (render_distance, player_pos) = match &mode {
-                RenderMode::World { render_distance, .. } => (*render_distance, *self.camera.position),
-                _ => (12, glam::DVec3::ZERO),
-            };
-            let player_chunk = ChunkPos::new(
-                player_pos.x.div_euclid(16.0) as i32,
-                player_pos.z.div_euclid(16.0) as i32,
-            );
-
-            self.chunk_buffers
-                .dispatch_cull(cmd, frame, &frustum, cam_pos, player_chunk, Some(render_distance));
-        }
-
-        let clear_values = [
-            vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: clear_color,
-                },
-            },
-            vk::ClearValue {
-                depth_stencil: vk::ClearDepthStencilValue {
-                    depth: 1.0,
-                    stencil: 0,
-                },
-            },
-        ];
-
-        let menu_elements: &[MenuElement] = match &mode {
-            RenderMode::World { overlay, .. } => overlay.as_slice(),
-            RenderMode::MainMenu { elements, .. } => elements.as_slice(),
-        };
-
+    fn run_gui_bake(
+        &mut self,
+        ctx: &FrameCtx,
+        menu_elements: &[MenuElement],
+    ) -> HashMap<String, [f32; 4]> {
         let target_slot_px =
             pipelines::gui_item_atlas::slot_px_for_gui_scale(crate::ui::hud::gui_scale(
                 self.swapchain.extent.width as f32,
@@ -1385,16 +1407,17 @@ impl Renderer {
             }
         }
         if !bake_list.is_empty() {
-            self.gui_item_atlas.begin_bake_pass(cmd);
-            self.gui_item_pipeline.bind_for_bake_pass(cmd);
+            self.gui_item_atlas.begin_bake_pass(ctx.cmd);
+            self.gui_item_pipeline.bind_for_bake_pass(ctx.cmd);
             for job in &bake_list {
                 if job.needs_clear {
-                    self.gui_item_atlas.clear_slot_color(cmd, &job.slot);
+                    self.gui_item_atlas.clear_slot_color(ctx.cmd, &job.slot);
                 }
-                cmd.set_scissor(0, &[self.gui_item_atlas.scissor_rect(&job.slot)]);
+                ctx.cmd
+                    .set_scissor(0, &[self.gui_item_atlas.scissor_rect(&job.slot)]);
                 let (sx, sy) = self.gui_item_atlas.slot_origin_pixels(&job.slot);
                 self.gui_item_pipeline.bake_to_slot(
-                    cmd,
+                    ctx.cmd,
                     &self.item_entity_pipeline,
                     sx,
                     sy,
@@ -1403,22 +1426,150 @@ impl Renderer {
                     job.is_block,
                 );
             }
-            self.gui_item_atlas.end_bake_pass(cmd);
+            self.gui_item_atlas.end_bake_pass(ctx.cmd);
         }
 
-        let use_blur = matches!(&mode, RenderMode::MainMenu { blur, .. } if *blur > 0.01);
+        item_atlas_uvs
+    }
 
-        let (rp, fb) = if use_blur {
-            (
-                self.swapchain.render_pass_scene,
-                self.swapchain.framebuffers_scene[image_index as usize],
-            )
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_world(
+        &mut self,
+        window: &Window,
+        hide_cursor: bool,
+        overlay: Vec<MenuElement>,
+        swing_progress: f32,
+        held_item: Option<(String, f32)>,
+        destroy_info: Option<(BlockPos, u32, BlockState)>,
+        show_chunk_borders: bool,
+        sky: SkyState,
+        entities: &[EntityRenderInfo],
+        item_entities: &[pipelines::item_entity::ItemRenderInfo],
+        block_entities: &[BlockEntityRenderInfo],
+        weather: &[WeatherColumn],
+        cloud_mode: CloudMode,
+        render_distance: u32,
+        player_preview: Option<PlayerPreview>,
+        eyes_in_water: bool,
+        min_y: i32,
+        height: u32,
+    ) -> Result<(ChunkRing<u32>, ChunkPos), RendererError> {
+        let held_item = held_item.map(|(name, light)| {
+            let has_3d_model = self.ensure_item_mesh(&name).is_block_model;
+            pipelines::held_item::HeldItemInfo {
+                name,
+                light,
+                has_3d_model,
+            }
+        });
+
+        if self.swapchain_dirty {
+            self.recreate_swapchain()?;
+        }
+
+        let frame = self.ctx.frame_index;
+        let fence = self.ctx.in_flight_fences[frame];
+
+        self.ctx.device.wait_for_fences(&[fence], true, u64::MAX)?;
+        if let Some(query_pools) = self.query_pools
+            && self.query_reset[frame]
+        {
+            self.query_reset[frame] = false;
+            self.ctx
+                .device
+                .get_query_pool_results(
+                    query_pools[frame],
+                    0,
+                    Timestamp::Count as u32,
+                    bytemuck::cast_slice_mut(&mut self.last_timings.ticks),
+                    size_of::<u64>() as u64,
+                    vk::QueryResultFlags::Type64 | vk::QueryResultFlags::Wait,
+                )
+                .unwrap();
+        }
+        let uniform = CameraUniform::new(
+            &self.camera,
+            sky.sky_color(),
+            render_distance,
+            eyes_in_water,
+        );
+        self.chunk_pipeline.update_camera(frame, &uniform);
+        self.block_overlay_pipeline.update_camera(frame, &uniform);
+        self.entity_renderer.update_camera(frame, &uniform);
+        self.block_entity_pipeline.update_camera(frame, &uniform);
+        self.chunk_border_pipeline.update_camera(frame, &uniform);
+        self.item_entity_pipeline.update_camera(frame, &uniform);
+        self.weather_pipeline.update_camera(frame, &uniform);
+        self.cloud_pipeline.update_camera(frame, &uniform);
+        let ctx = self.begin_frame(window, hide_cursor)?;
+        let timer_pool = if let Some(query_pools) = self.query_pools {
+            ctx.cmd
+                .reset_query_pool(query_pools[frame], 0, Timestamp::Count as u32);
+            self.query_reset[frame] = true;
+            Some(query_pools[frame])
         } else {
-            (
-                self.swapchain.render_pass,
-                self.swapchain.framebuffers[image_index as usize],
-            )
+            None
         };
+        let timer = Timer::new(ctx.cmd, timer_pool);
+
+        let frame_start_timer = timer.scope(Timestamp::FrameStart, Timestamp::FrameEnd);
+        let mut visibility_mask = ChunkRing::<u32>::new(0);
+        let readback = self.visibility_pipeline.readback(frame);
+        visibility_mask.buf.copy_from_slice(readback);
+        let visibility_center = self.visibility_pipeline.vis_center(frame);
+        let cull_timer = timer.scope(Timestamp::CullStart, Timestamp::CullEnd);
+        let frustum = self.camera.frustum_planes();
+        // The eye (including the third-person offset) is the origin the chunk
+        // vertex shader renders relative to, so the cull must use it too.
+        let eye = self.camera.position.as_vec3() + self.camera.third_person_offset();
+        let cam_pos: [f32; 3] = eye.into();
+
+        let player_pos = *self.camera.position;
+        let player_chunk = ChunkPos::new(
+            player_pos.x.div_euclid(16.0) as i32,
+            player_pos.z.div_euclid(16.0) as i32,
+        );
+
+        self.chunk_buffers.dispatch_cull(
+            ctx.cmd,
+            frame,
+            &frustum,
+            cam_pos,
+            player_chunk,
+            Some(render_distance),
+            &visibility_mask,
+            visibility_center,
+        );
+        cull_timer.end();
+
+        // Clear to the sky color: the strip between the sky disc's edge and the
+        // terrain shows the clear color, so it must match the sky/terrain or it
+        // reads as a horizon band (visible at night). Underwater, clear to the
+        // water fog color so background gaps read as water rather than sky.
+        let clear_col = if eyes_in_water {
+            camera::WATER_FOG_COLOR
+        } else {
+            sky.sky_color()
+        };
+        let clear_values = [
+            vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [clear_col[0], clear_col[1], clear_col[2], 1.0],
+                },
+            },
+            vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            },
+        ];
+        let gui_bake_timer = timer.scope(Timestamp::GuiBakeStart, Timestamp::GuiBakeEnd);
+        let item_atlas_uvs = self.run_gui_bake(&ctx, &overlay);
+        gui_bake_timer.end();
+        let rp = self.swapchain.render_pass;
+
+        let fb = self.swapchain.framebuffers[ctx.image_index as usize];
 
         let render_pass_info = vk::RenderPassBeginInfo {
             render_pass: rp,
@@ -1432,277 +1583,202 @@ impl Renderer {
             ..Default::default()
         };
 
-        cmd.begin_render_pass(&render_pass_info, vk::SubpassContents::Inline);
+        ctx.cmd
+            .begin_render_pass(&render_pass_info, vk::SubpassContents::Inline);
 
-        cmd.set_viewport(0, &[viewport]);
-        cmd.set_scissor(0, &[scissor]);
+        ctx.cmd.set_viewport(0, &[ctx.viewport]);
+        ctx.cmd.set_scissor(0, &[ctx.scissor]);
 
         let sw = self.swapchain.extent.width as f32;
         let sh = self.swapchain.extent.height as f32;
 
-        let frame_start = std::time::Instant::now();
+        // Vanilla water fog hides the sky dome and clouds; the framebuffer
+        // is cleared to the water fog color, so skipping them tints the view
+        // when looking up out of geometry.
+        if !eyes_in_water {
+            self.sky_pipeline
+                .update_and_draw(&self.ctx.device, ctx.cmd, frame, &self.camera, &sky);
+        }
+        let terrain_timer = timer.scope(Timestamp::TerrainStart, Timestamp::TerrainEnd);
 
-        match &mode {
-            RenderMode::World {
-                overlay,
-                swing_progress,
-                held_item,
-                destroy_info,
-                show_chunk_borders,
-                sky,
-                entities,
-                item_entities,
-                block_entities,
-                weather,
-                cloud_mode,
-                render_distance,
-                player_preview,
-                eyes_in_water,
-            } => {
-                // Vanilla water fog hides the sky dome and clouds; the framebuffer
-                // is cleared to the water fog color, so skipping them tints the view
-                // when looking up out of geometry.
-                if !*eyes_in_water {
-                    self.sky_pipeline.update_and_draw(
-                        &self.ctx.device,
-                        cmd,
-                        frame,
-                        &self.camera,
-                        sky,
-                    );
-                }
+        self.chunk_pipeline.bind(ctx.cmd, frame);
+        self.chunk_buffers.draw_indirect(ctx.cmd, frame);
+        terrain_timer.end();
 
-                let t_cull = std::time::Instant::now();
-                self.chunk_pipeline.bind(cmd, frame);
-                self.chunk_buffers.draw_indirect(cmd, frame);
-                let cull_ms = t_cull.elapsed().as_secs_f32() * 1000.0;
+        if let Some((block_pos, stage, state)) = destroy_info {
+            self.block_overlay_pipeline.draw(
+                ctx.cmd,
+                frame,
+                &self.registry,
+                state,
+                &block_pos,
+                stage,
+            );
+        }
+        let entity_timer = timer.scope(Timestamp::EntitiesStart, Timestamp::EntitiesEnd);
+        let ent_frustum = self.camera.frustum_planes();
+        let ent_eye: [f32; 3] =
+            (self.camera.position.as_vec3() + self.camera.third_person_offset()).into();
+        // Entities aren't sent beyond the server's tracking range; a
+        // generous render-distance cap just trims anything stray.
+        let ent_cull_dist = (render_distance * 16) as f32 + 16.0;
+        self.entity_renderer.draw(
+            ctx.cmd,
+            frame,
+            entities,
+            &ent_frustum,
+            ent_eye,
+            ent_cull_dist,
+        );
 
-                if let Some((block_pos, stage, state)) = destroy_info {
-                    self.block_overlay_pipeline.draw(
-                        cmd,
-                        frame,
-                        &self.registry,
-                        *state,
-                        block_pos,
-                        *stage,
-                    );
-                }
+        self.block_entity_pipeline
+            .draw(ctx.cmd, frame, block_entities);
 
-                let ent_frustum = self.camera.frustum_planes();
-                let ent_eye: [f32; 3] =
-                    (self.camera.position.as_vec3() + self.camera.third_person_offset()).into();
-                // Entities aren't sent beyond the server's tracking range; a
-                // generous render-distance cap just trims anything stray.
-                let ent_cull_dist = (*render_distance * 16) as f32 + 16.0;
-                self.entity_renderer.draw(
-                    cmd,
+        self.item_entity_pipeline
+            .draw(ctx.cmd, frame, item_entities);
+        entity_timer.end();
+        let translucent_timer = timer.scope(Timestamp::TranslucentStart, Timestamp::TranslucentEnd);
+        // Translucent water draws after opaque terrain and entities so it
+        // blends over them; depth-tested (occluded by geometry in front)
+        // but doesn't write depth. CPU frustum-culled, reusing the entity
+        // frustum/eye.
+        let vis_center = self.visibility_pipeline.vis_center(ctx.frame);
+        self.chunk_pipeline.bind_water(ctx.cmd, frame);
+        self.chunk_buffers
+            .draw_water(ctx.cmd, &ent_frustum, ent_eye, &visibility_mask, vis_center);
+
+        // Clouds draw after opaque world geometry (so terrain occludes
+        // them) and before weather, depth-tested against the scene.
+        if !eyes_in_water {
+            self.cloud_pipeline
+                .update_and_draw(ctx.cmd, frame, &self.camera, &sky, cloud_mode);
+        }
+
+        // Weather draws after opaque world geometry (depth-tested against
+        // terrain) but before the depth clear for the hand pass.
+        self.weather_pipeline
+            .update_and_draw(ctx.cmd, frame, &self.camera, &sky, weather);
+
+        if show_chunk_borders {
+            self.chunk_border_pipeline.draw(ctx.cmd, frame);
+        }
+        translucent_timer.end();
+        let clear_attachment = vk::ClearAttachment {
+            aspect_mask: vk::ImageAspectFlags::Depth,
+            color_attachment: 0,
+            clear_value: vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            },
+        };
+        let clear_rect = vk::ClearRect {
+            rect: ctx.scissor,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        ctx.cmd
+            .clear_attachments(&[clear_attachment], &[clear_rect]);
+
+        let ui_timer = timer.scope(Timestamp::UiStart, Timestamp::UiEnd);
+        if self.camera.mode == camera::CameraMode::FirstPerson && self.camera.top_down().is_none() {
+            let aspect = sw / sh.max(1.0);
+            // Same view-bob the world uses, so the arm/item bob in lockstep
+            // (vanilla applies bobView to the hand pose stack too).
+            let bob = self.camera.view_bob_matrix();
+            // Vanilla renderArmWithItem draws the arm only for an empty
+            // hand; a held item renders alone.
+            match held_item {
+                Some(item) => self.held_item_pipeline.update_and_draw(
+                    ctx.cmd,
                     frame,
-                    entities,
-                    &ent_frustum,
-                    ent_eye,
-                    ent_cull_dist,
-                );
-
-                self.block_entity_pipeline.draw(cmd, frame, block_entities);
-
-                self.item_entity_pipeline.draw(cmd, frame, item_entities);
-
-                // Translucent water draws after opaque terrain and entities so it
-                // blends over them; depth-tested (occluded by geometry in front)
-                // but doesn't write depth. CPU frustum-culled, reusing the entity
-                // frustum/eye.
-                self.chunk_pipeline.bind_water(cmd, frame);
-                self.chunk_buffers.draw_water(cmd, &ent_frustum, ent_eye);
-
-                // Clouds draw after opaque world geometry (so terrain occludes
-                // them) and before weather, depth-tested against the scene.
-                if !*eyes_in_water {
-                    self.cloud_pipeline
-                        .update_and_draw(cmd, frame, &self.camera, sky, *cloud_mode);
+                    aspect,
+                    swing_progress,
+                    &item,
+                    &self.item_entity_pipeline,
+                    bob,
+                ),
+                None => {
+                    self.hand_pipeline
+                        .update_and_draw(ctx.cmd, frame, aspect, swing_progress, bob)
                 }
-
-                // Weather draws after opaque world geometry (depth-tested against
-                // terrain) but before the depth clear for the hand pass.
-                self.weather_pipeline
-                    .update_and_draw(cmd, frame, &self.camera, sky, weather);
-
-                if *show_chunk_borders {
-                    self.chunk_border_pipeline.draw(cmd, frame);
-                }
-
-                let clear_attachment = vk::ClearAttachment {
-                    aspect_mask: vk::ImageAspectFlags::Depth,
-                    color_attachment: 0,
-                    clear_value: vk::ClearValue {
-                        depth_stencil: vk::ClearDepthStencilValue {
-                            depth: 1.0,
-                            stencil: 0,
-                        },
-                    },
-                };
-                let clear_rect = vk::ClearRect {
-                    rect: scissor,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                };
-                cmd.clear_attachments(&[clear_attachment], &[clear_rect]);
-
-                if self.camera.mode == camera::CameraMode::FirstPerson
-                    && self.camera.top_down().is_none()
-                {
-                    let aspect = sw / sh.max(1.0);
-                    // Same view-bob the world uses, so the arm/item bob in lockstep
-                    // (vanilla applies bobView to the hand pose stack too).
-                    let bob = self.camera.view_bob_matrix();
-                    // Vanilla renderArmWithItem draws the arm only for an empty
-                    // hand; a held item renders alone.
-                    match held_item {
-                        Some(item) => self.held_item_pipeline.update_and_draw(
-                            cmd,
-                            frame,
-                            aspect,
-                            *swing_progress,
-                            item,
-                            &self.item_entity_pipeline,
-                            bob,
-                        ),
-                        None => self.hand_pipeline.update_and_draw(
-                            cmd,
-                            frame,
-                            aspect,
-                            *swing_progress,
-                            bob,
-                        ),
-                    }
-                }
-
-                self.menu_pipeline
-                    .draw(cmd, sw, sh, overlay, &item_atlas_uvs);
-
-                if let Some(p) = player_preview {
-                    let x0 = p.rect[0].max(0.0) as i32;
-                    let y0 = p.rect[1].max(0.0) as i32;
-                    let w = (p.rect[2] as u32)
-                        .min(self.swapchain.extent.width.saturating_sub(x0 as u32));
-                    let h = (p.rect[3] as u32)
-                        .min(self.swapchain.extent.height.saturating_sub(y0 as u32));
-                    if w > 0 && h > 0 {
-                        let rect = vk::Rect2D {
-                            offset: vk::Offset2D { x: x0, y: y0 },
-                            extent: vk::Extent2D {
-                                width: w,
-                                height: h,
-                            },
-                        };
-                        let clear_rect = vk::ClearRect {
-                            rect,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        };
-                        cmd.clear_attachments(&[clear_attachment], &[clear_rect]);
-                        cmd.set_scissor(0, &[rect]);
-                        self.skin_preview.draw_in_box(cmd, frame, *p, sw, sh);
-                        cmd.set_scissor(0, &[scissor]);
-                    }
-                }
-
-                self.last_timings.cull_ms = cull_ms;
-                self.last_timings.frame_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
-            }
-            RenderMode::MainMenu {
-                scroll,
-                blur,
-                elements,
-                cursor,
-                show_skin,
-            } => {
-                let aspect = sw / sh.max(1.0);
-                self.panorama_pipeline
-                    .draw(&self.ctx.device, cmd, *scroll, aspect, 0.0);
-
-                // A BlurBackdrop marker splits the elements: those before it are
-                // drawn into the scene so the blur pass captures them (the title
-                // screen behind the Friends dialog); the rest are drawn sharp.
-                let split = elements
-                    .iter()
-                    .position(|e| matches!(e, MenuElement::BlurBackdrop));
-                let mut vbase = 0u32;
-                if let Some(i) = split {
-                    vbase = self.menu_pipeline.draw_from(
-                        cmd,
-                        sw,
-                        sh,
-                        &elements[..i],
-                        &item_atlas_uvs,
-                        0,
-                    );
-                }
-
-                if *blur > 0.01 {
-                    cmd.end_render_pass();
-
-                    let swapchain_image = self.swapchain.images[image_index as usize];
-                    let iterations = ((*blur * 3.0).ceil() as u32).clamp(1, 4);
-                    self.blur_pipeline.execute(
-                        cmd,
-                        swapchain_image,
-                        self.swapchain.extent.width,
-                        self.swapchain.extent.height,
-                        iterations,
-                    );
-
-                    let load_rp_info = vk::RenderPassBeginInfo {
-                        render_pass: self.swapchain.render_pass_load,
-                        framebuffer: self.swapchain.framebuffers_load[image_index as usize],
-                        render_area: vk::Rect2D {
-                            offset: vk::Offset2D { x: 0, y: 0 },
-                            extent: self.swapchain.extent,
-                        },
-                        clear_value_count: clear_values.len() as u32,
-                        clear_values: clear_values.as_ptr(),
-                        ..Default::default()
-                    };
-                    cmd.begin_render_pass(&load_rp_info, vk::SubpassContents::Inline);
-                    cmd.set_viewport(0, &[viewport]);
-                    cmd.set_scissor(0, &[scissor]);
-                }
-
-                if *show_skin {
-                    self.skin_preview.draw(
-                        &self.ctx.device,
-                        cmd,
-                        frame,
-                        aspect,
-                        0.7,
-                        0.5,
-                        cursor.0,
-                        cursor.1,
-                        sw,
-                        sh,
-                    );
-                }
-
-                let fg = match split {
-                    Some(i) => &elements[i + 1..],
-                    None => &elements[..],
-                };
-                self.menu_pipeline
-                    .draw_from(cmd, sw, sh, fg, &item_atlas_uvs, vbase);
             }
         }
 
-        cmd.end_render_pass();
+        self.menu_pipeline
+            .draw(ctx.cmd, sw, sh, &overlay, &item_atlas_uvs);
 
+        if let Some(p) = player_preview {
+            let x0 = p.rect[0].max(0.0) as i32;
+            let y0 = p.rect[1].max(0.0) as i32;
+            let w = (p.rect[2] as u32).min(self.swapchain.extent.width.saturating_sub(x0 as u32));
+            let h = (p.rect[3] as u32).min(self.swapchain.extent.height.saturating_sub(y0 as u32));
+            if w > 0 && h > 0 {
+                let rect = vk::Rect2D {
+                    offset: vk::Offset2D { x: x0, y: y0 },
+                    extent: vk::Extent2D {
+                        width: w,
+                        height: h,
+                    },
+                };
+                let clear_rect = vk::ClearRect {
+                    rect,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                ctx.cmd
+                    .clear_attachments(&[clear_attachment], &[clear_rect]);
+                ctx.cmd.set_scissor(0, &[rect]);
+                self.skin_preview.draw_in_box(ctx.cmd, frame, p, sw, sh);
+                ctx.cmd.set_scissor(0, &[ctx.scissor]);
+            }
+        }
+
+        ui_timer.end();
+
+        ctx.cmd.end_render_pass();
+
+        let hiz_timer = timer.scope(Timestamp::HizStart, Timestamp::HizEnd);
+
+        self.hiz_pipeline.execute(
+            ctx.cmd,
+            ctx.frame,
+            self.swapchain.depth_image,
+            self.swapchain.extent,
+        );
+        hiz_timer.end();
+
+        let visibility_timer = timer.scope(Timestamp::VisibilityStart, Timestamp::VisibilityEnd);
+        self.visibility_pipeline.execute(
+            ctx.cmd,
+            frame,
+            &self.camera,
+            render_distance,
+            height,
+            min_y,
+        );
+        visibility_timer.end();
+        frame_start_timer.end();
+
+        self.end_frame(&ctx)?;
+        Ok((visibility_mask, visibility_center))
+    }
+
+    fn end_frame(&mut self, ctx: &FrameCtx) -> Result<(), RendererError> {
         self.gui_item_atlas.end_frame();
 
-        cmd.end()?;
+        ctx.cmd.end()?;
 
+        let image_available = self.ctx.image_available_semaphores[ctx.frame];
+        let render_finished = self.render_finished_per_image[ctx.image_index as usize];
+        let fence = self.ctx.in_flight_fences[ctx.frame];
         let submit_info = vk::SubmitInfo {
             wait_semaphore_count: 1,
             wait_semaphores: &image_available,
             wait_dst_stage_mask: &vk::PipelineStageFlags::ColorAttachmentOutput,
             command_buffer_count: 1,
-            command_buffers: &cmd.handle(),
+            command_buffers: &ctx.cmd.handle(),
             signal_semaphore_count: 1,
             signal_semaphores: &render_finished,
             ..Default::default()
@@ -1715,11 +1791,10 @@ impl Renderer {
             wait_semaphores: &render_finished,
             swapchain_count: 1,
             swapchains: &self.swapchain.handle,
-            image_indices: &image_index,
+            image_indices: &ctx.image_index,
             ..Default::default()
         };
 
-        let t_present = std::time::Instant::now();
         match self.ctx.present_queue.present(&present_info) {
             Ok(()) => {}
             Err(vk::Error::OutOfDateKHR | vk::Error::SuboptimalKHR) => {
@@ -1727,10 +1802,6 @@ impl Renderer {
             }
             Err(e) => return Err(e.into()),
         }
-        let present_ms = t_present.elapsed().as_secs_f32() * 1000.0;
-        self.last_timings.fence_ms = fence_ms;
-        self.last_timings.acquire_ms = acquire_ms;
-        self.last_timings.present_ms = present_ms;
 
         self.ctx.advance_frame();
         Ok(())
@@ -1896,6 +1967,10 @@ impl Drop for Renderer {
             .destroy(&self.ctx.device, &self.ctx.allocator);
         self.blur_pipeline
             .destroy(&self.ctx.device, &self.ctx.allocator);
+        self.hiz_pipeline
+            .destroy(&self.ctx.device, &self.ctx.allocator);
+        self.visibility_pipeline
+            .destroy(&self.ctx.device, &self.ctx.allocator);
         self.skin_preview
             .destroy(&self.ctx.device, &self.ctx.allocator);
         self.entity_renderer
@@ -1917,6 +1992,12 @@ impl Drop for Renderer {
         self.gui_item_atlas
             .destroy(&self.ctx.device, &self.ctx.allocator);
         self.atlas.destroy(&self.ctx.device, &self.ctx.allocator);
+
+        if let Some(query_pools) = self.query_pools {
+            for pool in query_pools {
+                self.ctx.device.destroy_query_pool(pool, None);
+            }
+        }
 
         for sem in self.render_finished_per_image.drain(..) {
             self.ctx.device.destroy_semaphore(sem, None);

@@ -22,7 +22,7 @@ use crate::physics::aabb::Aabb;
 use crate::physics::collision::has_collision;
 use crate::physics::movement::{PLAYER_HALF_WIDTH, PLAYER_HEIGHT};
 use crate::world::block::sound::block_sounds;
-use crate::world::chunk::ChunkStore;
+use crate::world::chunk::SharedChunkStore;
 
 const REACH: f32 = 4.5;
 const ENTITY_REACH: f64 = 3.0;
@@ -144,7 +144,7 @@ impl InteractionState {
         pos: BlockPos,
         state: BlockState,
         player_pos: DVec3,
-        chunks: &ChunkStore,
+        chunks: &SharedChunkStore,
         audio: &AudioEngine,
         dirty_chunks: &mut Vec<BlockPos>,
     ) {
@@ -162,7 +162,7 @@ impl InteractionState {
     pub fn acknowledge(
         &mut self,
         seq: u32,
-        chunks: &ChunkStore,
+        chunks: &SharedChunkStore,
         player_pos: DVec3,
         dirty_chunks: &mut Vec<BlockPos>,
     ) -> Option<DVec3> {
@@ -242,7 +242,7 @@ impl InteractionState {
         &mut self,
         eye_pos: Position,
         look_dir: LookDirection,
-        chunks: &ChunkStore,
+        chunks: &SharedChunkStore,
         entities: &EntityStore,
         creative: bool,
     ) {
@@ -279,7 +279,7 @@ impl InteractionState {
     pub fn tick(
         &mut self,
         input: &InputState,
-        chunks: &ChunkStore,
+        chunks: &SharedChunkStore,
         sender: &PacketSender,
         audio: &AudioEngine,
         player_pos: DVec3,
@@ -358,7 +358,7 @@ impl InteractionState {
     #[allow(clippy::too_many_arguments)]
     fn start_attack(
         &mut self,
-        chunks: &ChunkStore,
+        chunks: &SharedChunkStore,
         sender: &PacketSender,
         audio: &AudioEngine,
         input: &InputState,
@@ -411,7 +411,7 @@ impl InteractionState {
     #[allow(clippy::too_many_arguments)]
     fn continue_attack(
         &mut self,
-        chunks: &ChunkStore,
+        chunks: &SharedChunkStore,
         sender: &PacketSender,
         audio: &AudioEngine,
         player_pos: DVec3,
@@ -455,7 +455,7 @@ impl InteractionState {
     fn use_item_on(
         &mut self,
         sender: &PacketSender,
-        chunks: &ChunkStore,
+        chunks: &SharedChunkStore,
         player_pos: DVec3,
         place_block: Option<BlockState>,
         dirty_chunks: &mut Vec<BlockPos>,
@@ -498,7 +498,7 @@ impl InteractionState {
         &mut self,
         hit: BlockHitResult,
         place_block: Option<BlockState>,
-        chunks: &ChunkStore,
+        chunks: &SharedChunkStore,
         player_pos: DVec3,
         dirty_chunks: &mut Vec<BlockPos>,
     ) {
@@ -529,7 +529,7 @@ impl InteractionState {
     fn start_destroy_block(
         &mut self,
         hit: BlockHitResult,
-        chunks: &ChunkStore,
+        chunks: &SharedChunkStore,
         sender: &PacketSender,
         audio: &AudioEngine,
         player_pos: DVec3,
@@ -610,7 +610,7 @@ impl InteractionState {
     fn continue_destroy_block(
         &mut self,
         hit: BlockHitResult,
-        chunks: &ChunkStore,
+        chunks: &SharedChunkStore,
         sender: &PacketSender,
         audio: &AudioEngine,
         player_pos: DVec3,
@@ -786,7 +786,7 @@ pub fn raycast(
     origin: DVec3,
     dir: Vec3,
     max_dist: f32,
-    chunks: &ChunkStore,
+    chunks: &SharedChunkStore,
 ) -> Option<BlockHitResult> {
     let dir = dir.as_dvec3();
     let mut bx = origin.x.floor() as i32;

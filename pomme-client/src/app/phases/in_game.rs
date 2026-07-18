@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use azalea_core::position::{ChunkPos, ChunkSectionPos};
@@ -20,8 +21,8 @@ use crate::net::connection::ConnectionHandle;
 use crate::player::LocalPlayer;
 use crate::player::interaction::{HitResult, InteractionState};
 use crate::player::tab_list::TabList;
-use crate::renderer::chunk::mesher::{BiomeClimate, MeshDispatcher, SectionMeshData};
-use crate::renderer::chunk::occlusion_graph::{self, VisibilitySet};
+use crate::renderer::chunk::dispatcher::ChunkMeshing;
+use crate::renderer::chunk::mesher::BiomeClimate;
 use crate::renderer::pipelines::entity_renderer::{
     EntityRenderInfo, WHITE_TINT, jeb_sheep_tint, wool_color_tint,
 };
@@ -32,6 +33,7 @@ use crate::ui::chat::ChatState;
 use crate::ui::death::{self, DeathAction};
 use crate::ui::pause::{self, PauseAction, PauseScreen};
 use crate::ui::{common, hud};
+use crate::util::ChunkRing;
 use crate::world::block_entity_anim::BlockEntityAnimStore;
 use crate::world::chunk::ChunkStore;
 
@@ -45,7 +47,9 @@ pub struct GameState {
     pub player_walk_pos: f32,
     pub player_walk_speed: f32,
     pub player_prev_walk_speed: f32,
-    pub mesh_dispatcher: MeshDispatcher,
+    pub meshing: ChunkMeshing,
+    pub visibility_mask: ChunkRing<u32>,
+    pub visibility_center: ChunkPos,
     pub paused: bool,
     pub dead: bool,
     pub death_message: String,
@@ -104,66 +108,21 @@ pub struct GameState {
     /// In-flight/finished upload of the chunk-load result, while its overlay is
     /// shown.
     pub chunk_load_upload: Option<UploadHandle>,
-    /// Monotonic content generation per column, bumped on every edit (and chunk
-    /// load). This is the dirty marker: a column needs (re)meshing whenever its
-    /// `content_gen` outruns what was last enqueued, regardless of visibility,
-    /// so an edit to a deferred/hidden column can never be lost.
-    pub content_gen: HashMap<ChunkSectionPos, u64>,
-    /// What was most recently meshed for each column: the LOD, the column
-    /// `content_gen`, and the bitmask of section indices already meshed. The
-    /// re-scan meshes only sections newly made visible (or re-meshes all on a
-    /// lod/content change), so hidden sections never mesh.
-    pub meshed: HashMap<ChunkSectionPos, MeshedSection>,
-    pub mesh_upload_queue: VecDeque<SectionMeshData>,
-    /// Per-column bitmask of currently-visible section indices (bit `si` set =
-    /// section is in-frustum and not occluded). Computed in
-    /// `update_visibility`.
-    pub vis_mask: HashMap<ChunkPos, u32>,
-    /// Per-section generation for edits only (bulk uses the column
-    /// `content_gen` above). Bumped per edited section so a result is
-    /// dropped only when *that* section was edited again — editing one
-    /// section never invalidates a sibling section's in-flight result.
-    pub section_gen: HashMap<ChunkSectionPos, u64>,
-    pub next_section_gen: u64,
-    /// Per-section cave-cull visibility (vanilla `VisibilitySet`), keyed like
-    /// `section_gen`. Fed by mesh results; consumed by the occlusion walk.
-    pub section_vis: HashMap<ChunkSectionPos, VisibilitySet>,
-    /// Highest upload epoch each `section_vis` entry was set from; mirrors the
-    /// buffer's per-section geometry gate so a stale bulk can't re-stale an
-    /// edited section's visibility.
-    pub section_vis_epoch: HashMap<ChunkSectionPos, u64>,
-    /// Cached per-column frustum tier (0 in view, 1 margin, 2 behind),
-    /// recomputed each time an occlusion walk completes. Only the F3
-    /// overlay reads it now.
-    pub vis_tiers: HashMap<ChunkPos, u8>,
-    pub vis_valid: bool,
-    /// Camera 8-block bucket that last triggered an occlusion walk — movement,
-    /// not rotation, drives recomputes (vanilla's cadence).
-    pub last_vis_cam: (i32, i32, i32),
-    /// In-flight async occlusion walk; its result is applied a few frames
-    /// later.
-    pub vis_task: Option<crossbeam_channel::Receiver<HashSet<ChunkSectionPos>>>,
-    /// Runtime toggle for graph-driven chunk occlusion culling (F3+O). When
-    /// off, only frustum culling applies (full masks pushed to the
-    /// renderer).
-    pub chunk_occlusion_enabled: bool,
-}
-
-/// What a column was last meshed as: LOD, content generation, and the set of
-/// section indices (bitmask) that have been meshed so far.
-#[derive(Clone, Copy)]
-pub struct MeshedSection {
-    pub lod: u32,
-    pub content_gen: u64,
 }
 
 impl GameState {
     pub fn new(renderer: &Renderer, resource_packs: &ResourcePackManager) -> Self {
+        let chunk_store = ChunkStore::new(DEFAULT_RENDER_DISTANCE);
         let biome_climate = Arc::new(HashMap::new());
-        let mesh_dispatcher = renderer.create_mesh_dispatcher(biome_climate, Some(resource_packs));
-
+        let meshing = ChunkMeshing::new(
+            renderer,
+            Arc::clone(&chunk_store.shared),
+            Arc::clone(&biome_climate),
+            Some(resource_packs),
+        );
+        let visibility_mask = ChunkRing::new(0);
         Self {
-            chunk_store: ChunkStore::new(DEFAULT_RENDER_DISTANCE),
+            chunk_store,
             entity_store: EntityStore::new(),
             position_set: false,
             player_loaded_sent: false,
@@ -174,11 +133,13 @@ impl GameState {
             item_entity_store: ItemEntityStore::new(),
             block_entity_anim: BlockEntityAnimStore::default(),
             player: LocalPlayer::new(),
-            biome_climate: Arc::new(HashMap::new()),
+            biome_climate,
             player_walk_pos: 0.0,
             player_walk_speed: 0.0,
             player_prev_walk_speed: 0.0,
-            mesh_dispatcher,
+            meshing,
+            visibility_mask,
+            visibility_center: ChunkPos::new(0, 0),
             paused: false,
             dead: false,
             death_message: String::new(),
@@ -218,19 +179,6 @@ impl GameState {
             chunk_load_result: None,
             chunk_load_abort: false,
             chunk_load_upload: None,
-            content_gen: HashMap::new(),
-            meshed: HashMap::new(),
-            mesh_upload_queue: VecDeque::new(),
-            vis_mask: HashMap::new(),
-            section_gen: HashMap::new(),
-            next_section_gen: 0,
-            section_vis: HashMap::new(),
-            section_vis_epoch: HashMap::new(),
-            vis_tiers: HashMap::new(),
-            vis_valid: false,
-            last_vis_cam: (i32::MIN, i32::MIN, i32::MIN),
-            vis_task: None,
-            chunk_occlusion_enabled: true,
         }
     }
 
@@ -255,7 +203,6 @@ impl GameState {
     pub fn sync_render_distance(&mut self, connection: &ConnectionHandle, render_distance: u32) {
         self.last_render_distance = render_distance;
         tracing::info!("Render distance changed to {render_distance}");
-
         use azalea_entity::HumanoidArm;
         use azalea_protocol::common::client_information::*;
         connection
@@ -290,149 +237,15 @@ impl GameState {
     /// dropped on arrival, so a deferred column always remeshes with the
     /// latest blocks.
     pub fn bump_content_gen(&mut self, pos: ChunkSectionPos) -> u64 {
-        let g = self.content_gen.entry(pos).or_insert(0);
-        *g += 1;
-        *g
+        self.meshing.bump_content_gen(pos)
     }
 
     /// Mesh a single edited section now on the priority lane, ungated by
     /// visibility. Bumps that section's generation so the result is dropped
     /// only if the same section is edited again before it lands.
     pub fn enqueue_section_edit(&mut self, pos: ChunkSectionPos, lod: u32) {
-        self.next_section_gen += 1;
-        let g = self.next_section_gen;
-        self.section_gen.insert(pos, g);
-        self.mesh_dispatcher
-            .enqueue_section(&self.chunk_store, pos, lod, true, g);
-    }
-
-    /// Drive the cave-cull occlusion walk: apply a finished async walk to the
-    /// per-column draw masks, then schedule the next one on 8-block camera
-    /// movement or chunk loads (one at a time, off the main thread — vanilla's
-    /// async, movement-gated cadence). The walk is rotation-independent;
-    /// frustum culling runs per-frame on the GPU.
-    pub fn update_visibility(
-        &mut self,
-        renderer: &mut Renderer,
-        player_chunk: ChunkSectionPos,
-        loads_happened: bool,
-    ) {
-        // Before the camera is placed the frustum is meaningless, so trust
-        // nothing and let the queue mesh everything nearest-first.
-        if !self.position_set {
-            if self.vis_valid {
-                self.vis_valid = false;
-                self.vis_tiers.clear();
-            }
-            return;
-        }
-
-        // Apply a finished walk (its result lags a few frames, like vanilla's).
-        let finished = self.vis_task.as_ref().and_then(|rx| rx.try_recv().ok());
-        if let Some(bfs) = finished {
-            self.vis_task = None;
-            self.apply_visibility(renderer, &bfs);
-        }
-
-        // Schedule the next walk on 8-block movement, chunk loads, or an
-        // invalidated result (`!vis_valid`, e.g. the F3+O toggle forcing a
-        // recompute while stationary), one in flight.
-        let eye = renderer.camera_render_position();
-        let cam_bucket = (
-            (eye.x / 8.0).floor() as i32,
-            (eye.y / 8.0).floor() as i32,
-            (eye.z / 8.0).floor() as i32,
-        );
-        if self.vis_task.is_none()
-            && (!self.vis_valid || cam_bucket != self.last_vis_cam || loads_happened)
-        {
-            self.last_vis_cam = cam_bucket;
-            let section_vis = self.section_vis.clone();
-            let min_y = self.chunk_store.min_y();
-
-            let height = self.chunk_store.height() as i32;
-            // Bound the walk by the actual loaded radius (a server can stream
-            // terrain past the client render distance).
-            let rd = self
-                .chunk_store
-                .loaded_positions()
-                .iter()
-                .map(|p| {
-                    (p.x - player_chunk.x)
-                        .abs()
-                        .max((p.z - player_chunk.z).abs())
-                })
-                .max()
-                .unwrap_or(0);
-            let (tx, rx) = crossbeam_channel::bounded(1);
-            std::thread::spawn(move || {
-                let bfs = occlusion_graph::compute_visible_mask(
-                    &section_vis,
-                    player_chunk,
-                    eye,
-                    min_y,
-                    height,
-                    rd,
-                );
-                let _ = tx.send(bfs);
-            });
-            self.vis_task = Some(rx);
-        }
-    }
-
-    /// Combine a finished walk with the current camera frustum into per-column
-    /// draw masks (occluded sections omitted) and tiers, and push them to the
-    /// GPU cull.
-    fn apply_visibility(&mut self, renderer: &mut Renderer, bfs: &HashSet<ChunkSectionPos>) {
-        let planes = renderer.frustum_planes();
-        let planes_wide = renderer.frustum_planes_dilated(VIS_MARGIN_RADIANS);
-        let eye_f = renderer.camera_render_position().as_vec3();
-        let min_y = self.chunk_store.min_y() as f32;
-        let max_y = min_y + self.chunk_store.height() as f32;
-        let full = section_mask(self.chunk_store.section_count());
-
-        let min_y_section = self.chunk_store.min_y().div_euclid(16);
-        let section_count = self.chunk_store.section_count();
-
-        let mut tiers = HashMap::new();
-        let mut masks = HashMap::new();
-        for pos in self.chunk_store.loaded_positions() {
-            let near = column_is_near(pos, eye_f);
-            let tier = if near {
-                0
-            } else {
-                column_frustum_tier(pos, eye_f, &planes, &planes_wide, min_y, max_y)
-            };
-            // Near columns always draw fully; otherwise a column draws only the
-            // sections the graph proved occlusion-visible (none => fully hidden).
-            let mask = if near {
-                full
-            } else {
-                let mut m = 0u32;
-                for si in 0..section_count {
-                    let sec_pos = ChunkSectionPos::new(pos.x, min_y_section + si, pos.z);
-                    if bfs.contains(&sec_pos) {
-                        m |= 1 << si;
-                    }
-                }
-                m
-            };
-            // A fully-occluded column (no visible section) drops to the hidden tier.
-            let tier = if tier == 0 && mask == 0 { 2 } else { tier };
-            tiers.insert(pos, tier);
-            masks.insert(pos, mask);
-        }
-        self.vis_tiers = tiers;
-        self.vis_mask = masks.clone();
-        self.vis_valid = true;
-
-        // With occlusion off, push full masks (frustum still applies on the GPU).
-        if !self.chunk_occlusion_enabled {
-            for m in masks.values_mut() {
-                *m = full;
-            }
-        }
-        renderer.set_chunk_visibility(masks);
+        self.meshing
+            .enqueue_section_edit(&self.chunk_store.shared, pos, lod);
     }
 
     /// Enqueue every loaded column's not-yet-meshed sections (re-meshing the
@@ -441,112 +254,14 @@ impl GameState {
     /// drawing — and the queue orders the backlog nearest-first. Runs every
     /// frame to drain it.
     pub fn rescan_mesh_jobs(&mut self, player_chunk: ChunkPos) {
-        let min_y_section = self.chunk_store.min_y().div_euclid(16);
-        let section_count = self.chunk_store.section_count();
-        for pos in self.chunk_store.loaded_positions() {
-            let lod = crate::app::core::chunk_lod(pos, player_chunk);
-            for si in 0..section_count {
-                let spos = ChunkSectionPos::new(pos.x, min_y_section + si, pos.z);
-                let content_gen = self.content_gen.get(&spos).copied().unwrap_or(0);
-
-                let needs_mesh = match self.meshed.get(&spos) {
-                    Some(m) if m.lod == lod && m.content_gen == content_gen => false,
-                    _ => true,
-                };
-
-                if needs_mesh {
-                    self.mesh_dispatcher.enqueue_section(
-                        &self.chunk_store,
-                        spos,
-                        lod,
-                        false,
-                        content_gen,
-                    );
-                    self.meshed.insert(spos, MeshedSection { lod, content_gen });
-                }
-            }
-        }
+        self.meshing.rescan_mesh_jobs(
+            &self.chunk_store.shared,
+            player_chunk,
+            &self.visibility_mask,
+            self.visibility_center,
+            &self.player.position,
+        );
     }
-}
-
-/// Always-mesh radius (vanilla `isNearby`, squared block distance in X/Z):
-/// close columns are tier 0 regardless of frustum so the area around the player
-/// is never deferred.
-const NEARBY_DIST_SQ: f32 = 768.0;
-/// Extra FOV (radians) for the tier-1 "about to be seen" margin frustum, so
-/// small camera turns reveal already-meshed terrain instead of a meshing
-/// curtain.
-const VIS_MARGIN_RADIANS: f32 = 0.6;
-
-/// Frustum tier for a column: 0 in view, 1 in the dilated margin, 2 behind the
-/// camera. (Nearby columns are forced to 0 by the caller.)
-fn column_frustum_tier(
-    pos: ChunkPos,
-    eye: glam::Vec3,
-    planes: &[[f32; 4]; 6],
-    planes_wide: &[[f32; 4]; 6],
-    min_y: f32,
-    max_y: f32,
-) -> u8 {
-    let bx = pos.x as f32 * 16.0;
-    let bz = pos.z as f32 * 16.0;
-    // Camera-relative full-height column box, matching how the GPU cull subtracts
-    // the eye before its plane test (cull.comp).
-    let mn = [bx - eye.x, min_y - eye.y, bz - eye.z];
-    let mx = [bx + 16.0 - eye.x, max_y - eye.y, bz + 16.0 - eye.z];
-    if aabb_in_frustum(&mn, &mx, planes) {
-        0
-    } else if aabb_in_frustum(&mn, &mx, planes_wide) {
-        1
-    } else {
-        2
-    }
-}
-
-/// Whether a column is within the always-mesh radius (never deferred/demoted).
-fn column_is_near(pos: ChunkPos, eye: glam::Vec3) -> bool {
-    let cx = pos.x as f32 * 16.0 + 8.0 - eye.x;
-    let cz = pos.z as f32 * 16.0 + 8.0 - eye.z;
-    cx * cx + cz * cz < NEARBY_DIST_SQ
-}
-
-/// Full mask for an `n`-section column (bits `0..n` set).
-fn section_mask(n: i32) -> u32 {
-    if n >= 32 { u32::MAX } else { (1u32 << n) - 1 }
-}
-
-/// Contiguous `(start, end)` index runs of set bits in `mask`, so a (usually
-/// contiguous) visible set enqueues as a few range jobs — one gather per run.
-fn contiguous_runs(mask: u32) -> Vec<(i32, i32)> {
-    let mut runs = Vec::new();
-    let mut i = 0i32;
-    while i < 32 {
-        if mask & (1u32 << i) != 0 {
-            let start = i;
-            while i < 32 && mask & (1u32 << i) != 0 {
-                i += 1;
-            }
-            runs.push((start, i));
-        } else {
-            i += 1;
-        }
-    }
-    runs
-}
-
-/// Conservative AABB-vs-frustum test (the dominant-corner max-dot used by
-/// `cull.comp`): true unless the box is fully behind some plane.
-fn aabb_in_frustum(mn: &[f32; 3], mx: &[f32; 3], planes: &[[f32; 4]; 6]) -> bool {
-    for p in planes {
-        let d = p[0] * if p[0] >= 0.0 { mx[0] } else { mn[0] }
-            + p[1] * if p[1] >= 0.0 { mx[1] } else { mn[1] }
-            + p[2] * if p[2] >= 0.0 { mx[2] } else { mn[2] }
-            + p[3];
-        if d < 0.0 {
-            return false;
-        }
-    }
-    true
 }
 
 pub enum GameUpdateResult {
@@ -669,7 +384,6 @@ fn send_container_clicks(
                 (changed, game.cursor_item.clone())
             }
         };
-
         let mut click = ServerboundContainerClick {
             container_id: 0,
             state_id: game.container_state_id,
@@ -704,7 +418,6 @@ pub fn update_game(
     core.audio
         .set_listener(listener_pos, game.player.look_dir.y_rot_deg());
     core.audio.set_volumes(core.menu.category_volumes());
-
     gfx.renderer.set_vsync(core.menu.vsync);
 
     let disconnect_reason =
@@ -712,53 +425,6 @@ pub fn update_game(
     if let Some(reason) = disconnect_reason {
         return GameUpdateResult::Disconnected { reason };
     }
-
-    for mesh in game.mesh_dispatcher.drain_results() {
-        // Drop a mesh built from an out-of-date snapshot. Edits (priority lane,
-        // single section) are keyed per section so editing one section never
-        // drops a sibling's in-flight result; bulk loads keep the section content gen.
-        let stale = if mesh.timing.is_some() {
-            game.section_gen.get(&mesh.spos).copied() != Some(mesh.content_gen)
-        } else {
-            mesh.content_gen < game.content_gen.get(&mesh.spos).copied().unwrap_or(0)
-        };
-        if stale {
-            continue;
-        }
-        if let Some(t) = &mesh.timing {
-            let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
-            tracing::info!(
-                "edit remesh [{}, {}, {}]: queue {:.1}ms + mesh {:.1}ms + drain {:.1}ms = {:.1}ms",
-                mesh.spos.x,
-                mesh.spos.y,
-                mesh.spos.z,
-                ms(t.started_at - t.enqueued_at),
-                ms(t.meshed_at - t.started_at),
-                ms(t.meshed_at.elapsed()),
-                ms(t.enqueued_at.elapsed()),
-            );
-        }
-        game.mesh_upload_queue.push_back(mesh);
-    }
-
-    if !game.mesh_upload_queue.is_empty() {
-        let start = std::time::Instant::now();
-
-        let uploaded = gfx.renderer.upload_mesh_batch(&mut game.mesh_upload_queue);
-
-        for (spos, visibility, upload_epoch) in uploaded {
-            let e = game.section_vis_epoch.entry(spos).or_insert(0);
-            if upload_epoch >= *e {
-                *e = upload_epoch;
-                game.section_vis.insert(spos, visibility);
-            }
-        }
-
-        let elapsed = start.elapsed();
-    }
-
-    game.mesh_dispatcher
-        .set_camera_position(*game.player.position);
 
     // Sky time ticks unconditionally so it keeps flowing in menus;
     // server SetTime packets reconcile drift.
@@ -810,8 +476,42 @@ pub fn update_game(
             .prev_eye_pos()
             .lerp(game.player.eye_pos(), partial_tick as f64),
     );
+
+    for mesh in game.meshing.drain_results() {
+        // Drop a mesh built from an out-of-date snapshot. Edits (priority lane,
+        // single section) are keyed per section so editing one section never
+        // drops a sibling's in-flight result; bulk loads keep the section content gen.
+        let stale = game
+            .meshing
+            .section_meta
+            .get(mesh.spos)
+            .ver
+            .load(Ordering::Acquire)
+            < mesh.content_gen;
+        if stale {
+            continue;
+        }
+        if let Some(t) = &mesh.timing {
+            let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
+            tracing::info!(
+                "edit remesh [{}, {}, {}]: queue {:.1}ms + mesh {:.1}ms + drain {:.1}ms = {:.1}ms",
+                mesh.spos.x,
+                mesh.spos.y,
+                mesh.spos.z,
+                ms(t.started_at - t.enqueued_at),
+                ms(t.meshed_at - t.started_at),
+                ms(t.meshed_at.elapsed()),
+                ms(t.enqueued_at.elapsed()),
+            );
+        }
+        gfx.renderer.mesh_queue.push_back(mesh);
+    }
+
+    let uploaded = gfx.renderer.upload_mesh_batch();
+
     // Per-frame FOV interpolation; set before the frustum/view-projection reads.
     gfx.renderer.set_render_partial_tick(partial_tick);
+
     // Plain lerp (vanilla getInterpolatedWalkDistance); the forward-extrapolating
     // camera variant judders across tick boundaries when per-tick speed varies.
     let bob_walk = game
@@ -827,12 +527,14 @@ pub fn update_game(
             .lerp(game.player.eye_pos(), partial_tick as f64),
         &game.chunk_store,
     );
+
     // Esc cancels a running benchmark: restore the render distance it changed.
     if std::mem::take(&mut game.chunk_load_abort)
         && let Some(bench) = game.chunk_load_bench.take()
     {
         apply_render_distance(core, game, connection, bench.original_rd());
     }
+
     // Watch the chunk-load benchmark from straight above, framed to its load
     // radius.
     match &game.chunk_load_bench {
@@ -867,19 +569,25 @@ pub fn update_game(
             }),
             chunk_count: gfx.renderer.loaded_chunk_count(),
             sections_drawn: gfx.renderer.sections_drawn(),
-            occlusion_on: game.chunk_occlusion_enabled,
-            mesh_gate: game.vis_valid.then(|| {
+            occlusion_on: true,
+            mesh_gate: Some({
                 // Among in-frustum columns: sections we mesh vs sections skipped as
                 // occluded (the per-section occlusion win). Middle slot unused.
                 let n = game.chunk_store.section_count() as u32;
                 let mut visible = 0u32;
                 let mut hidden = 0u32;
-                for (pos, &mask) in &game.vis_mask {
-                    if game.vis_tiers.get(pos).copied().unwrap_or(0) == 0 {
-                        let v = mask.count_ones();
-                        visible += v;
-                        hidden += n.saturating_sub(v);
-                    }
+                let center = game.visibility_center;
+                let mask_ring = &game.visibility_mask;
+                for pos in game.chunk_store.loaded_positions() {
+                    let in_range = (pos.x - center.x).abs() <= 64 && (pos.z - center.z).abs() <= 64;
+                    let mask = if in_range {
+                        *mask_ring.get(pos)
+                    } else {
+                        (1u32 << n) - 1
+                    };
+                    let v = mask.count_ones();
+                    visible += v;
+                    hidden += n.saturating_sub(v);
                 }
                 (visible, 0, hidden)
             }),
@@ -888,17 +596,21 @@ pub fn update_game(
             screen_w: gfx.renderer.screen_width(),
             screen_h: gfx.renderer.screen_height(),
             timings: Some(hud::FrameTimings {
-                frame_ms: gfx.renderer.last_timings().frame_ms,
-                fence_ms: gfx.renderer.last_timings().fence_ms,
-                acquire_ms: gfx.renderer.last_timings().acquire_ms,
-                cull_ms: gfx.renderer.last_timings().cull_ms,
-                draw_ms: gfx.renderer.last_timings().draw_ms,
-                present_ms: gfx.renderer.last_timings().present_ms,
+                frame_ms: gfx.renderer.last_timings().frame_ms(),
+                cull_ms: gfx.renderer.last_timings().cull_ms(),
+                gui_bake_ms: gfx.renderer.last_timings().gui_bake_ms(),
+                terrain_ms: gfx.renderer.last_timings().terrain_ms(),
+                entities_ms: gfx.renderer.last_timings().entities_ms(),
+                translucent_ms: gfx.renderer.last_timings().translucent_ms(),
+                ui_ms: gfx.renderer.last_timings().ui_ms(),
+                hiz_ms: gfx.renderer.last_timings().hiz_ms(),
+                visibility_ms: gfx.renderer.last_timings().visibility_ms(),
             }),
         })
     } else {
         None
     };
+
     // The chunk-load benchmark renders a clean top-down view: only terrain, no HUD,
     // entities/player, held item, clouds, or weather — and skipping them also keeps
     // the measured frame times honest.
@@ -999,8 +711,12 @@ pub fn update_game(
                 result.avg_frame_ms, result.p1_frame_ms, result.p99_frame_ms
             ),
             format!(
-                "Fence: {:.2}ms / Cull: {:.2}ms / Draw: {:.2}ms",
-                result.avg_fence_ms, result.avg_cull_ms, result.avg_draw_ms
+                "Cull: {:.2}ms / GuiBake: {:.2}ms / Terrain: {:.2}ms",
+                result.avg_cull_ms, result.avg_gui_bake_ms, result.avg_terrain_ms
+            ),
+            format!(
+                "Entities: {:.2}ms / Translucent: {:.2}ms / UI: {:.2}ms",
+                result.avg_entities_ms, result.avg_translucent_ms, result.avg_ui_ms
             ),
             format!(
                 "{} spikes (>{:.0}ms) - Saved to benchmark.json",
@@ -1037,7 +753,7 @@ pub fn update_game(
             }
             ChunkLoadStep::StartTiming => {
                 gfx.renderer.clear_chunk_meshes();
-                game.meshed.clear();
+                game.meshing.clear();
                 game.chunk_load_bench = Some(bench);
             }
             ChunkLoadStep::Done(result) => {
@@ -1065,9 +781,7 @@ pub fn update_game(
     if let Some(ref bench) = game.chunk_load_bench {
         let progress = format!("Run {}/{}", bench.current_run(), bench.total_runs());
         let mut info_lines = Vec::new();
-
         info_lines.push(format!("=== CHUNK LOAD BENCHMARK ({}) ===", progress));
-
         if bench.resetting() {
             let expected = (bench.target_rd() * 2 + 1).pow(2);
             info_lines.push(format!(
@@ -1097,16 +811,14 @@ pub fn update_game(
             info_lines.push(format!("Chunks (Client Cache): {}", bench.client_cached()));
             info_lines.push(format!(
                 "Pending Mesh Jobs: {}",
-                game.mesh_dispatcher.pending_jobs()
+                game.meshing.pending_jobs()
             ));
             info_lines.push(format!(
                 "Elapsed Load Time: {:.2}s",
                 bench.load_elapsed_secs()
             ));
         }
-
         info_lines.push(String::new()); // Blank spacing line
-
         info_lines.push(format!(
             "FPS: {:.1} (avg: {:.1} ms, worst: {:.1} ms)",
             1.0 / raw_dt.max(0.0001),
@@ -1120,14 +832,12 @@ pub fn update_game(
                 .map(|n| n.get())
                 .unwrap_or(1)
         ));
-
         let padding = 10.0 * gs;
         let line_height = 14.0 * gs;
         let box_w = 320.0 * gs;
         let box_h = (info_lines.len() as f32 * 14.0 + 8.0) * gs;
         let box_x = 10.0 * gs;
         let box_y = 10.0 * gs;
-
         elements.push(MenuElement::Rect {
             x: box_x,
             y: box_y,
@@ -1136,7 +846,6 @@ pub fn update_game(
             corner_radius: 4.0 * gs,
             color: [0.0, 0.0, 0.0, 0.75],
         });
-
         for (idx, line) in info_lines.into_iter().enumerate() {
             elements.push(MenuElement::Text {
                 x: box_x + padding,
@@ -1379,7 +1088,6 @@ pub fn update_game(
             .map(|(&entity_id, e)| {
                 let interp_pos = e.prev_position.lerp(e.position, partial_tick as f64);
                 let extras = entity_extras(entity_id, e, partial_tick);
-
                 EntityRenderInfo {
                     position: interp_pos,
                     head_y_rot_deg: lerp_angle(
@@ -1426,13 +1134,11 @@ pub fn update_game(
             .player
             .prev_position
             .lerp(game.player.position, partial_tick as f64);
-
         let interp_y_rot_deg = lerp_angle(
             game.player.prev_look_dir.y_rot_deg(),
             game.player.look_dir.y_rot_deg(),
             partial_tick,
         );
-
         entity_renders.push(EntityRenderInfo {
             position: interp_pos,
             head_y_rot_deg: interp_y_rot_deg,
@@ -1466,6 +1172,7 @@ pub fn update_game(
         thunder_level: game.sky_state.thunder_level,
         partial_tick: sky_partial_tick,
     };
+
     if game.show_chunk_borders {
         gfx.renderer.update_chunk_borders(
             game.chunk_store.min_y(),
@@ -1531,6 +1238,7 @@ pub fn update_game(
     } else {
         core.menu.render_distance
     };
+
     let held_item = if benchmark_running {
         None
     } else {
@@ -1546,10 +1254,11 @@ pub fn update_game(
             _ => None,
         }
     };
+
     // Recompute after this frame's state changes (a finished benchmark releases
     // the cursor mid-frame), so the renderer doesn't re-hide it from a stale value.
     let hide_cursor = game.input_live() && !game.dead && core.input.is_cursor_captured();
-    if let Err(e) = gfx.renderer.render_world(
+    match gfx.renderer.render_world(
         &gfx.window,
         hide_cursor,
         elements,
@@ -1570,8 +1279,16 @@ pub fn update_game(
         effective_rd,
         player_preview,
         game.player.eyes_in_water,
+        game.chunk_store.shared.min_y(),
+        game.chunk_store.shared.height(),
     ) {
-        tracing::error!("Render error: {e}");
+        Ok((mask, center)) => {
+            game.visibility_mask = mask;
+            game.visibility_center = center;
+        }
+        Err(e) => {
+            tracing::error!("Render error: {e}");
+        }
     }
 
     if close_inventory {
@@ -1733,8 +1450,8 @@ fn build_weather_columns(
     let cam_x = cam.x.floor() as i32;
     let cam_y = cam.y.floor() as i32;
     let cam_z = cam.z.floor() as i32;
-
     let mut columns = Vec::new();
+
     for dz in -WEATHER_RADIUS..=WEATHER_RADIUS {
         for dx in -WEATHER_RADIUS..=WEATHER_RADIUS {
             let wx = cam_x + dx;
@@ -1796,16 +1513,19 @@ fn emit_item_copies(
     let bob = (age_f / 10.0 + bob_offset).sin() * 0.1 + 0.1;
     let spin = age_f / 20.0 + bob_offset;
     let copies = stack_render_count(count);
+
     // GROUND display scale: blocks 0.25, flat items 0.5.
     let scale = if is_block_model { 0.25 } else { 0.5 };
     let min_y_r = min_y * scale;
     let z_size_r = z_size * scale;
+
     // hover = bob + (-modelBoundingBox.minY) + 0.0625
     let hover_y = bob - min_y_r + 0.0625;
 
     let base = glam::Mat4::from_translation(world_pos + glam::Vec3::new(0.0, hover_y, 0.0))
         * glam::Mat4::from_rotation_y(spin);
     let scale_mat = glam::Mat4::from_scale(glam::Vec3::splat(scale));
+
     let mut push = |copy_offset: glam::Mat4| {
         infos.push(ItemRenderInfo {
             item_name: item_name.to_string(),
@@ -1845,6 +1565,7 @@ fn build_item_render_infos(
     partial_tick: f32,
 ) -> Vec<crate::renderer::pipelines::item_entity::ItemRenderInfo> {
     let mut infos = Vec::new();
+
     for item in entity_store.visible_items(camera_pos, 64.0) {
         let age_f = item.age as f32 + partial_tick;
         let lerped = item.prev_position.lerp(item.position, partial_tick as f64);
@@ -1931,7 +1652,6 @@ fn sheep_extras(entity_id: i32, e: &crate::entity::LivingEntity, alpha: f32) -> 
     } else {
         WHITE_TINT
     };
-
     let overlay_tints = if e.is_sheared {
         [None, None]
     } else if e.is_baby {
@@ -1943,7 +1663,6 @@ fn sheep_extras(entity_id: i32, e: &crate::entity::LivingEntity, alpha: f32) -> 
             Some(tint),
         ]
     };
-
     let (pos_scale, angle_scale) = sheep_eat_scales(e.eat_anim_tick, e.prev_eat_anim_tick, alpha);
     let age_scale = if e.is_baby { 0.5 } else { 1.0 };
     let head_y_offset = pos_scale * 9.0 * age_scale;
@@ -1952,7 +1671,6 @@ fn sheep_extras(entity_id: i32, e: &crate::entity::LivingEntity, alpha: f32) -> 
     } else {
         None
     };
-
     EntityExtras {
         variant_index: 0,
         overlay_tints,
@@ -1963,7 +1681,6 @@ fn sheep_extras(entity_id: i32, e: &crate::entity::LivingEntity, alpha: f32) -> 
 
 fn sheep_eat_scales(eat_tick: u8, prev_eat_tick: u8, alpha: f32) -> (f32, f32) {
     use std::f32::consts::PI;
-
     // Mirrors vanilla Sheep.java:127-149. Linear-blend previous and current tick
     // first so the head dip is smooth between server ticks.
     let interp = prev_eat_tick as f32 + (eat_tick as f32 - prev_eat_tick as f32) * alpha;
@@ -1976,7 +1693,6 @@ fn sheep_eat_scales(eat_tick: u8, prev_eat_tick: u8, alpha: f32) -> (f32, f32) {
     } else {
         -(interp - 40.0) / 4.0
     };
-
     let angle_scale = if (4.0..36.0).contains(&interp) {
         let s = (interp - 4.0) / 32.0;
         PI / 5.0 + (PI * 7.0 / 100.0) * (s * 28.7).sin()
@@ -1985,6 +1701,5 @@ fn sheep_eat_scales(eat_tick: u8, prev_eat_tick: u8, alpha: f32) -> (f32, f32) {
     } else {
         0.0
     };
-
     (pos_scale, angle_scale)
 }

@@ -171,7 +171,7 @@ impl LocalPlayer {
         }
     }
 
-    pub fn update_water_state(&mut self, chunks: &crate::world::chunk::ChunkStore) {
+    pub fn update_water_state(&mut self, chunks: &crate::world::chunk::SharedChunkStore) {
         let half_w = 0.3;
         let height = self.height();
         let eye_height = self.target_eye_height();

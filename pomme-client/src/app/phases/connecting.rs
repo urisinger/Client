@@ -35,13 +35,12 @@ pub fn update_connecting(
     }
 
     if matches!(connect_phase, ConnectionPhase::Loading) {
-        game.mesh_dispatcher
-            .set_camera_position(*game.player.position);
-        game.mesh_upload_queue.extend(game.mesh_dispatcher.drain_results());
-        if !game.mesh_upload_queue.is_empty() {
-            gfx.renderer.upload_mesh_batch(&mut game.mesh_upload_queue);
+        gfx.renderer
+            .mesh_queue
+            .extend(game.meshing.drain_results());
+        if !gfx.renderer.mesh_queue.is_empty() {
+            gfx.renderer.upload_mesh_batch();
         }
-
         let ready = game.position_set && (game.dead || gfx.renderer.loaded_chunk_count() > 0);
 
         // Mirror vanilla's `notifyPlayerLoaded`; servers gate
