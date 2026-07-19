@@ -18,7 +18,13 @@ fn compat_label(compat: PackCompat) -> (&'static str, [f32; 4]) {
 }
 
 impl MainMenu {
-    pub(super) fn build_options(&mut self, sw: f32, sh: f32, input: &MenuInput) -> MainMenuResult {
+    pub(super) fn build_options(
+        &mut self,
+        sw: f32,
+        sh: f32,
+        input: &MenuInput,
+        text_width_fn: common::TextWidthFn,
+    ) -> MainMenuResult {
         // Sub-screens reached from here (Language/Accessibility) return to Options.
         self.settings_back = Screen::Options;
         let fov_label = if self.fov == 70 {
@@ -66,6 +72,7 @@ impl MainMenu {
             sliders,
             false,
             &[],
+            text_width_fn,
         )
     }
 
@@ -82,6 +89,7 @@ impl MainMenu {
         sw: f32,
         sh: f32,
         input: &MenuInput,
+        text_width_fn: common::TextWidthFn,
     ) -> MainMenuResult {
         let fullscreen_label = match self.display_mode {
             DisplayMode::Windowed => "Fullscreen: Windowed",
@@ -153,6 +161,7 @@ impl MainMenu {
             sliders,
             true,
             &[],
+            text_width_fn,
         )
     }
 
@@ -161,6 +170,7 @@ impl MainMenu {
         sw: f32,
         sh: f32,
         input: &MenuInput,
+        text_width_fn: common::TextWidthFn,
     ) -> MainMenuResult {
         let rows: Vec<OptRow> = vec![
             OptRow::Pair("Sensitivity: 100%", "Invert Mouse: OFF"),
@@ -180,6 +190,7 @@ impl MainMenu {
             &[],
             true,
             &[],
+            text_width_fn,
         )
     }
 
@@ -188,6 +199,7 @@ impl MainMenu {
         sw: f32,
         sh: f32,
         input: &MenuInput,
+        text_width_fn: common::TextWidthFn,
     ) -> MainMenuResult {
         let rows: Vec<OptRow> = vec![
             OptRow::Pair("Chat: Shown", "Chat Colors: ON"),
@@ -211,6 +223,7 @@ impl MainMenu {
             &[],
             true,
             &[],
+            text_width_fn,
         )
     }
 
@@ -219,6 +232,7 @@ impl MainMenu {
         sw: f32,
         sh: f32,
         input: &MenuInput,
+        text_width_fn: common::TextWidthFn,
     ) -> MainMenuResult {
         let fov_effect_label = if self.fov_effect_scale <= 0.0 {
             "FOV Effects: OFF".to_string()
@@ -255,6 +269,7 @@ impl MainMenu {
             sliders,
             true,
             &[],
+            text_width_fn,
         )
     }
 
@@ -263,6 +278,7 @@ impl MainMenu {
         sw: f32,
         sh: f32,
         input: &MenuInput,
+        text_width_fn: common::TextWidthFn,
     ) -> MainMenuResult {
         let pct = |v: f32| -> String {
             let p = (v * 100.0).round() as u32;
@@ -318,6 +334,7 @@ impl MainMenu {
             sliders,
             true,
             &[],
+            text_width_fn,
         )
     }
 
@@ -326,6 +343,7 @@ impl MainMenu {
         sw: f32,
         sh: f32,
         input: &MenuInput,
+        text_width_fn: common::TextWidthFn,
     ) -> MainMenuResult {
         let cape = if self.skin_cape {
             "Cape: ON"
@@ -380,6 +398,7 @@ impl MainMenu {
             &[],
             true,
             &[],
+            text_width_fn,
         )
     }
 
@@ -388,6 +407,7 @@ impl MainMenu {
         sw: f32,
         sh: f32,
         input: &MenuInput,
+        text_width_fn: common::TextWidthFn,
     ) -> MainMenuResult {
         let online_status_label = if self.show_online_status {
             "Show Online Status: ON"
@@ -432,6 +452,7 @@ impl MainMenu {
             &[],
             true,
             tooltips,
+            text_width_fn,
         )
     }
 
@@ -448,6 +469,7 @@ impl MainMenu {
         sliders: &[(&'static str, f32)],
         header_footer: bool,
         tooltips: &[(&str, &str)],
+        text_width_fn: common::TextWidthFn,
     ) -> MainMenuResult {
         if input.escape {
             self.set_screen(back.clone_screen());
@@ -576,6 +598,10 @@ impl MainMenu {
             content_top + (content_h - grid_h) / 2.0
         };
         let mut slider_results: Vec<(&str, f32)> = Vec::new();
+        let label_scroll = common::LabelScroll {
+            text_width_fn,
+            time_secs: self.created.elapsed().as_secs_f64(),
+        };
 
         if header_footer {
             elements.push(MenuElement::ScissorPush {
@@ -624,6 +650,7 @@ impl MainMenu {
                         label,
                         *value,
                         is_active,
+                        &label_scroll,
                     );
                     any_hovered |= result.hovered;
                     if result.dragging {
@@ -638,7 +665,7 @@ impl MainMenu {
                     continue;
                 }
 
-                let h = common::push_button(
+                let h = common::push_button_scrolling(
                     &mut elements,
                     cursor,
                     bx,
@@ -649,6 +676,7 @@ impl MainMenu {
                     fs,
                     label,
                     true,
+                    &label_scroll,
                 );
                 any_hovered |= h;
                 if h && let Some((_, tip)) = tooltips.iter().find(|(p, _)| label.starts_with(p)) {
@@ -759,7 +787,9 @@ impl MainMenu {
             self.save_settings();
         }
 
-        elements.push(MenuElement::ScissorPop);
+        if header_footer {
+            elements.push(MenuElement::ScissorPop);
+        }
 
         if scrollable {
             let max_scroll = (grid_h + content_pad - content_h).max(0.001);
@@ -789,7 +819,7 @@ impl MainMenu {
         }
 
         let done_w = 200.0 * gs;
-        let h = common::push_button(
+        let h = common::push_button_scrolling(
             &mut elements,
             cursor,
             cx - done_w / 2.0,
@@ -800,6 +830,7 @@ impl MainMenu {
             fs,
             "Done",
             true,
+            &label_scroll,
         );
         any_hovered |= h;
         if clicked && h {
@@ -821,7 +852,7 @@ impl MainMenu {
         sw: f32,
         sh: f32,
         input: &MenuInput,
-        text_width_fn: &dyn Fn(&str, f32) -> f32,
+        text_width_fn: common::TextWidthFn,
     ) -> MainMenuResult {
         use crate::resource_pack::PackSource;
 

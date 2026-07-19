@@ -1,8 +1,11 @@
+#[cfg(test)]
+mod azalea_compat;
 pub mod commands;
 pub mod connection;
 pub mod handler;
 pub mod resolve;
 pub mod sender;
+pub mod translate;
 
 use std::sync::Arc;
 
@@ -11,9 +14,40 @@ use azalea_core::heightmap_kind::HeightmapKind;
 use azalea_core::position::{BlockPos, ChunkPos};
 use azalea_inventory::ItemStack;
 use azalea_registry::builtin::{BlockEntityKind, EntityKind};
+use glam::DVec3;
 use simdnbt::owned::NbtCompound;
 
 use crate::entity::components::Position;
+use crate::entity::villager::{VillagerKind, VillagerProfession};
+
+/// A packet's per-column light payload (chunk load or standalone update):
+/// present sections listed in `*_updates`, selected by `*_y_mask`, with
+/// `empty_*_y_mask` marking explicitly-zero sections.
+pub struct PacketLightData {
+    pub sky_updates: Arc<Box<[Box<[u8]>]>>,
+    pub block_updates: Arc<Box<[Box<[u8]>]>>,
+    pub sky_y_mask: azalea_core::bitset::BitSet,
+    pub block_y_mask: azalea_core::bitset::BitSet,
+    pub empty_sky_y_mask: azalea_core::bitset::BitSet,
+    pub empty_block_y_mask: azalea_core::bitset::BitSet,
+}
+
+impl From<&azalea_protocol::packets::game::c_light_update::ClientboundLightUpdatePacketData>
+    for PacketLightData
+{
+    fn from(
+        data: &azalea_protocol::packets::game::c_light_update::ClientboundLightUpdatePacketData,
+    ) -> Self {
+        Self {
+            sky_updates: data.sky_updates.clone(),
+            block_updates: data.block_updates.clone(),
+            sky_y_mask: data.sky_y_mask.clone(),
+            block_y_mask: data.block_y_mask.clone(),
+            empty_sky_y_mask: data.empty_sky_y_mask.clone(),
+            empty_block_y_mask: data.empty_block_y_mask.clone(),
+        }
+    }
+}
 
 pub enum NetworkEvent {
     Connected,
@@ -24,15 +58,18 @@ pub enum NetworkEvent {
     DimensionInfo {
         height: u32,
         min_y: i32,
+        has_skylight: bool,
     },
     ChunkLoaded {
         pos: ChunkPos,
         data: Arc<Box<[u8]>>,
         heightmaps: Vec<(HeightmapKind, Box<[u64]>)>,
-        sky_light: Arc<Box<[Box<[u8]>]>>,
-        block_light: Arc<Box<[Box<[u8]>]>>,
-        sky_y_mask: azalea_core::bitset::BitSet,
-        block_y_mask: azalea_core::bitset::BitSet,
+        light: PacketLightData,
+    },
+    /// Standalone server light correction (`ClientboundLightUpdate`).
+    LightUpdate {
+        pos: ChunkPos,
+        light: PacketLightData,
     },
     ChunkUnloaded {
         pos: ChunkPos,
@@ -54,20 +91,38 @@ pub enum NetworkEvent {
         progress: f32,
         level: i32,
     },
+    Waypoint {
+        operation: azalea_protocol::packets::game::c_waypoint::WaypointOperation,
+        waypoint: azalea_protocol::packets::game::c_waypoint::TrackedWaypoint,
+    },
     EntityArmorUpdate {
         entity_id: i32,
         armor: u32,
     },
-    InventoryContent {
+    ContainerContent {
+        container_id: i32,
         items: Vec<ItemStack>,
         carried: ItemStack,
         state_id: u32,
     },
-    InventorySlot {
+    ContainerSlot {
+        container_id: i32,
         index: u16,
         item: ItemStack,
         state_id: u32,
     },
+    /// A menu data value (furnace lit/cook progress, etc.).
+    ContainerData {
+        container_id: i32,
+        id: u16,
+        value: u16,
+    },
+    OpenScreen {
+        container_id: i32,
+        menu_type: azalea_registry::builtin::MenuKind,
+        title: String,
+    },
+    ContainerClosed,
     CursorItem {
         item: ItemStack,
     },
@@ -76,6 +131,13 @@ pub enum NetworkEvent {
     },
     CommandTree {
         tree: Arc<crate::net::commands::CommandTree>,
+    },
+    CommandSuggestions {
+        id: u32,
+        /// Offset into the command string (as sent, including the leading `/`)
+        /// where the completed range begins.
+        start: usize,
+        options: Vec<String>,
     },
     BlockUpdate {
         pos: BlockPos,
@@ -142,6 +204,7 @@ pub enum NetworkEvent {
         uuid: uuid::Uuid,
         entity_type: EntityKind,
         position: Position,
+        velocity: DVec3,
         y_rot_deg: f32,
         x_rot_deg: f32,
         head_y_rot_deg: f32,
@@ -151,6 +214,7 @@ pub enum NetworkEvent {
         dx: f64,
         dy: f64,
         dz: f64,
+        on_ground: bool,
     },
     EntityMovedRotated {
         id: i32,
@@ -159,12 +223,40 @@ pub enum NetworkEvent {
         dz: f64,
         y_rot_deg: f32,
         x_rot_deg: f32,
+        on_ground: bool,
+    },
+    EntityMotion {
+        id: i32,
+        velocity: DVec3,
     },
     EntityTeleported {
         id: i32,
         position: Position,
+        /// `TeleportEntity` applies the packet's velocity; `EntityPositionSync`
+        /// doesn't (vanilla `setValuesFromPositionPacket` vs
+        /// `handleEntityPositionSync`).
+        velocity: Option<DVec3>,
         y_rot_deg: f32,
         x_rot_deg: f32,
+        on_ground: bool,
+    },
+    LevelEvent {
+        event_type: u32,
+        pos: BlockPos,
+        data: u32,
+    },
+    /// `ClientboundLevelParticles`. The handler drops unimplemented particle
+    /// kinds and the `always_show` flag (it only matters below
+    /// `ParticleStatus::All`, and pomme has no particles setting).
+    LevelParticles {
+        kind: crate::particle::ServerParticleKind,
+        override_limiter: bool,
+        pos: DVec3,
+        x_dist: f32,
+        y_dist: f32,
+        z_dist: f32,
+        max_speed: f32,
+        count: u32,
     },
     EntitiesRemoved {
         ids: Vec<i32>,
@@ -195,9 +287,23 @@ pub enum NetworkEvent {
     SheepEatStart {
         id: i32,
     },
+    /// Entity event 9: the entity finished using its item (eating complete).
+    FinishUseItem {
+        id: i32,
+    },
     CowVariant {
         id: i32,
         variant: u8,
+    },
+    VillagerData {
+        id: i32,
+        kind: VillagerKind,
+        profession: VillagerProfession,
+        level: u32,
+    },
+    VillagerUnhappy {
+        id: i32,
+        counter: i32,
     },
     EntityCustomName {
         id: i32,

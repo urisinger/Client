@@ -1,4 +1,5 @@
-use glam::{FloatExt, Mat4, Vec3};
+use glam::camera::rh::{proj, view};
+use glam::{DVec3, FloatExt, Mat4, Vec3};
 
 use crate::app::input::InputState;
 use crate::entity::components::{LookDirection, Position};
@@ -186,9 +187,14 @@ impl Camera {
         self.position = position
     }
 
-    #[allow(dead_code)] // TODO: camera relative rendering
-    pub fn camera_relative_f32(&self, world_pos: Position) -> Vec3 {
-        (world_pos - self.position).as_vec3()
+    /// Render-space anchor: the camera's block position (vanilla
+    /// `CameraBlockPos`). World positions are rebased against it in f64
+    /// before narrowing to f32, keeping full precision near the camera even
+    /// at extreme coordinates (no stripe lands at 2^24). Never narrow the
+    /// anchor itself to f32 — its components are integers, exact in i32 and
+    /// f64 but not in f32 past 2^24.
+    pub fn anchor(&self) -> DVec3 {
+        self.position.floor()
     }
 
     pub fn update_fov_modifier(&mut self, target: f32) {
@@ -258,6 +264,27 @@ impl Camera {
         }
     }
 
+    /// Screen-space right/up axes for camera-facing particle billboards.
+    /// Equivalent to rotating quad corners by vanilla's roll-free camera
+    /// quaternion; derived from yaw/pitch analytically so there's no
+    /// degeneracy looking straight up or down.
+    pub fn billboard_axes(&self) -> (Vec3, Vec3) {
+        if self.top_down.is_some() {
+            // Looking straight down with north up.
+            return (Vec3::X, Vec3::NEG_Z);
+        }
+        let (sin_yaw, cos_yaw) = self.look_dir.y_rot_rad().sin_cos();
+        let (sin_pitch, cos_pitch) = self.look_dir.x_rot_rad().sin_cos();
+        let right = Vec3::new(-cos_yaw, 0.0, -sin_yaw);
+        let up = Vec3::new(-sin_yaw * sin_pitch, cos_pitch, cos_yaw * sin_pitch);
+        if self.mode == CameraMode::ThirdPersonFront {
+            // The camera faces the opposite way: right flips, up stays.
+            (-right, up)
+        } else {
+            (right, up)
+        }
+    }
+
     /// Forward and up vectors for the view matrix, accounting for the top-down
     /// override and front-facing third person.
     fn view_basis(&self) -> (Vec3, Vec3) {
@@ -298,8 +325,8 @@ impl Camera {
 
     pub fn sky_view_projection(&self) -> Mat4 {
         let (forward, up) = self.view_basis();
-        let view = Mat4::look_to_rh(Vec3::ZERO, forward, up);
-        let mut proj = Mat4::perspective_rh(
+        let view = view::look_to_mat4(Vec3::ZERO, forward, up);
+        let mut proj = proj::directx::perspective(
             self.fov_radians(self.render_partial_tick),
             self.aspect_ratio,
             NEAR,
@@ -309,11 +336,43 @@ impl Camera {
         proj * view
     }
 
+    /// Vanilla `Camera.getViewRotationProjectionMatrix`: rotation-only view
+    /// times the GL-convention projection — no view bob, no third-person
+    /// translation, no Vulkan Y flip. Used by the locator bar's waypoint
+    /// pitch test.
+    pub fn view_rotation_projection(&self) -> Mat4 {
+        let (forward, up) = self.view_basis();
+        let view = view::look_to_mat4(Vec3::ZERO, forward, up);
+        let proj = proj::opengl::perspective(
+            self.fov_radians(self.render_partial_tick),
+            self.aspect_ratio,
+            NEAR,
+            FAR,
+        );
+        proj * view
+    }
+
+    /// Camera yaw/pitch in degrees as vanilla `Camera.setRotation` sees them:
+    /// the mirrored third-person view turns around (yaw + 180, pitch negated).
+    pub fn effective_look_deg(&self) -> (f32, f32) {
+        let yaw = self.look_dir.y_rot_deg();
+        let pitch = self.look_dir.x_rot_deg();
+        if self.mode == CameraMode::ThirdPersonFront {
+            (yaw + 180.0, -pitch)
+        } else {
+            (yaw, pitch)
+        }
+    }
+
+    pub fn fov_degrees(&self) -> f32 {
+        self.fov_radians(self.render_partial_tick).to_degrees()
+    }
+
     pub fn view_projection_with_fov(&self, fov: f32) -> Mat4 {
         let offset = self.third_person_offset();
         let (forward, up) = self.view_basis();
-        let view = self.bob_matrix() * Mat4::look_to_rh(offset, forward, up);
-        let mut proj = Mat4::perspective_rh(fov, self.aspect_ratio, NEAR, FAR);
+        let view = self.bob_matrix() * view::look_to_mat4(offset, forward, up);
+        let mut proj = proj::directx::perspective(fov, self.aspect_ratio, NEAR, FAR);
         proj.y_axis.y *= -1.0; // Vulkan NDC has +Y down
         proj * view
     }
@@ -323,8 +382,15 @@ impl Camera {
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CameraUniform {
     view_proj: [[f32; 4]; 4],
+    /// xyz: eye position relative to the render anchor (small, full f32
+    /// precision; see `Camera::anchor`), w: fog start. All world-space data
+    /// is uploaded anchor-relative, so shaders never see large floats.
     camera_pos: [f32; 4],
     fog_color: [f32; 4],
+    /// xyz: the anchor as integers (vanilla `CameraBlockPos`). Declared only
+    /// in chunk.vert, which subtracts it from the absolute integer section
+    /// origins; the other shaders keep the shorter block prefix.
+    camera_block: [i32; 4],
 }
 
 // Vanilla FogType.WATER defaults (EnvironmentAttributes): color 0xFF050533,
@@ -342,8 +408,9 @@ impl CameraUniform {
         render_distance_chunks: u32,
         eyes_in_water: bool,
     ) -> Self {
+        let anchor = camera.anchor();
         let offset = camera.third_person_offset();
-        let pos = camera.position.as_vec3() + offset;
+        let pos = (*camera.position - anchor).as_vec3() + offset;
         // Vanilla render-distance fog band: the last clamp(blocks / 10, 4, 64) blocks.
         // The top-down benchmark view sits hundreds of blocks up, so push fog past the
         // far plane to keep the whole loaded area visible.
@@ -362,6 +429,7 @@ impl CameraUniform {
             view_proj: camera.view_projection().to_cols_array_2d(),
             camera_pos: [pos.x, pos.y, pos.z, fog_start],
             fog_color: [fog_rgb[0], fog_rgb[1], fog_rgb[2], fog_end],
+            camera_block: anchor.as_ivec3().extend(0).to_array(),
         }
     }
 
@@ -370,6 +438,7 @@ impl CameraUniform {
             view_proj: view_proj.to_cols_array_2d(),
             camera_pos: [0.0; 4],
             fog_color: [0.0; 4],
+            camera_block: [0; 4],
         }
     }
 }

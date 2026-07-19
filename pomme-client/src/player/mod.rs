@@ -7,13 +7,13 @@ use glam::{dvec2, dvec3};
 use inventory::Inventory;
 
 use crate::entity::components::{LookDirection, Position, Velocity};
-use crate::world::block::BlockStateExt;
+use crate::world::block::{FluidKind, fluid};
 
 pub const MAX_AIR_SUPPLY: i32 = 300;
 pub const STANDING_HEIGHT: f64 = 1.8;
 pub const CROUCH_HEIGHT: f64 = 1.5;
-const STANDING_EYE_HEIGHT: f64 = 1.62;
-const CROUCH_EYE_HEIGHT: f64 = 1.27;
+pub const STANDING_EYE_HEIGHT: f64 = 1.62;
+pub const CROUCH_EYE_HEIGHT: f64 = 1.27;
 const DROWN_DAMAGE_THRESHOLD: i32 = -20;
 const DROWN_DAMAGE: f32 = 2.0;
 const AIR_RECOVERY_RATE: i32 = 4;
@@ -25,19 +25,13 @@ pub fn is_survival(game_mode: u8) -> bool {
     game_mode == 0 || game_mode == 2
 }
 
+/// Matches vanilla GameType.isCreative(): Creative (1).
+pub fn is_creative(game_mode: u8) -> bool {
+    game_mode == 1
+}
+
 fn is_water_block(state: azalea_block::BlockState) -> bool {
-    if state.is_air() {
-        return false;
-    }
-    let block = state.to_trait();
-    let id = block.id();
-    if id == "water" || id == "bubble_column" {
-        return true;
-    }
-    block
-        .property_map()
-        .get("waterlogged")
-        .is_some_and(|v| *v == "true")
+    fluid(state).kind == FluidKind::Water
 }
 
 pub struct LocalPlayer {
@@ -172,7 +166,7 @@ impl LocalPlayer {
         }
     }
 
-    pub fn update_water_state(&mut self, chunks: &crate::world::chunk::SharedChunkStore) {
+    pub fn update_water_state(&mut self, chunks: &crate::world::chunk::ChunkStore) {
         let half_w = 0.3;
         let height = self.height();
         let eye_height = self.target_eye_height();

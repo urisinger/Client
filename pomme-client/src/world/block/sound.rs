@@ -12,8 +12,6 @@ use std::sync::LazyLock;
 
 use azalea_block::BlockState;
 
-use super::BlockStateExt;
-
 /// A block's vanilla `SoundType` sounds: the `sounds.json` hit and break events
 /// plus the raw volume and pitch (the caller applies the play-time scaling). An
 /// empty event marks an action that is intentionally silent for the block.
@@ -35,8 +33,7 @@ static BLOCK_SOUNDS: LazyLock<HashMap<String, (String, String, f32, f32)>> = Laz
 /// vanilla `SoundType.STONE` default. An empty event field means that action is
 /// silent for the block.
 pub fn block_sounds(state: BlockState) -> BlockSounds {
-    let block = state.to_trait();
-    let id = block.id();
+    let id = super::block_id(state);
     let key = id.strip_prefix("minecraft:").unwrap_or(id);
 
     let (hit, brk, volume, pitch) = BLOCK_SOUNDS

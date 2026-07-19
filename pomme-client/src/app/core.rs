@@ -27,7 +27,8 @@ use crate::renderer::Renderer;
 use crate::resource_pack::ResourcePackManager;
 use crate::ui::menu::{MainMenu, MenuInput};
 use crate::user::UserData;
-use crate::world::chunk::{ChunkStore, SharedChunkStore, mesh_neighborhood};
+use crate::world::chunk::ChunkStore;
+
 pub struct PendingPackDownload {
     pub id: uuid::Uuid,
     pub required: bool,
@@ -38,21 +39,68 @@ pub type PackDownloadResult = Result<std::path::PathBuf, crate::resource_pack::P
 struct PlayerSkinResult {
     uuid: uuid::Uuid,
     textures: Option<String>,
-    result: Result<(Vec<u8>, u32, u32), String>,
+    result: Result<crate::renderer::SkinData, String>,
 }
-/// Queues `pos` and its already-loaded mesh neighborhood (de-duplicated): when
-/// `pos` changes, every chunk whose mesh samples it must re-mesh too, else
-/// their shared border keeps the stale full-bright edge light.
-fn enqueue_with_neighbors(
-    out: &mut Vec<azalea_core::position::ChunkPos>,
-    store: &SharedChunkStore,
-    pos: azalea_core::position::ChunkPos,
+
+/// Applies a server-driven block change: block-entity sync, prediction
+/// absorption, the block + light write, and the remesh cascade. The block
+/// entity syncs even when a pending prediction absorbs the update (the state
+/// is applied later in `acknowledge`), so e.g. a chest placed where a break
+/// was just predicted still gets its entry.
+fn apply_server_block(
+    game: &mut GameState,
+    priority_remesh: &mut Vec<(azalea_core::position::ChunkPos, i32)>,
+    pos: azalea_core::position::BlockPos,
+    state: azalea_block::BlockState,
 ) {
-    for p in mesh_neighborhood(pos) {
-        if (p == pos || store.has_chunk(p)) && !out.contains(&p) {
-            out.push(p);
-        }
+    crate::world::block_entity::sync_block_entity(&mut game.chunk_store.block_entities, pos, state);
+    if game.interaction.update_known_server_state(&pos, state) {
+        return;
     }
+    crate::world::light::set_block_and_light(
+        &game.chunk_store,
+        &mut game.light_engine,
+        pos.x,
+        pos.y,
+        pos.z,
+        state,
+    );
+    dirty_sections_for_block(
+        priority_remesh,
+        pos.x,
+        pos.y,
+        pos.z,
+        game.chunk_store.min_y(),
+        game.chunk_store.section_count(),
+    );
+}
+
+/// Queues a column's packet light for the per-tick apply. Chunk loads enable
+/// the column, standalone light updates are corrections.
+fn queue_light_apply(
+    game: &mut GameState,
+    pos: azalea_core::position::ChunkPos,
+    light: &crate::net::PacketLightData,
+    enable: bool,
+) {
+    let count = game.light_engine.light_section_count();
+    game.light_engine
+        .queue_task(crate::world::light::LightTask::ApplyLight {
+            pos: (pos.x, pos.z),
+            sky: crate::world::light::section_entries(
+                count,
+                &light.sky_y_mask,
+                &light.empty_sky_y_mask,
+                &light.sky_updates[..],
+            ),
+            block: crate::world::light::section_entries(
+                count,
+                &light.block_y_mask,
+                &light.empty_block_y_mask,
+                &light.block_updates[..],
+            ),
+            enable,
+        });
 }
 /// Mirror of vanilla `LevelExtractor.setBlockDirty`: a block at (x,y,z) dirties
 /// its own 16³ section plus any neighbour section it touches when on a boundary
@@ -140,6 +188,7 @@ impl AppCore {
             &data_dirs.game_dir,
             Arc::clone(&tokio_rt),
             user.username.clone(),
+            version.clone(),
             user.access_token.clone(),
         );
         let asset_index =
@@ -244,6 +293,13 @@ impl AppCore {
             return;
         }
         self.requested_player_skins.insert(uuid, textures.clone());
+
+        // Name-derived (v3) UUIDs from offline-mode servers have no Mojang
+        // profile to fetch; keep the default skin.
+        if textures.is_none() && uuid.get_version_num() == 3 {
+            return;
+        }
+
         let tx = self.player_skin_tx.clone();
         let requested_textures = textures.clone();
         self.tokio_rt.spawn(async move {
@@ -266,8 +322,8 @@ impl AppCore {
                 continue;
             }
             match skin.result {
-                Ok((pixels, width, height)) => {
-                    renderer.update_player_entity_skin(&skin.uuid, &pixels, width, height);
+                Ok(data) => {
+                    renderer.update_player_entity_skin(&skin.uuid, &data);
                 }
                 Err(e) => {
                     tracing::warn!("Failed to load entity player skin for {}: {e}", skin.uuid)
@@ -288,7 +344,10 @@ impl AppCore {
         game: &mut GameState,
     ) -> Option<String> {
         let rx = &connection.event_rx;
-        let mut chunks_to_mesh = Vec::new();
+
+        // Phase timers for the chunk-load benchmark's worst-frame breakdown.
+        let t_net = std::time::Instant::now();
+
         // Block edits go on the priority lane so they apply instantly even while
         // chunks stream in, instead of starving behind the load backlog.
         let mut priority_remesh: Vec<(azalea_core::position::ChunkPos, i32)> = Vec::new();
@@ -315,12 +374,24 @@ impl AppCore {
                     game.meshing
                         .set_biome_climate(Arc::clone(&game.biome_climate));
                 }
-                NetworkEvent::DimensionInfo { height, min_y } => {
-                    tracing::info!("Dimension: height={height}, min_y={min_y}");
+                NetworkEvent::DimensionInfo {
+                    height,
+                    min_y,
+                    has_skylight,
+                } => {
+                    tracing::info!(
+                        "Dimension: height={height}, min_y={min_y}, skylight={has_skylight}"
+                    );
                     game.chunk_store =
                         ChunkStore::new_with_dimension(self.menu.render_distance, height, min_y);
+                    game.light_engine =
+                        crate::world::light::LevelLightEngine::new(height, min_y, has_skylight);
                     game.position_set = false;
                     game.player_loaded_sent = false;
+                    // Login/respawn recreate vanilla's LocalPlayer, resetting
+                    // the XP display sentinel; waypoints persist.
+                    game.xp_display_start_tick = i64::MIN;
+
                     renderer.clear_chunk_meshes();
                     game.meshing.recreate_dispatcher(
                         renderer,
@@ -332,26 +403,28 @@ impl AppCore {
                     pos,
                     data,
                     heightmaps,
-                    sky_light,
-                    block_light,
-                    sky_y_mask,
-                    block_y_mask,
+                    light,
                 } => {
                     if let Err(e) = game.chunk_store.load_chunk(pos, &data, &heightmaps) {
                         tracing::error!("Failed to load chunk [{}, {}]: {e}", pos.x, pos.z);
                         continue;
                     }
-                    game.chunk_store.store_light(
-                        pos,
-                        &sky_light,
-                        &block_light,
-                        &sky_y_mask,
-                        &block_y_mask,
-                    );
-                    enqueue_with_neighbors(&mut chunks_to_mesh, &game.chunk_store.shared, pos);
+                    game.light_engine
+                        .on_chunk_loaded(&mut game.chunk_store, (pos.x, pos.z));
+                    // The column meshes once its queued light applies (vanilla
+                    // schedules the rebuild from enableChunkLight, not here).
+                    queue_light_apply(game, pos, &light, true);
+                }
+                NetworkEvent::LightUpdate { pos, light } => {
+                    queue_light_apply(game, pos, &light, false);
                 }
                 NetworkEvent::ChunkUnloaded { pos } => {
                     game.chunk_store.unload_chunk(&pos);
+                    game.light_engine.on_chunk_unloaded((pos.x, pos.z));
+                    game.light_engine
+                        .queue_task(crate::world::light::LightTask::Remove {
+                            pos: (pos.x, pos.z),
+                        });
                     game.block_entity_anim.drop_chunk(pos.x, pos.z);
                     game.meshing.on_chunk_unload(pos);
                     renderer.remove_chunk_mesh(&pos);
@@ -454,22 +527,53 @@ impl AppCore {
                     }
                 }
                 NetworkEvent::PlayerExperience { progress, level } => {
+                    if progress != game.player.experience_progress {
+                        // Vanilla LocalPlayer.setExperienceValues: the first
+                        // change after (re)spawn only arms the sentinel and
+                        // doesn't yet prioritize the XP bar.
+                        game.xp_display_start_tick = if game.xp_display_start_tick == i64::MIN {
+                            i64::MIN + 1
+                        } else {
+                            game.tick_count as i64
+                        };
+                    }
                     game.player.experience_progress = progress;
                     game.player.experience_level = level;
+                }
+                NetworkEvent::Waypoint {
+                    operation,
+                    waypoint,
+                } => {
+                    game.waypoints.apply(operation, waypoint);
                 }
                 NetworkEvent::EntityArmorUpdate { entity_id, armor } => {
                     if entity_id == game.player.entity_id {
                         game.player.armor = armor;
                     }
                 }
-                NetworkEvent::InventoryContent {
+                NetworkEvent::ContainerContent {
+                    container_id,
                     items,
                     carried,
                     state_id,
                 } => {
-                    game.player.inventory.set_contents(items);
-                    game.cursor_item = carried;
-                    game.container_state_id = state_id;
+                    // State ids are per-menu (vanilla scopes them to the menu
+                    // the packet addresses); the rendered carried stack is the
+                    // open menu's, so an inventory sync must not clobber it.
+                    if container_id == 0 {
+                        game.player.inventory.set_contents(items);
+                        game.sync_container_from_inventory();
+                        game.inventory_state_id = state_id;
+                        if game.open_container.is_none() {
+                            game.cursor_item = carried;
+                        }
+                    } else if game.open_menu_id() == Some(container_id) {
+                        for (i, item) in items.into_iter().enumerate() {
+                            game.set_menu_slot(i, item);
+                        }
+                        game.cursor_item = carried;
+                        game.set_container_state_id(state_id);
+                    }
                 }
                 NetworkEvent::CursorItem { item } => {
                     game.cursor_item = item;
@@ -477,13 +581,112 @@ impl AppCore {
                 NetworkEvent::Registries(registries) => {
                     game.registries = registries;
                 }
-                NetworkEvent::InventorySlot {
+                NetworkEvent::ContainerSlot {
+                    container_id,
                     index,
                     item,
                     state_id,
                 } => {
-                    game.container_state_id = state_id;
-                    game.player.inventory.set_slot(index as usize, item);
+                    // Direct inventory updates (-2) carry no menu state id.
+                    if container_id == 0 || container_id == -2 {
+                        game.player.inventory.set_slot(index as usize, item);
+                        game.sync_container_from_inventory();
+                        if container_id == 0 {
+                            game.inventory_state_id = state_id;
+                        }
+                    } else if game.open_menu_id() == Some(container_id) {
+                        game.set_menu_slot(index as usize, item);
+                        game.set_container_state_id(state_id);
+                    }
+                }
+                NetworkEvent::ContainerData {
+                    container_id,
+                    id,
+                    value,
+                } => {
+                    if let Some(c) = &mut game.open_container
+                        && c.id == container_id
+                        && let Some(d) = c.data.get_mut(id as usize)
+                    {
+                        *d = value as i16;
+                    }
+                }
+                NetworkEvent::OpenScreen {
+                    container_id,
+                    menu_type,
+                    title,
+                } => {
+                    use azalea_inventory::ItemStack;
+                    use azalea_registry::builtin::MenuKind;
+
+                    use crate::app::phases::in_game::ContainerScreen;
+                    use crate::ui::furnace::FurnaceVariant;
+                    let screen = match menu_type {
+                        MenuKind::Crafting => Some(ContainerScreen::CraftingTable),
+                        MenuKind::Furnace => {
+                            Some(ContainerScreen::Furnace(FurnaceVariant::Furnace))
+                        }
+                        MenuKind::BlastFurnace => {
+                            Some(ContainerScreen::Furnace(FurnaceVariant::BlastFurnace))
+                        }
+                        MenuKind::Smoker => Some(ContainerScreen::Furnace(FurnaceVariant::Smoker)),
+                        MenuKind::Generic9x1 => Some(ContainerScreen::Chest { rows: 1 }),
+                        MenuKind::Generic9x2 => Some(ContainerScreen::Chest { rows: 2 }),
+                        MenuKind::Generic9x3 => Some(ContainerScreen::Chest { rows: 3 }),
+                        MenuKind::Generic9x4 => Some(ContainerScreen::Chest { rows: 4 }),
+                        MenuKind::Generic9x5 => Some(ContainerScreen::Chest { rows: 5 }),
+                        MenuKind::Generic9x6 => Some(ContainerScreen::Chest { rows: 6 }),
+                        MenuKind::ShulkerBox => Some(ContainerScreen::ShulkerBox),
+                        MenuKind::Anvil => Some(ContainerScreen::Anvil),
+                        MenuKind::Enchantment => Some(ContainerScreen::Enchantment),
+                        _ => None,
+                    };
+                    if let Some(screen) = screen {
+                        // Vanilla setScreen replaces whatever screen is up,
+                        // including the pause menu.
+                        game.paused = false;
+                        game.inventory_open = false;
+                        game.close_creative_inventory();
+                        game.inv_drag = None;
+                        game.inv_last_click = None;
+                        game.open_container = Some(crate::app::phases::in_game::OpenContainer {
+                            id: container_id,
+                            title,
+                            screen,
+                            slots: vec![ItemStack::Empty; screen.click_kind().slot_count()],
+                            data: [0; 10],
+                            anvil: (screen == ContainerScreen::Anvil)
+                                .then(crate::ui::anvil::AnvilState::new),
+                            enchant: (screen == ContainerScreen::Enchantment)
+                                .then(crate::ui::enchantment::EnchantState::new),
+                            state_id: 0,
+                        });
+                        game.sync_container_from_inventory();
+                        // The new menu replaces any previous one server-side;
+                        // don't send a close for the replaced menu (the server
+                        // would apply it to this one).
+                        game.container_was_open = Some(container_id);
+                        self.apply_cursor_grab(window, Some(game));
+                    } else {
+                        // TODO: render the remaining menu screens (chest,
+                        // brewing stand, ...). Until then tell the server we
+                        // closed the menu so its container state stays
+                        // consistent.
+                        use azalea_protocol::packets::game::s_container_close::ServerboundContainerClose;
+                        connection
+                            .packet_tx
+                            .send(ServerboundGamePacket::ContainerClose(
+                                ServerboundContainerClose { container_id },
+                            ));
+                    }
+                }
+                NetworkEvent::ContainerClosed => {
+                    // Vanilla closes whatever menu is open regardless of the
+                    // packet's container id.
+                    game.close_menu();
+                    // The server initiated the close; don't echo one back.
+                    game.container_was_open = None;
+                    self.apply_cursor_grab(window, Some(game));
                 }
                 NetworkEvent::ChatMessage { spans } => {
                     game.chat.push_message(spans);
@@ -491,39 +694,16 @@ impl AppCore {
                 NetworkEvent::CommandTree { tree } => {
                     game.command_tree = Some(tree);
                 }
+                NetworkEvent::CommandSuggestions { id, start, options } => {
+                    game.chat.apply_server_suggestions(id, start, options);
+                }
                 NetworkEvent::BlockUpdate { pos, state } => {
-                    if game.interaction.update_known_server_state(&pos, state) {
-                        continue;
-                    }
-                    game.chunk_store.set_block_state(pos.x, pos.y, pos.z, state);
-                    dirty_sections_for_block(
-                        &mut priority_remesh,
-                        pos.x,
-                        pos.y,
-                        pos.z,
-                        game.chunk_store.min_y(),
-                        game.chunk_store.section_count(),
-                    );
+                    apply_server_block(game, &mut priority_remesh, pos, state);
                 }
                 NetworkEvent::SectionBlocksUpdate { updates } => {
-                    let min_y = game.chunk_store.min_y();
-                    let n = game.chunk_store.section_count();
-                    let mut applied = Vec::with_capacity(updates.len());
                     for (pos, state) in updates {
-                        if game.interaction.update_known_server_state(&pos, state) {
-                            continue;
-                        }
-                        dirty_sections_for_block(
-                            &mut priority_remesh,
-                            pos.x,
-                            pos.y,
-                            pos.z,
-                            min_y,
-                            n,
-                        );
-                        applied.push((pos, state));
+                        apply_server_block(game, &mut priority_remesh, pos, state);
                     }
-                    game.chunk_store.set_block_states(applied);
                 }
                 NetworkEvent::BlockEntitySync { chunk_pos, entries } => {
                     game.chunk_store.block_entities.retain(|p, _| {
@@ -627,7 +807,7 @@ impl AppCore {
                     let mut ack_dirty: Vec<azalea_core::position::BlockPos> = Vec::new();
                     let snap = game.interaction.acknowledge(
                         seq,
-                        &game.chunk_store.shared,
+                        &game.chunk_store,
                         game.player.position.into(),
                         &mut ack_dirty,
                     );
@@ -638,6 +818,8 @@ impl AppCore {
                     let min_y = game.chunk_store.min_y();
                     let n = game.chunk_store.section_count();
                     for b in ack_dirty {
+                        game.light_engine
+                            .on_block_dirty(&game.chunk_store, b.x, b.y, b.z);
                         dirty_sections_for_block(&mut priority_remesh, b.x, b.y, b.z, min_y, n);
                     }
                 }
@@ -667,6 +849,7 @@ impl AppCore {
                     uuid,
                     entity_type,
                     position,
+                    velocity,
                     y_rot_deg,
                     x_rot_deg,
                     head_y_rot_deg,
@@ -693,12 +876,18 @@ impl AppCore {
                         }
                     }
                     if entity_type == azalea_registry::builtin::EntityKind::Item {
-                        game.item_entity_store.spawn_item(id, position);
+                        game.item_entity_store.spawn_item(id, position, velocity);
                     }
                 }
-                NetworkEvent::EntityMoved { id, dx, dy, dz } => {
+                NetworkEvent::EntityMoved {
+                    id,
+                    dx,
+                    dy,
+                    dz,
+                    on_ground,
+                } => {
                     game.entity_store.move_living_delta(id, dx, dy, dz);
-                    game.item_entity_store.move_delta(id, dx, dy, dz);
+                    game.item_entity_store.move_delta(id, dx, dy, dz, on_ground);
                 }
                 NetworkEvent::EntityMovedRotated {
                     id,
@@ -707,22 +896,73 @@ impl AppCore {
                     dz,
                     y_rot_deg,
                     x_rot_deg,
+                    on_ground,
                 } => {
                     game.entity_store.move_living_delta(id, dx, dy, dz);
                     game.entity_store
                         .update_living_rotation(id, y_rot_deg, x_rot_deg);
-                    game.item_entity_store.move_delta(id, dx, dy, dz);
+                    game.item_entity_store.move_delta(id, dx, dy, dz, on_ground);
+                }
+                NetworkEvent::EntityMotion { id, velocity } => {
+                    game.item_entity_store.set_motion(id, velocity);
                 }
                 NetworkEvent::EntityTeleported {
                     id,
                     position,
+                    velocity,
                     y_rot_deg,
                     x_rot_deg,
+                    on_ground,
                 } => {
                     game.entity_store.teleport_living(id, position);
                     game.entity_store
                         .update_living_rotation(id, y_rot_deg, x_rot_deg);
-                    game.item_entity_store.teleport(id, position);
+                    game.item_entity_store
+                        .teleport(id, position, velocity, on_ground);
+                }
+                NetworkEvent::LevelEvent {
+                    event_type,
+                    pos,
+                    data,
+                } => {
+                    // Vanilla `LevelEventHandler` case 2001 (block break).
+                    // The server excludes the breaking player from the
+                    // broadcast; the local break's effects come from
+                    // `predict_destroy`. TODO: the other level events.
+                    if event_type == 2001
+                        && let Some(state) = crate::world::block::try_state(data)
+                    {
+                        if !crate::world::block::is_air(state) {
+                            crate::player::interaction::play_break_sound(&self.audio, state, pos);
+                        }
+                        game.particle_store.add_destroy_block_effect(
+                            pos,
+                            state,
+                            renderer.registry(),
+                            &game.chunk_store,
+                            &game.biome_climate,
+                        );
+                    }
+                }
+                NetworkEvent::LevelParticles {
+                    kind,
+                    override_limiter,
+                    pos,
+                    x_dist,
+                    y_dist,
+                    z_dist,
+                    max_speed,
+                    count,
+                } => {
+                    game.particle_store.add_particles_from_packet(
+                        kind,
+                        override_limiter,
+                        pos,
+                        glam::dvec3(x_dist as f64, y_dist as f64, z_dist as f64),
+                        max_speed as f64,
+                        count,
+                        renderer.camera_render_position(),
+                    );
                 }
                 NetworkEvent::EntitiesRemoved { ids } => {
                     for id in &ids {
@@ -770,8 +1010,35 @@ impl AppCore {
                 NetworkEvent::SheepEatStart { id } => {
                     game.entity_store.start_sheep_eat(id);
                 }
+                NetworkEvent::FinishUseItem { id } => {
+                    // Vanilla sends event 9 only to the eater; remote players'
+                    // eating effects come from each client simulating their use
+                    // ticks off entity flags (TODO, with third-person items).
+                    if id == game.player.entity_id {
+                        game.interaction.complete_using(
+                            &self.audio,
+                            &mut game.particle_store,
+                            &game.chunk_store,
+                            game.player.position.into(),
+                            game.player.eye_pos().into(),
+                            game.player.look_dir,
+                        );
+                    }
+                }
                 NetworkEvent::CowVariant { id, variant } => {
                     game.entity_store.set_cow_variant(id, variant);
+                }
+                NetworkEvent::VillagerData {
+                    id,
+                    kind,
+                    profession,
+                    level,
+                } => {
+                    game.entity_store
+                        .set_villager_data(id, kind, profession, level);
+                }
+                NetworkEvent::VillagerUnhappy { id, counter } => {
+                    game.entity_store.set_villager_unhappy(id, counter);
                 }
                 NetworkEvent::EntityCustomName { id, name } => {
                     game.entity_store.set_custom_name(id, name);
@@ -936,10 +1203,7 @@ impl AppCore {
                 ));
             self.menu.active_packs = self.resource_packs.active_pack_info();
         }
-        let player_chunk = azalea_core::position::ChunkPos::new(
-            (game.player.position.x as i32).div_euclid(16),
-            (game.player.position.z as i32).div_euclid(16),
-        );
+        let player_chunk = game.player_chunk();
         let min_y_section = game.chunk_store.min_y().div_euclid(16);
         // Edits mesh the affected section(s) immediately on the priority lane,
         // ungated by visibility.
@@ -947,20 +1211,16 @@ impl AppCore {
             let spos = ChunkSectionPos::new(col.x, min_y_section + si, col.z);
             game.enqueue_section_edit(spos, chunk_lod(col, player_chunk));
         }
-        // New chunk loads (and their neighbours, for border lighting) are only
-        // marked dirty here; the visibility re-scan enqueues them gated by tier so
-        // hidden/behind-camera columns don't waste meshing time.
-        let section_count = game.chunk_store.section_count();
-        for &pos in &chunks_to_mesh {
-            for si in 0..section_count {
-                let spos = ChunkSectionPos::new(pos.x, min_y_section + si, pos.z);
-                game.bump_content_gen(spos);
-            }
-        }
-        // Refresh the frustum tiers (throttled to camera movement / new loads),
-        // then enqueue everything that needs meshing — visible-first, with hidden
-        // columns backfilled at a bounded rate so the world still completes.
+        let ms = |t: std::time::Instant| t.elapsed().as_secs_f32() * 1000.0;
+        game.last_update_phases.net_decode_ms = ms(t_net);
+
+        // Enqueue everything that needs meshing; newly lit columns marked
+        // their dirty bits in GameState::update_light. Visibility itself is
+        // GPU-side (the Hi-Z pass), so no CPU visibility refresh runs here.
+        let t_rescan = std::time::Instant::now();
         game.rescan_mesh_jobs(player_chunk);
+        game.last_update_phases.rescan_ms = ms(t_rescan);
+
         disconnect_reason
     }
     pub fn tick_physics(
@@ -984,7 +1244,13 @@ impl AppCore {
         if game.chunk_load_bench.is_some() {
             game.player.velocity = crate::entity::components::Velocity::new(0.0, 0.0, 0.0);
         }
-        movement::tick(&mut game.player, input, &game.chunk_store.shared);
+        movement::tick(
+            &mut game.player,
+            input,
+            &game.chunk_store,
+            game.interaction.use_speed_multiplier(),
+            game.interaction.slow_due_to_using_item(),
+        );
         game.entity_store.tick_living();
         let dx = game.player.position.x - game.player.prev_position.x;
         let dz = game.player.position.z - game.player.prev_position.z;
@@ -1013,36 +1279,55 @@ impl AppCore {
         game.interaction.update_target(
             eye_pos,
             game.player.look_dir,
-            &game.chunk_store.shared,
+            &game.chunk_store,
             &game.entity_store,
-            game.player.game_mode == 1,
+            crate::player::is_creative(game.player.game_mode),
         );
-        let place_block = {
-            let slot = input.selected_slot() as usize;
-            match game.player.inventory.hotbar_slots().get(slot) {
-                Some(stack) if !matches!(stack, azalea_inventory::ItemStack::Empty) => {
-                    let name = crate::player::inventory::item_resource_name(stack.kind());
-                    renderer.registry().placeable_block_for_item(&name)
-                }
-                _ => None,
-            }
+        let held_stack = match game
+            .player
+            .inventory
+            .hotbar_slots()
+            .get(input.selected_slot() as usize)
+        {
+            Some(azalea_inventory::ItemStack::Present(data)) if data.count > 0 => Some(data),
+            _ => None,
         };
+        let place_block = held_stack.and_then(|data| {
+            let name = crate::player::inventory::item_resource_name(data.kind);
+            renderer.registry().placeable_block_for_item(&name)
+        });
+        let hands_empty = held_stack.is_none() && game.player.inventory.offhand().is_empty();
         let dirty = game.interaction.tick(
             input,
-            &game.chunk_store.shared,
+            &game.chunk_store,
             &connection.packet_tx,
             &self.audio,
             game.player.position.into(),
+            game.player.eye_pos().into(),
+            game.player.look_dir,
             game.player.on_ground,
-            game.player.game_mode == 1,
+            crate::player::is_creative(game.player.game_mode),
+            game.player.food,
             input.selected_slot(),
+            held_stack,
             place_block,
+            hands_empty,
+            &mut crate::player::interaction::BreakEffects {
+                particles: &mut game.particle_store,
+                registry: renderer.registry(),
+                biome_climate: &game.biome_climate,
+            },
         );
         if !dirty.is_empty() {
             let min_y = game.chunk_store.min_y();
             let n = game.chunk_store.section_count();
             let mut sections: Vec<(azalea_core::position::ChunkPos, i32)> = Vec::new();
             for b in dirty {
+                // Light lands in this frame's update_light, matching vanilla's
+                // prediction timing (setBlockState queues; the per-frame
+                // ClientLevel.update drains).
+                game.light_engine
+                    .on_block_dirty(&game.chunk_store, b.x, b.y, b.z);
                 dirty_sections_for_block(&mut sections, b.x, b.y, b.z, min_y, n);
             }
             // Player edits are always adjacent (lod 0).

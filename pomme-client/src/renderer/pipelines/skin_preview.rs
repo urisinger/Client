@@ -1,6 +1,7 @@
 use std::slice;
 use std::sync::{Arc, Mutex};
 
+use glam::camera::rh::{proj, view};
 use glam::{Mat4, Vec3};
 use pomme_gpu_allocator::vulkan::{Allocation, Allocator};
 use pyronyx::vk;
@@ -9,14 +10,14 @@ use crate::renderer::{MAX_FRAMES_IN_FLIGHT, shader, util};
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    position: [f32; 3],
-    uv: [f32; 2],
+pub(crate) struct Vertex {
+    pub(crate) position: [f32; 3],
+    pub(crate) uv: [f32; 2],
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct Uniform {
+pub(crate) struct Uniform {
     mvp: [[f32; 4]; 4],
 }
 
@@ -55,6 +56,7 @@ impl SkinPreviewPipeline {
         allocator: &Arc<Mutex<Allocator>>,
         skin_view: vk::ImageView,
         skin_sampler: vk::Sampler,
+        slim: bool,
     ) -> Self {
         let mvp_layout = util::create_descriptor_set_layout(
             device,
@@ -238,7 +240,7 @@ impl SkinPreviewPipeline {
         };
         device.update_descriptor_sets(&[tex_write], &[]);
 
-        let body_verts = build_body_mesh();
+        let body_verts = build_body_mesh(slim);
         let body_bytes = bytemuck::cast_slice(&body_verts);
         let (body_buffer, body_allocation) = util::create_mapped_buffer(
             device,
@@ -248,7 +250,7 @@ impl SkinPreviewPipeline {
             "skin_body",
         );
 
-        let arm_verts = build_right_arm_mesh();
+        let arm_verts = build_right_arm_mesh(slim);
         let arm_bytes = bytemuck::cast_slice(&arm_verts);
         let (arm_buffer, arm_allocation) = util::create_mapped_buffer(
             device,
@@ -328,7 +330,7 @@ impl SkinPreviewPipeline {
         let head_x_rot_rad = head_x_rot_raw * 20.0f32.to_radians();
 
         let fov = 0.6f32;
-        let mut proj = Mat4::perspective_rh(fov, aspect, 0.1, 100.0);
+        let mut proj = proj::directx::perspective(fov, aspect, 0.1, 100.0);
         proj.y_axis.y *= -1.0;
 
         let ndc_x = screen_x * 2.0 - 1.0;
@@ -367,7 +369,7 @@ impl SkinPreviewPipeline {
         let units_to_px = 30.0 * p.gui_scale;
         let half_w = sw / (2.0 * units_to_px);
         let half_h = sh / (2.0 * units_to_px);
-        let mut proj = Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, 0.1, 100.0);
+        let mut proj = proj::directx::orthographic(-half_w, half_w, -half_h, half_h, 0.1, 100.0);
         proj.y_axis.y *= -1.0;
 
         let clip_offset =
@@ -521,10 +523,10 @@ impl SkinPreviewPipeline {
 }
 
 fn camera_view() -> Mat4 {
-    Mat4::look_at_rh(Vec3::new(0.0, 0.0, -4.5), Vec3::ZERO, Vec3::Y)
+    view::look_at_mat4(Vec3::new(0.0, 0.0, -4.5), Vec3::ZERO, Vec3::Y)
 }
 
-fn write_uniform(alloc: &mut Allocation, mvp: &Mat4) {
+pub(crate) fn write_uniform(alloc: &mut Allocation, mvp: &Mat4) {
     let uniform = Uniform {
         mvp: mvp.to_cols_array_2d(),
     };
@@ -532,7 +534,10 @@ fn write_uniform(alloc: &mut Allocation, mvp: &Mat4) {
     alloc.mapped_slice_mut().unwrap()[..bytes.len()].copy_from_slice(bytes);
 }
 
-fn create_pipeline(
+/// The textured-model preview pipeline, shared with the enchanting book
+/// preview. Vanilla's GL-CCW front faces come out clockwise in Vulkan's
+/// y-down framebuffer coords, so this culls the CCW set.
+pub(crate) fn create_pipeline(
     device: &vk::Device,
     render_pass: vk::RenderPass,
     layout: vk::PipelineLayout,
@@ -657,7 +662,7 @@ fn create_pipeline(
             None,
             slice::from_mut(&mut pipeline),
         )
-        .expect("failed to create skin preview pipeline");
+        .expect("failed to create preview pipeline");
 
     device.destroy_shader_module(vert_mod, None);
     device.destroy_shader_module(frag_mod, None);
@@ -781,9 +786,11 @@ fn build_head_mesh() -> Vec<Vertex> {
     v
 }
 
-fn build_body_mesh() -> Vec<Vertex> {
+fn build_body_mesh(slim: bool) -> Vec<Vertex> {
     let mut v = Vec::new();
     let e = 0.25; // overlay inflation for body/limbs
+    let arm_tw: u32 = if slim { 3 } else { 4 };
+    let arm_w = arm_tw as f32;
 
     // Body: addBox(-4, 0, -2, 8, 12, 4) @ (0, 0, 0), UV (16, 16)
     add_box(
@@ -808,9 +815,9 @@ fn build_body_mesh() -> Vec<Vertex> {
         4,
     );
 
-    // Left arm: addBox(-1, -2, -2, 4, 12, 4) @ (5, 2, 0), UV (32, 48)
+    // Left arm: addBox(-1, -2, -2, 4|3, 12, 4) @ (5, 2, 0), UV (32, 48)
     add_box(
-        &mut v, 5.0, 2.0, 0.0, -1.0, -2.0, -2.0, 4.0, 12.0, 4.0, 32, 48, 4, 12, 4,
+        &mut v, 5.0, 2.0, 0.0, -1.0, -2.0, -2.0, arm_w, 12.0, 4.0, 32, 48, arm_tw, 12, 4,
     );
     // Left sleeve overlay: UV (48, 48)
     add_box(
@@ -821,12 +828,12 @@ fn build_body_mesh() -> Vec<Vertex> {
         -1.0 - e,
         -2.0 - e,
         -2.0 - e,
-        4.0 + e * 2.0,
+        arm_w + e * 2.0,
         12.0 + e * 2.0,
         4.0 + e * 2.0,
         48,
         48,
-        4,
+        arm_tw,
         12,
         4,
     );
@@ -879,26 +886,31 @@ fn build_body_mesh() -> Vec<Vertex> {
     v
 }
 
-fn build_right_arm_mesh() -> Vec<Vertex> {
+fn build_right_arm_mesh(slim: bool) -> Vec<Vertex> {
     let mut v = Vec::new();
     let e = 0.25;
+    let arm_tw: u32 = if slim { 3 } else { 4 };
+    let arm_w = arm_tw as f32;
+    let ox = if slim { -2.0 } else { -3.0 };
+    // Right arm: addBox(-3|-2, -2, -2, 4|3, 12, 4) @ (-5, 2, 0), UV (40, 16)
     add_box(
-        &mut v, -5.0, 2.0, 0.0, -3.0, -2.0, -2.0, 4.0, 12.0, 4.0, 40, 16, 4, 12, 4,
+        &mut v, -5.0, 2.0, 0.0, ox, -2.0, -2.0, arm_w, 12.0, 4.0, 40, 16, arm_tw, 12, 4,
     );
+    // Right sleeve overlay: UV (40, 32)
     add_box(
         &mut v,
         -5.0,
         2.0,
         0.0,
-        -3.0 - e,
+        ox - e,
         -2.0 - e,
         -2.0 - e,
-        4.0 + e * 2.0,
+        arm_w + e * 2.0,
         12.0 + e * 2.0,
         4.0 + e * 2.0,
         40,
         32,
-        4,
+        arm_tw,
         12,
         4,
     );

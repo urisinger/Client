@@ -1,3 +1,9 @@
+// Per-thread-heap allocator (see Cargo.toml): keeps the chunk-mesh worker
+// pool's cross-thread Vec churn from serializing on the system heap's global
+// lock and stalling the main thread.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod app;
 mod args;
 mod assets;
@@ -9,6 +15,7 @@ mod entity;
 mod lang;
 mod logging;
 mod net;
+mod particle;
 mod physics;
 mod player;
 mod renderer;
@@ -16,24 +23,17 @@ mod resource_pack;
 mod ui;
 mod user;
 mod util;
+mod version;
 mod world;
 
 use std::sync::Arc;
 
 use clap::Parser;
+use pomme_protocol::ProtocolVersion;
+use pomme_protocol::version::{LATEST, VERSIONS};
 
 use crate::app::App;
 use crate::user::UserData;
-
-/// Maps all supported versions to their protocol version.
-/// Snapshots encode as `(1 << 30) | base_protocol`.
-/// KEEP IN SYNC WITH pomme-launcher/src-tauri/src/lib.rs
-const VERSION_PROTOCOL_MAP: [(&str, i32); 4] = [
-    ("26.2", 776),
-    ("26.1", 775),
-    ("26.1.1-rc-1", 0x40000130),
-    ("26.1.1", 775),
-];
 
 fn main() {
     let args = args::LaunchArgs::parse();
@@ -57,22 +57,22 @@ fn main() {
         }
     }
 
-    let version = args
-        .version
-        .as_deref()
-        .unwrap_or_else(|| VERSION_PROTOCOL_MAP.first().unwrap().0);
+    let version = args.version.as_deref().unwrap_or(LATEST.name);
 
-    if !VERSION_PROTOCOL_MAP.iter().any(|(v, _)| v == &version) {
-        eprintln!(
-            "{version} is not currently supported. Supported versions: {}",
-            VERSION_PROTOCOL_MAP
-                .iter()
-                .map(|(v, _)| *v)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        #[cfg(not(debug_assertions))]
-        std::process::exit(1);
+    match ProtocolVersion::from_name(version) {
+        Some(v) => version::set_selected_protocol(v.protocol),
+        None => {
+            eprintln!(
+                "{version} is not currently supported. Supported versions: {}",
+                VERSIONS
+                    .iter()
+                    .map(|v| v.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            #[cfg(not(debug_assertions))]
+            std::process::exit(1);
+        }
     }
 
     let data_dirs = dirs::DataDirs::resolve(
@@ -89,6 +89,9 @@ fn main() {
     }
     let _guard = logging::init(&log_dir);
 
+    // Block-state tables must be loaded before any world/render code runs.
+    world::block::init(version);
+
     if let Err(e) = data_dirs.verify() {
         eprintln!("Failed to verify directories: {e}");
         std::process::exit(1);
@@ -96,7 +99,16 @@ fn main() {
     data_dirs.ensure_game_dir().ok();
     tracing::info!("Installation directory: {}", data_dirs.game_dir.display());
 
-    let rt = Arc::new(tokio::runtime::Runtime::new().expect("Failed to create tokio runtime"));
+    // A single connection needs only a few async workers; the default runtime
+    // spawns one per core and floods them decoding the chunk-load burst, starving
+    // the render/mesh threads. Cap it so those cores stay free.
+    let rt = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime"),
+    );
 
     let user = UserData::from_args(args.username, args.uuid, args.access_token);
 

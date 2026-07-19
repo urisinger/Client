@@ -2,9 +2,22 @@ use azalea_core::position::BlockPos;
 use azalea_inventory::ItemStack;
 use glam::DVec3;
 
-use super::common::{FONT_SIZE, WHITE, push_item_count};
+use super::common::{FONT_SIZE, TextWidthFn, WHITE, push_item_count};
 use crate::player::inventory::item_resource_name;
 use crate::renderer::pipelines::menu_overlay::{MenuElement, SpriteId};
+use crate::world::waypoints::{LocatorDot, PitchDirection, WaypointStyleId};
+
+/// Which bar occupies the slot above the hotbar (vanilla `ContextualInfo`).
+// TODO: JumpableVehicle bar.
+pub enum ContextualBarKind<'a> {
+    Empty,
+    Experience,
+    Locator {
+        dots: &'a [LocatorDot],
+        arrow_frame_1: bool,
+    },
+}
+
 pub struct FrameTimings {
     pub frame_ms: f32,
     pub cull_ms: f32,
@@ -21,7 +34,12 @@ pub struct DebugInfo<'a> {
     pub position: DVec3,
     pub y_rot_deg: f32,
     pub x_rot_deg: f32,
-    pub target_block: Option<(BlockPos, azalea_core::direction::Direction, String)>,
+    pub target_block: Option<(
+        BlockPos,
+        azalea_core::direction::Direction,
+        String,
+        Vec<String>,
+    )>,
     pub chunk_count: u32,
     pub sections_drawn: u32,
     pub occlusion_on: bool,
@@ -70,15 +88,19 @@ pub fn build_hud(
     health: f32,
     food: u32,
     armor: u32,
-    air_supply: i32,
+    // Gated to survival by the caller.
+    air_bubbles: Option<AirBubbles>,
     eyes_in_water: bool,
+    tick: u64,
     experience_level: i32,
     experience_progress: f32,
+    bar: ContextualBarKind<'_>,
     game_mode: u8,
     hotbar: &[ItemStack],
     first_person: bool,
     debug: Option<&DebugInfo<'_>>,
     gui_scale_setting: u32,
+    text_width_fn: TextWidthFn,
 ) {
     let gs = gui_scale(screen_w, screen_h, gui_scale_setting);
     let cx = screen_w / 2.0;
@@ -87,7 +109,7 @@ pub fn build_hud(
         build_crosshair(elements, cx, cy);
     }
     if let Some(info) = debug {
-        build_debug_overlay(elements, info, gs);
+        build_debug_overlay(elements, info, gs, text_width_fn);
     }
     let hotbar_w = HOTBAR_W * gs;
     let hotbar_h = HOTBAR_H * gs;
@@ -170,99 +192,111 @@ pub fn build_hud(
                 gs,
             );
         }
-        let xp_w = XP_BAR_W * gs;
-        let xp_h = XP_BAR_H * gs;
-        let xp_x = (cx - xp_w / 2.0).round();
-        let xp_y = (hotbar_y - xp_h - 2.0 * gs).round();
+    }
+
+    let bar_w = XP_BAR_W * gs;
+    let bar_h = XP_BAR_H * gs;
+    let bar_x = (cx - bar_w / 2.0).round();
+    let bar_y = (hotbar_y - bar_h - 2.0 * gs).round();
+
+    let bar_background = match bar {
+        ContextualBarKind::Experience => Some(SpriteId::ExperienceBarBackground),
+        ContextualBarKind::Locator { .. } => Some(SpriteId::LocatorBarBackground),
+        ContextualBarKind::Empty => None,
+    };
+    if let Some(sprite) = bar_background {
         elements.push(MenuElement::Image {
-            x: xp_x,
-            y: xp_y,
-            w: xp_w,
-            h: xp_h,
-            sprite: SpriteId::ExperienceBarBackground,
+            x: bar_x,
+            y: bar_y,
+            w: bar_w,
+            h: bar_h,
+            sprite,
             tint: WHITE,
         });
-        let fill_px = (experience_progress.clamp(0.0, 1.0) * XP_BAR_W).ceil() as i32;
+    }
+
+    if matches!(bar, ContextualBarKind::Experience) {
+        // Vanilla ExperienceBar: (int)(experienceProgress * 183).
+        let fill_px = (experience_progress.clamp(0.0, 1.0) * 183.0) as i32;
         if fill_px > 0 {
             let fill_w = (fill_px as f32 * gs).round();
             elements.push(MenuElement::ScissorPush {
-                x: xp_x,
-                y: xp_y,
+                x: bar_x,
+                y: bar_y,
                 w: fill_w,
-                h: xp_h,
+                h: bar_h,
             });
             elements.push(MenuElement::Image {
-                x: xp_x,
-                y: xp_y,
-                w: xp_w,
-                h: xp_h,
+                x: bar_x,
+                y: bar_y,
+                w: bar_w,
+                h: bar_h,
                 sprite: SpriteId::ExperienceBarProgress,
                 tint: WHITE,
             });
             elements.push(MenuElement::ScissorPop);
         }
-        if experience_level > 0 {
-            let text = experience_level.to_string();
-            let fs = FONT_SIZE * gs;
-            let ty = (xp_y - 6.0 * gs).round();
-            let shadow = [0.0, 0.0, 0.0, 1.0];
-            let main = [0.5, 1.0, 0.125, 1.0];
-            for (dx, dy) in [
-                (1.0, 0.0),
-                (-1.0, 0.0),
-                (0.0, 1.0),
-                (0.0, -1.0),
-                (1.0, 1.0),
-                (1.0, -1.0),
-                (-1.0, 1.0),
-                (-1.0, -1.0),
-            ] {
-                elements.push(MenuElement::Text {
-                    x: (cx + dx * gs).round(),
-                    y: (ty + dy * gs).round(),
-                    text: text.clone(),
-                    scale: fs,
-                    color: shadow,
-                    centered: true,
-                });
-            }
+    }
+
+    // Vanilla draws the level number over whichever bar is showing, between
+    // the background and the locator dots.
+    if is_survival && experience_level > 0 {
+        let text = experience_level.to_string();
+        let fs = FONT_SIZE * gs;
+        let ty = (bar_y - 6.0 * gs).round();
+        let shadow = [0.0, 0.0, 0.0, 1.0];
+        let main = [0.5, 1.0, 0.125, 1.0];
+        for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
             elements.push(MenuElement::Text {
-                x: cx,
-                y: ty,
-                text,
+                x: (cx + dx * gs).round(),
+                y: (ty + dy * gs).round(),
+                text: text.clone(),
                 scale: fs,
-                color: main,
+                color: shadow,
                 centered: true,
             });
         }
+        elements.push(MenuElement::Text {
+            x: cx,
+            y: ty,
+            text,
+            scale: fs,
+            color: main,
+            centered: true,
+        });
     }
-    let max_air = crate::player::MAX_AIR_SUPPLY;
-    if is_survival && (eyes_in_water || air_supply < max_air) {
-        let air = air_supply.clamp(0, max_air);
-        let bubble_count =
-            |offset: i32| -> i32 { (((air + offset) * 10 + max_air - 1) / max_air).clamp(0, 10) };
-        let full_bubbles = bubble_count(-2);
-        let popping_pos = bubble_count(0);
-        let empty_delay = if air == 0 || !eyes_in_water { 0 } else { 1 };
-        let empty_bubbles = 10 - bubble_count(empty_delay);
-        let is_popping = full_bubbles != popping_pos;
-        let bubble_y = (status_bar_y - ICON_SIZE * gs - 1.0 * gs).round();
-        let stride = ICON_STRIDE * gs;
+
+    if let ContextualBarKind::Locator {
+        dots,
+        arrow_frame_1,
+    } = bar
+    {
+        build_locator_dots(elements, bar_x, bar_y, gs, dots, arrow_frame_1);
+    }
+
+    if let Some(bubbles) = air_bubbles {
+        let bubble_y = (status_bar_y - (ICON_SIZE * 2.0 + 1.0) * gs).round();
         let icon_size = ICON_SIZE * gs;
+        let mut rng = crate::util::JavaRandom::new((tick as i64).wrapping_mul(312871));
+        let wobbling = bubbles.empty == 10 && tick.is_multiple_of(2);
         for b in 1..=10i32 {
-            let sprite = if b <= full_bubbles {
+            let mut y = bubble_y;
+            let sprite = if b <= bubbles.full {
                 SpriteId::AirFull
-            } else if is_popping && b == popping_pos && eyes_in_water {
+            } else if bubbles.is_popping && b == bubbles.popping_pos && eyes_in_water {
                 SpriteId::AirBursting
-            } else if b <= 10 - empty_bubbles {
+            } else if b <= 10 - bubbles.empty {
                 continue;
             } else {
+                if wobbling {
+                    y += rng.next_int(2) as f32 * gs;
+                }
                 SpriteId::AirEmpty
             };
-            let x = (hotbar_x + hotbar_w - (b - 1) as f32 * stride - icon_size).round();
+            let x = icon_row_x_rtl(hotbar_x + hotbar_w, b - 1, gs);
             elements.push(MenuElement::Image {
                 x,
-                y: bubble_y,
+                y,
                 w: icon_size,
                 h: icon_size,
                 sprite,
@@ -271,6 +305,117 @@ pub fn build_hud(
         }
     }
 }
+
+/// Right-aligned status icon x, matching vanilla `xRight - i * 8 - 9`.
+fn icon_row_x_rtl(x_right: f32, i: i32, gs: f32) -> f32 {
+    (x_right - i as f32 * ICON_STRIDE * gs - ICON_SIZE * gs).round()
+}
+
+pub struct AirBubbles {
+    pub full: i32,
+    pub popping_pos: i32,
+    pub empty: i32,
+    pub is_popping: bool,
+}
+
+/// None when the air row is hidden (full air and not underwater).
+pub fn air_bubbles(air_supply: i32, eyes_in_water: bool) -> Option<AirBubbles> {
+    let max_air = crate::player::MAX_AIR_SUPPLY;
+    if !eyes_in_water && air_supply >= max_air {
+        return None;
+    }
+    let air = air_supply.clamp(0, max_air);
+    let bubble_count =
+        |offset: i32| -> i32 { (((air + offset) * 10 + max_air - 1) / max_air).clamp(0, 10) };
+    let full = bubble_count(-2);
+    let popping_pos = bubble_count(0);
+    let empty_delay = if air == 0 || !eyes_in_water { 0 } else { 1 };
+    Some(AirBubbles {
+        full,
+        popping_pos,
+        empty: 10 - bubble_count(empty_delay),
+        is_popping: full != popping_pos,
+    })
+}
+
+fn locator_dot_sprite(style: WaypointStyleId, index: usize) -> SpriteId {
+    const DEFAULT: [SpriteId; 4] = [
+        SpriteId::LocatorDotDefault0,
+        SpriteId::LocatorDotDefault1,
+        SpriteId::LocatorDotDefault2,
+        SpriteId::LocatorDotDefault3,
+    ];
+    match style {
+        WaypointStyleId::Default => DEFAULT[index.min(3)],
+        WaypointStyleId::Bowtie => {
+            if index == 0 {
+                SpriteId::LocatorDotBowtie
+            } else {
+                DEFAULT[(index - 1).min(3)]
+            }
+        }
+        WaypointStyleId::Missing => SpriteId::LocatorDotMissing,
+    }
+}
+
+fn build_locator_dots(
+    elements: &mut Vec<MenuElement>,
+    bar_x: f32,
+    bar_y: f32,
+    gs: f32,
+    dots: &[LocatorDot],
+    arrow_frame_1: bool,
+) {
+    // Vanilla centers dots on ceil((gui_w - 9) / 2) while the bar's left edge
+    // is (gui_w - 182) / 2; the offset between them is 87 GUI px at any width.
+    for dot in dots {
+        let c = dot.color;
+        let tint = [
+            (c >> 16 & 0xFF) as f32 / 255.0,
+            (c >> 8 & 0xFF) as f32 / 255.0,
+            (c & 0xFF) as f32 / 255.0,
+            (c >> 24) as f32 / 255.0,
+        ];
+        elements.push(MenuElement::Image {
+            x: (bar_x + (87 + dot.dot_position) as f32 * gs).round(),
+            y: (bar_y - 2.0 * gs).round(),
+            w: 9.0 * gs,
+            h: 9.0 * gs,
+            sprite: locator_dot_sprite(dot.style, dot.sprite_index),
+            tint,
+        });
+        let arrow = match dot.pitch {
+            PitchDirection::None => None,
+            PitchDirection::Up => Some((
+                -6.0,
+                if arrow_frame_1 {
+                    SpriteId::LocatorArrowUp1
+                } else {
+                    SpriteId::LocatorArrowUp0
+                },
+            )),
+            PitchDirection::Down => Some((
+                6.0,
+                if arrow_frame_1 {
+                    SpriteId::LocatorArrowDown1
+                } else {
+                    SpriteId::LocatorArrowDown0
+                },
+            )),
+        };
+        if let Some((dy, sprite)) = arrow {
+            elements.push(MenuElement::Image {
+                x: (bar_x + (88 + dot.dot_position) as f32 * gs).round(),
+                y: (bar_y + dy * gs).round(),
+                w: 7.0 * gs,
+                h: 5.0 * gs,
+                sprite,
+                tint: WHITE,
+            });
+        }
+    }
+}
+
 fn build_crosshair(elements: &mut Vec<MenuElement>, cx: f32, cy: f32) {
     elements.push(MenuElement::Rect {
         x: cx - CROSSHAIR_SIZE,
@@ -309,7 +454,7 @@ fn build_status_bar(
     let has_half = halves % 2 == 1;
     for i in 0..10u8 {
         let x = if right_to_left {
-            (x_start - (i as f32 + 1.0) * stride).round()
+            icon_row_x_rtl(x_start, i as i32, gs)
         } else {
             (x_start + i as f32 * stride).round()
         };
@@ -341,7 +486,13 @@ fn build_status_bar(
         }
     }
 }
-fn build_debug_overlay(elements: &mut Vec<MenuElement>, info: &DebugInfo<'_>, gs: f32) {
+
+fn build_debug_overlay(
+    elements: &mut Vec<MenuElement>,
+    info: &DebugInfo<'_>,
+    gs: f32,
+    text_width_fn: TextWidthFn,
+) {
     let fs = super::common::FONT_SIZE * gs;
     let pad = 4.0 * gs;
     let pos = info.position;
@@ -380,16 +531,20 @@ fn build_debug_overlay(elements: &mut Vec<MenuElement>, info: &DebugInfo<'_>, gs
             None => "Mesh gate: off (meshing all)".to_string(),
         },
     ];
-    if let Some((target, face, name)) = &info.target_block {
+
+    if let Some((target, face, name, props)) = &info.target_block {
         left_lines.push(String::new());
         left_lines.push(format!(
             "Targeted Block: {}, {}, {}",
             target.x, target.y, target.z
         ));
         left_lines.push(format!("minecraft:{name}"));
+        left_lines.extend(props.iter().cloned());
         left_lines.push(format!("Face: {:?}", face));
     }
-    push_debug_lines(elements, &left_lines, pad, pad, fs, true);
+
+    push_debug_lines(elements, &left_lines, pad, pad, fs, true, text_width_fn);
+
     let mut right_lines: Vec<String> = vec![
         info.vulkan_version.to_string(),
         format!("GPU: {}", info.gpu_name),
@@ -408,7 +563,15 @@ fn build_debug_overlay(elements: &mut Vec<MenuElement>, info: &DebugInfo<'_>, gs
         right_lines.push(format!("  Visibility: {:.2}ms", t.visibility_ms));
     }
     let right_x = info.screen_w as f32 - pad;
-    push_debug_lines(elements, &right_lines, right_x, pad, fs, false);
+    push_debug_lines(
+        elements,
+        &right_lines,
+        right_x,
+        pad,
+        fs,
+        false,
+        text_width_fn,
+    );
 }
 fn push_debug_lines(
     elements: &mut Vec<MenuElement>,
@@ -417,6 +580,7 @@ fn push_debug_lines(
     start_y: f32,
     fs: f32,
     left_align: bool,
+    text_width_fn: TextWidthFn,
 ) {
     let line_h = fs * 1.25;
     for (i, line) in lines.iter().enumerate() {
@@ -427,7 +591,7 @@ fn push_debug_lines(
         let tx = if left_align {
             x
         } else {
-            x - line.len() as f32 * fs * 0.6
+            x - text_width_fn(line, fs)
         };
         elements.push(MenuElement::Text {
             x: tx,

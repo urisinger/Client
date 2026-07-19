@@ -8,7 +8,7 @@ use super::aabb::Aabb;
 use super::collision::{no_collision, resolve_collision};
 use crate::app::input::{self, InputState};
 use crate::player::{CROUCH_HEIGHT, LocalPlayer, STANDING_HEIGHT};
-use crate::world::chunk::SharedChunkStore;
+use crate::world::chunk::ChunkStore;
 
 const GRAVITY: f64 = 0.08;
 const JUMP_VELOCITY: f64 = 0.42;
@@ -38,19 +38,37 @@ const SPRINT_HUNGER_THRESHOLD: u32 = 6;
 const DEFAULT_SPRINT_WINDOW: u32 = 7;
 const MINOR_COLLISION_ANGLE: f64 = 0.13962634;
 
-pub fn tick(player: &mut LocalPlayer, input: &InputState, chunk_store: &SharedChunkStore) {
+pub fn tick(
+    player: &mut LocalPlayer,
+    input: &InputState,
+    chunk_store: &ChunkStore,
+    use_speed_multiplier: f64,
+    slow_due_to_using_item: bool,
+) {
     player.update_water_state(chunk_store);
     update_crouch_state(player, input, chunk_store);
     player.tick_eye_height();
 
+    // Vanilla `LocalPlayer.modifyInput`: an in-use item scales the movement
+    // input by its `UseEffects` speed multiplier (0.2 for food).
     let (forward, strafe) = movement_input(input, player.crouching);
+    let (forward, strafe) = (
+        forward * use_speed_multiplier,
+        strafe * use_speed_multiplier,
+    );
     let forward_pressed = input.key_pressed(KeyCode::KeyW)
         || input
             .get_gamepad_left_analog()
             .map(|vec| vec.y > input::STICK_MOVEMENT_THRESHOLD)
             .unwrap_or(false);
 
-    update_sprint_state(player, input, forward, forward_pressed);
+    update_sprint_state(
+        player,
+        input,
+        forward,
+        forward_pressed,
+        slow_due_to_using_item,
+    );
 
     let (sin_y_rot, cos_y_rot) = (player.look_dir.y_rot_rad() as f64).sin_cos();
 
@@ -83,7 +101,7 @@ pub fn tick(player: &mut LocalPlayer, input: &InputState, chunk_store: &SharedCh
 fn tick_land(
     player: &mut LocalPlayer,
     input: &InputState,
-    chunk_store: &SharedChunkStore,
+    chunk_store: &ChunkStore,
     forward: f64,
     strafe: f64,
     sin_y_rot: f64,
@@ -134,7 +152,7 @@ fn tick_land(
 fn tick_water(
     player: &mut LocalPlayer,
     input: &InputState,
-    chunk_store: &SharedChunkStore,
+    chunk_store: &ChunkStore,
     forward: f64,
     strafe: f64,
     sin_y_rot: f64,
@@ -188,7 +206,7 @@ fn tick_water(
 fn apply_collision(
     player: &mut LocalPlayer,
     input: &InputState,
-    chunk_store: &SharedChunkStore,
+    chunk_store: &ChunkStore,
     forward: f64,
     strafe: f64,
     sin_y_rot: f64,
@@ -248,16 +266,22 @@ fn update_sprint_state(
     input: &InputState,
     forward: f64,
     forward_pressed: bool,
+    slow_due_to_using_item: bool,
 ) {
     if player.sprint_toggle_timer > 0 {
         player.sprint_toggle_timer -= 1;
     }
-    if input.performing_action(input::Action::Sneak) {
+    if input.performing_action(input::Action::Sneak) || slow_due_to_using_item {
         player.sprint_toggle_timer = 0;
     }
 
     // Crouching blocks starting a sprint but doesn't stop one in progress.
-    let can_sprint = forward > 0.0 && player.food > SPRINT_HUNGER_THRESHOLD && !player.crouching;
+    // Vanilla `canStartSprinting` also denies it while slowed by an item use,
+    // and the slowed input impulse (< 0.8) stops a sprint in progress.
+    let can_sprint = forward > 0.0
+        && player.food > SPRINT_HUNGER_THRESHOLD
+        && !player.crouching
+        && !slow_due_to_using_item;
 
     if input.performing_action(input::Action::Sprint) && can_sprint {
         player.sprinting = true;
@@ -270,18 +294,16 @@ fn update_sprint_state(
         player.sprint_toggle_timer = DEFAULT_SPRINT_WINDOW;
     }
 
-    if player.sprinting && (forward <= 0.0 || player.food <= SPRINT_HUNGER_THRESHOLD) {
+    if player.sprinting
+        && (forward <= 0.0 || player.food <= SPRINT_HUNGER_THRESHOLD || slow_due_to_using_item)
+    {
         player.sprinting = false;
     }
 }
 
 // Forces the crouch pose under ceilings too low to stand in; flying, riding
 // and sleeping aren't simulated.
-fn update_crouch_state(
-    player: &mut LocalPlayer,
-    input: &InputState,
-    chunk_store: &SharedChunkStore,
-) {
+fn update_crouch_state(player: &mut LocalPlayer, input: &InputState, chunk_store: &ChunkStore) {
     player.crouching = player.game_mode != 3
         && !player.swimming
         && can_fit_with_height(chunk_store, player.position.into(), CROUCH_HEIGHT)
@@ -289,7 +311,7 @@ fn update_crouch_state(
             || !can_fit_with_height(chunk_store, player.position.into(), STANDING_HEIGHT));
 }
 
-fn can_fit_with_height(chunk_store: &SharedChunkStore, pos: DVec3, height: f64) -> bool {
+fn can_fit_with_height(chunk_store: &ChunkStore, pos: DVec3, height: f64) -> bool {
     no_collision(
         chunk_store,
         &Aabb::from_center(pos, PLAYER_HALF_WIDTH, height / 2.0).deflate(1.0e-7),
@@ -299,7 +321,7 @@ fn can_fit_with_height(chunk_store: &SharedChunkStore, pos: DVec3, height: f64) 
 // While holding shift on the ground, clamp the horizontal move so the player
 // can't fall further than the step height.
 fn back_off_from_edge(
-    chunk_store: &SharedChunkStore,
+    chunk_store: &ChunkStore,
     bb: &Aabb,
     delta: DVec3,
     shift_down: bool,
@@ -347,7 +369,7 @@ fn back_off_from_edge(
 }
 
 fn can_fall_at_least(
-    chunk_store: &SharedChunkStore,
+    chunk_store: &ChunkStore,
     bb: &Aabb,
     dx: f64,
     dz: f64,

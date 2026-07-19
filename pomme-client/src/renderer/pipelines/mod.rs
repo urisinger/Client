@@ -1,6 +1,7 @@
 pub mod block_entity;
 pub mod block_overlay;
 pub mod blur;
+pub mod book_preview;
 pub mod chunk;
 pub mod chunk_borders;
 pub mod clouds;
@@ -13,6 +14,7 @@ pub mod item_display;
 pub mod item_entity;
 pub mod menu_overlay;
 pub mod panorama;
+pub mod particle;
 pub mod skin_preview;
 pub mod sky;
 pub mod weather;

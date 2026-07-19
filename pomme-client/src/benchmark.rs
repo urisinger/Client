@@ -261,6 +261,40 @@ fn radius_from_chunk_count(count: u32) -> u32 {
     (((count as f32).sqrt() - 1.0) / 2.0).round().max(0.0) as u32
 }
 
+/// `update_game`'s CPU phase timings — the per-frame work not covered by the
+/// render timings. Set each frame and folded into [`FrameBreakdown`].
+/// `update_ms` is the whole-`update_game` wall time (including the render
+/// call); if it is far below `total_ms`, the hitch is outside `update_game`
+/// (framerate limiter / OS scheduling / inter-frame gap) rather than in any CPU
+/// phase.
+#[derive(Clone, Copy, Default, serde::Serialize)]
+pub struct UpdatePhases {
+    pub update_ms: f32,
+    pub net_decode_ms: f32,
+    pub visibility_ms: f32,
+    pub rescan_ms: f32,
+    pub mesh_drain_ms: f32,
+    pub upload_ms: f32,
+}
+
+/// Phase split of a run's single worst frame, to localize a hitch. `total_ms`
+/// is the wall-clock frame (`raw_dt`); `render_ms` the `render_frame` portion
+/// (which includes `fence_ms`, the GPU-bound wait); the `update` phases cover
+/// the rest. All sub-timings reflect the same prior frame `raw_dt` measures, so
+/// the split lines up; whatever `total_ms` exceeds the parts is time spent
+/// outside `update_game` (limiter / OS scheduling / inter-frame gap).
+#[derive(Clone, Default, serde::Serialize)]
+pub struct FrameBreakdown {
+    pub total_ms: f32,
+    pub render_ms: f32,
+    pub fence_ms: f32,
+    pub acquire_ms: f32,
+    pub cull_ms: f32,
+    pub present_ms: f32,
+    #[serde(flatten)]
+    pub update: UpdatePhases,
+}
+
 /// One reset→load cycle's measurements.
 #[derive(Clone, serde::Serialize)]
 pub struct ChunkLoadRun {
@@ -270,6 +304,10 @@ pub struct ChunkLoadRun {
     pub time_to_first_secs: f32,
     pub avg_frame_ms: f32,
     pub worst_frame_ms: f32,
+    pub mesh_total_secs: f32,
+    pub mesh_avg_ms: f32,
+    pub queue_avg_ms: f32,
+    pub worst_frame_breakdown: FrameBreakdown,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -306,7 +344,18 @@ pub struct ChunkLoadResult {
     /// feel as chunks mesh and upload.
     pub avg_frame_ms: f32,
     pub worst_frame_ms: f32,
+    /// Summed worker meshing wall time across the run — how much of the load
+    /// was actually spent meshing (divide by worker threads for the
+    /// wall-clock lower bound).
+    pub mesh_total_secs: f32,
+    /// Per-job averages: meshing wall time, and time waiting in the mesh
+    /// queue before a worker picked the job up (queue-bound vs mesh-bound).
+    pub mesh_avg_ms: f32,
+    pub queue_avg_ms: f32,
     pub runs_detail: Vec<ChunkLoadRun>,
+    /// Phase split of the worst frame across the measured runs — what the spike
+    /// was actually spent on.
+    pub worst_frame_breakdown: FrameBreakdown,
     /// "debug" or "release" — see [`build_profile`].
     pub profile: String,
     pub measurement_note: String,
@@ -365,6 +414,8 @@ pub struct ChunkLoadBench {
     first_load_at: Option<Instant>,
     frame_ms_sum: f32,
     frame_ms_max: f32,
+    /// Phase split of the current run's worst frame so far.
+    worst_breakdown: FrameBreakdown,
     frame_samples: u32,
     /// How many runs have finished (warmup + measured).
     runs_done: u32,
@@ -408,6 +459,7 @@ impl ChunkLoadBench {
             first_load_at: None,
             frame_ms_sum: 0.0,
             frame_ms_max: 0.0,
+            worst_breakdown: FrameBreakdown::default(),
             frame_samples: 0,
             runs_done: 0,
             completed: Vec::new(),
@@ -416,7 +468,14 @@ impl ChunkLoadBench {
         }
     }
 
-    pub fn update(&mut self, gpu_loaded: u32, client_cached: u32, frame_ms: f32) -> ChunkLoadStep {
+    pub fn update(
+        &mut self,
+        gpu_loaded: u32,
+        client_cached: u32,
+        frame_ms: f32,
+        timings: &RenderTimings,
+        phases: UpdatePhases,
+    ) -> ChunkLoadStep {
         self.gpu_loaded_count = gpu_loaded;
         self.client_cached_count = client_cached;
 
@@ -449,7 +508,20 @@ impl ChunkLoadBench {
             }
             ChunkPhase::Load => {
                 self.frame_ms_sum += frame_ms;
-                self.frame_ms_max = self.frame_ms_max.max(frame_ms);
+                if frame_ms > self.frame_ms_max {
+                    self.frame_ms_max = frame_ms;
+                    // fence/acquire/present are CPU-side waits the GPU
+                    // timestamp timings no longer measure.
+                    self.worst_breakdown = FrameBreakdown {
+                        total_ms: frame_ms,
+                        render_ms: timings.frame_ms(),
+                        fence_ms: 0.0,
+                        acquire_ms: 0.0,
+                        cull_ms: timings.cull_ms(),
+                        present_ms: 0.0,
+                        update: phases,
+                    };
+                }
                 self.frame_samples += 1;
 
                 if gpu_loaded != self.last_count {
@@ -471,7 +543,6 @@ impl ChunkLoadBench {
                         .first_load_at
                         .map(|t| t.duration_since(self.start).as_secs_f32())
                         .unwrap_or(0.0);
-
                     self.completed.push(ChunkLoadRun {
                         load_secs: elapsed,
                         chunks_per_sec: self.baseline_count as f32 / elapsed.max(0.001),
@@ -479,6 +550,13 @@ impl ChunkLoadBench {
                         avg_frame_ms: self.frame_ms_sum / self.frame_samples.max(1) as f32,
                         worst_frame_ms: self.frame_ms_max,
                         chunk_count: self.baseline_count,
+                        // TODO: per-job mesh/queue timing went away with the
+                        // section dispatcher rewrite; re-feed these when the
+                        // dispatcher reports worker timings again.
+                        mesh_total_secs: 0.0,
+                        mesh_avg_ms: 0.0,
+                        queue_avg_ms: 0.0,
+                        worst_frame_breakdown: self.worst_breakdown.clone(),
                     });
 
                     self.runs_done += 1;
@@ -494,6 +572,7 @@ impl ChunkLoadBench {
                     self.first_load_at = None;
                     self.frame_ms_sum = 0.0;
                     self.frame_ms_max = 0.0;
+                    self.worst_breakdown = FrameBreakdown::default();
                     self.frame_samples = 0;
 
                     ChunkLoadStep::StartTiming
@@ -533,10 +612,22 @@ impl ChunkLoadBench {
             chunks_per_sec: avg(|r| r.chunks_per_sec),
             time_to_first_secs: avg(|r| r.time_to_first_secs),
             avg_frame_ms: avg(|r| r.avg_frame_ms),
+            mesh_total_secs: avg(|r| r.mesh_total_secs),
+            mesh_avg_ms: avg(|r| r.mesh_avg_ms),
+            queue_avg_ms: avg(|r| r.queue_avg_ms),
             worst_frame_ms: measured
                 .iter()
                 .map(|r| r.worst_frame_ms)
                 .fold(0.0, f32::max),
+            worst_frame_breakdown: measured
+                .iter()
+                .max_by(|a, b| {
+                    a.worst_frame_ms
+                        .partial_cmp(&b.worst_frame_ms)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|r| r.worst_frame_breakdown.clone())
+                .unwrap_or_default(),
             runs_detail: measured.to_vec(),
             profile: build_profile().to_owned(),
             measurement_note: MEASUREMENT_NOTE.to_owned(),

@@ -45,6 +45,9 @@ pub struct InputState {
     cursor_moved: bool,
     typed_chars: Vec<char>,
     menu_scroll: f32,
+    /// A focused text field (anvil rename, creative search) is capturing
+    /// keyboard input this frame: letter/digit hotkeys must type, not act.
+    pub text_capture: bool,
     backspace_pressed: bool,
     enter_pressed: bool,
     escape_pressed: bool,
@@ -121,6 +124,7 @@ impl InputState {
             cursor_moved: false,
             typed_chars: Vec::new(),
             menu_scroll: 0.0,
+            text_capture: false,
             backspace_pressed: false,
             enter_pressed: false,
             escape_pressed: false,
@@ -160,12 +164,15 @@ impl InputState {
                     if game.creative_inventory_open {
                         game.close_creative_inventory();
                         should_apply_cursor_grab = true;
+                    } else if game.open_container.is_some() {
+                        game.close_menu();
+                        should_apply_cursor_grab = true;
                     } else if !game.paused
                         && !game.dead
                         && game.player.game_mode != 3
                         && !game.chat.is_open()
                     {
-                        if game.player.game_mode == 1 {
+                        if crate::player::is_creative(game.player.game_mode) {
                             game.creative_inventory_open = true;
                         } else {
                             game.inventory_open = !game.inventory_open;
@@ -183,8 +190,8 @@ impl InputState {
                         should_apply_cursor_grab = true;
                     } else if !game.dead && !game.options_from_game {
                         use crate::ui::pause::PauseScreen;
-                        if game.inventory_open {
-                            game.inventory_open = false;
+                        if game.inventory_open || game.open_container.is_some() {
+                            game.close_menu();
                         } else if game.paused {
                             // Step back through the benchmark sub-screens; close
                             // the menu from the main screen.
@@ -206,8 +213,8 @@ impl InputState {
                     self.recent_actions.remove(&Action::OpenMenu);
                 }
                 if self.action_just_pressed(Action::Close) {
-                    if !game.dead && game.inventory_open {
-                        game.inventory_open = false;
+                    if !game.dead && (game.inventory_open || game.open_container.is_some()) {
+                        game.close_menu();
                         should_apply_cursor_grab = true;
                     }
 
@@ -224,7 +231,7 @@ impl InputState {
                     self.recent_actions.remove(&Action::ChangePerspective);
                 }
                 if self.action_just_pressed(Action::OpenChat) {
-                    if !game.paused && !game.gui_open() {
+                    if !game.paused && !game.gui_open() && !game.chat.is_open() {
                         game.chat.open();
                         should_apply_cursor_grab = true;
                     }
@@ -232,7 +239,7 @@ impl InputState {
                     self.recent_actions.remove(&Action::OpenChat);
                 }
                 if self.action_just_pressed(Action::OpenCommands) {
-                    if !game.paused && !game.gui_open() {
+                    if !game.paused && !game.gui_open() && !game.chat.is_open() {
                         game.chat.open_with_slash();
                         should_apply_cursor_grab = true;
                     }
@@ -435,11 +442,13 @@ impl InputState {
             match event.state {
                 ElementState::Pressed => {
                     self.pressed.insert(code);
-                    if let Some(slot) = hotbar_slot(code) {
+                    if !self.text_capture
+                        && let Some(slot) = hotbar_slot(code)
+                    {
                         self.selected_slot = slot;
                     }
                     match code {
-                        KeyCode::KeyE => {
+                        KeyCode::KeyE if !self.text_capture => {
                             self.recent_actions.insert(Action::ToggleInventory, true);
                         }
                         KeyCode::Escape => {

@@ -4,10 +4,10 @@ use std::path::Path;
 use azalea_block::BlockState;
 use serde::{Deserialize, Serialize};
 
-pub const BLOCK_CACHE_FILE: &str = "block_cache.json";
+pub const BLOCK_CACHE_FILE: &str = "block_cache_v2.json";
 
+use super::model;
 use super::model::BakedModel;
-use super::{BlockStateExt, model};
 use crate::assets::AssetIndex;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +28,10 @@ pub struct FaceTextures {
     pub west: String,
     pub side_overlay: Option<String>,
     pub tint: Tint,
+    /// The model's `particle` texture slot (vanilla `getParticleMaterial`),
+    /// used for block-break particles.
+    #[serde(default)]
+    pub particle: Option<String>,
 }
 
 impl FaceTextures {
@@ -51,6 +55,7 @@ impl FaceTextures {
             west: west.into(),
             side_overlay: side_overlay.map(Into::into),
             tint,
+            particle: None,
         }
     }
 
@@ -69,7 +74,7 @@ pub struct BlockRegistry {
     flat_item_texture_keys: HashMap<String, String>,
     /// Block name -> its single `BlockState`, for one-state blocks (see
     /// `placeable_block_for_item`).
-    placeable_blocks: HashMap<String, BlockState>,
+    placeable_blocks: HashMap<&'static str, BlockState>,
 }
 
 impl BlockRegistry {
@@ -145,13 +150,11 @@ impl BlockRegistry {
     }
 
     pub fn get_textures(&self, state: BlockState) -> Option<&FaceTextures> {
-        let block = state.to_trait();
-        self.textures.get(block.id())
+        self.textures.get(super::block_id(state))
     }
 
     pub fn get_baked_model(&self, state: BlockState) -> Option<&BakedModel> {
-        let block = state.to_trait();
-        let variants = self.baked.get(block.id())?;
+        let variants = self.baked.get(super::block_id(state))?;
 
         if variants.len() == 1 {
             return variants.values().next();
@@ -160,25 +163,24 @@ impl BlockRegistry {
         // Vanilla variant keys only list the properties that affect the model, so
         // match by subset rather than exact string equality (an empty key matches
         // any state, serving as the default variant).
-        let props = block.property_map();
+        let props = super::block_properties(state);
         variants
             .iter()
             .find(|(key, _)| {
-                constraints_match(&props, key.split(',').filter_map(|p| p.split_once('=')))
+                constraints_match(props, key.split(',').filter_map(|p| p.split_once('=')))
             })
             .map(|(_, model)| model)
             .or_else(|| variants.values().next())
     }
 
     pub fn get_multipart_quads(&self, state: BlockState) -> Option<Vec<&model::BakedQuad>> {
-        let block = state.to_trait();
-        let entries = self.multipart.get(block.id())?;
-        let props = block.property_map();
+        let entries = self.multipart.get(super::block_id(state))?;
+        let props = super::block_properties(state);
 
         let mut quads = Vec::new();
         for entry in entries {
             let when = entry.when.iter().map(|(k, v)| (k.as_str(), v.as_str()));
-            if constraints_match(&props, when) {
+            if constraints_match(props, when) {
                 quads.extend(entry.quads.iter());
             }
         }
@@ -187,7 +189,7 @@ impl BlockRegistry {
     }
 
     fn baked_model_flag(&self, state: BlockState, f: impl Fn(&BakedModel) -> bool) -> bool {
-        if state.is_air() {
+        if super::is_air(state) {
             return false;
         }
         self.get_baked_model(state).map(f).unwrap_or(false)
@@ -238,13 +240,12 @@ impl BlockRegistry {
     }
 }
 
-/// Builds the block-name -> single-`BlockState` map by walking every valid
-/// block state and keeping only names that map to exactly one state.
-fn build_placeable_blocks() -> HashMap<String, BlockState> {
-    let mut seen: HashMap<String, Option<BlockState>> = HashMap::new();
-    for state in (0u32..).map_while(|id| BlockState::try_from(id).ok()) {
-        let block = state.to_trait();
-        seen.entry(block.id().to_string())
+/// Builds the block-name -> single-`BlockState` map from the block table,
+/// keeping only names that map to exactly one state.
+fn build_placeable_blocks() -> HashMap<&'static str, BlockState> {
+    let mut seen: HashMap<&'static str, Option<BlockState>> = HashMap::new();
+    for (state, data) in super::all_states() {
+        seen.entry(data.id)
             .and_modify(|v| *v = None)
             .or_insert(Some(state));
     }
@@ -256,13 +257,13 @@ fn build_placeable_blocks() -> HashMap<String, BlockState> {
 /// Whether every `key=value` constraint holds for `props`. A value may list
 /// alternatives separated by `|`, as vanilla multipart `when` clauses do.
 fn constraints_match<'a>(
-    props: &HashMap<&str, &str>,
+    props: &super::PropMap,
     mut constraints: impl Iterator<Item = (&'a str, &'a str)>,
 ) -> bool {
     constraints.all(|(k, v)| {
         props
             .get(k)
-            .is_some_and(|pv| v.split('|').any(|opt| opt == *pv))
+            .is_some_and(|pv| v.split('|').any(|opt| opt == pv))
     })
 }
 

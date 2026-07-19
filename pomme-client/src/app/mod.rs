@@ -118,7 +118,7 @@ impl App {
         Self {
             phase: StateSlot::new(AppPhase::Setup {
                 quick_access_multiplayer,
-                pending_skin_uuid: Some(user.uuid),
+                pending_skin_uuid: user.has_profile.then_some(user.uuid),
             }),
             core: AppCore::new(version, data_dirs, tokio_rt, presence, user),
             occluded: false,
@@ -218,6 +218,9 @@ impl ApplicationHandler for App {
                             uuid: self.core.user.uuid,
                             access_token: self.core.user.access_token.clone(),
                             view_distance: self.core.menu.render_distance as u8,
+                            // TODO: read the saved server list's protocol for
+                            // this address to skip the join-time probe.
+                            protocol: None,
                         },
                     );
 
@@ -337,6 +340,11 @@ impl ApplicationHandler for App {
                                 if code == KeyCode::KeyH && self.core.input.key_pressed(KeyCode::F3)
                                 {
                                     game.advanced_item_tooltips = !game.advanced_item_tooltips;
+                                } else if game.options_from_game {
+                                    let f3_held = self.core.input.key_pressed(KeyCode::F3);
+                                    if !game.handle_debug_key(code, f3_held) {
+                                        self.core.input.on_menu_key_event(&event);
+                                    }
                                 } else if game.chat.is_open() {
                                     match code {
                                         KeyCode::Escape => {
@@ -347,8 +355,12 @@ impl ApplicationHandler for App {
                                             self.core
                                                 .apply_cursor_grab(&gfx.window, Some(&mut game));
                                         }
-                                        KeyCode::F3 => game.show_debug = !game.show_debug,
-                                        _ => self.core.input.on_menu_key_event(&event),
+                                        _ => {
+                                            let f3_held = self.core.input.key_pressed(KeyCode::F3);
+                                            if !game.handle_debug_key(code, f3_held) {
+                                                self.core.input.on_menu_key_event(&event);
+                                            }
+                                        }
                                     }
                                 } else if game.creative_inventory_open {
                                     match code {
@@ -360,8 +372,20 @@ impl ApplicationHandler for App {
                                             self.core
                                                 .apply_cursor_grab(&gfx.window, Some(&mut game));
                                         }
-                                        KeyCode::F3 => game.show_debug = !game.show_debug,
-                                        _ => self.core.input.on_menu_key_event(&event),
+                                        _ => {
+                                            let f3_held = self.core.input.key_pressed(KeyCode::F3);
+                                            if !game.handle_debug_key(code, f3_held) {
+                                                self.core.input.on_menu_key_event(&event);
+                                            }
+                                        }
+                                    }
+                                } else if game.wants_text_input() {
+                                    // A container text field (anvil rename) has
+                                    // focus; keys type into it. Escape still
+                                    // closes via the OpenMenu action.
+                                    let f3_held = self.core.input.key_pressed(KeyCode::F3);
+                                    if !game.handle_debug_key(code, f3_held) {
+                                        self.core.input.on_menu_key_event(&event);
                                     }
                                 } else {
                                     match code {
@@ -376,15 +400,10 @@ impl ApplicationHandler for App {
                                             game.death_confirm = false;
                                             self.core.send_respawn(&connection, &mut game);
                                         }
-                                        KeyCode::F3 => {
-                                            game.show_debug = !game.show_debug;
+                                        _ => {
+                                            let f3_held = self.core.input.key_pressed(KeyCode::F3);
+                                            game.handle_debug_key(code, f3_held);
                                         }
-                                        KeyCode::KeyG
-                                            if self.core.input.key_pressed(KeyCode::F3) =>
-                                        {
-                                            game.show_chunk_borders = !game.show_chunk_borders;
-                                        }
-                                        _ => {}
                                     }
                                 }
                             }
@@ -408,11 +427,14 @@ impl ApplicationHandler for App {
                     AppPhase::InMenu { .. } | AppPhase::Connecting { .. } => {
                         self.core.input.on_menu_scroll(scroll);
                     }
-                    AppPhase::InGame { game, .. } if !game.gui_open() => {
-                        self.core.input.on_scroll(scroll)
-                    }
-                    AppPhase::InGame { game, .. } if game.creative_inventory_open => {
+                    AppPhase::InGame { game, .. }
+                        if game.options_from_game || game.creative_inventory_open =>
+                    {
                         self.core.input.on_menu_scroll(scroll);
+                    }
+                    // TODO: open chat should capture scroll (chat history scrolling)
+                    AppPhase::InGame { game, .. } if game.input_live() => {
+                        self.core.input.on_scroll(scroll)
                     }
                     _ => {}
                 }

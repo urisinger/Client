@@ -1,11 +1,18 @@
 pub mod components;
+pub mod villager;
 
 use std::collections::HashMap;
 
+use azalea_core::position::ChunkPos;
 use azalea_registry::builtin::EntityKind;
 use glam::DVec3;
 
 use crate::entity::components::{LookDirection, Position};
+use crate::entity::villager::{VillagerKind, VillagerProfession};
+use crate::physics::aabb::Aabb;
+use crate::physics::collision::resolve_collision;
+use crate::world::block::{FluidKind, fluid};
+use crate::world::chunk::ChunkStore;
 
 const INTERPOLATION_STEPS: i32 = 3;
 const HURT_DURATION: u8 = 10;
@@ -34,6 +41,12 @@ pub struct LivingEntity {
     pub wool_color: Option<u8>,
     pub is_sheared: bool,
     pub cow_variant: u8,
+    pub villager_kind: VillagerKind,
+    pub villager_profession: VillagerProfession,
+    pub villager_level: u32,
+    /// Villager head-shake timer; shakes while > 0 (vanilla unhappy counter,
+    /// synched then decremented client-side each tick like vanilla does).
+    pub unhappy_counter: i32,
     pub eat_anim_tick: u8,
     pub prev_eat_anim_tick: u8,
     pub hurt_time: u8,
@@ -84,6 +97,10 @@ impl LivingEntity {
             wool_color: None,
             is_sheared: false,
             cow_variant: 0,
+            villager_kind: VillagerKind::default(),
+            villager_profession: VillagerProfession::default(),
+            villager_level: 0,
+            unhappy_counter: 0,
             eat_anim_tick: 0,
             prev_eat_anim_tick: 0,
             hurt_time: 0,
@@ -184,8 +201,10 @@ pub struct ItemEntity {
     /// used for hover height and the 3D-vs-flat copy layout.
     pub min_y: f32,
     pub z_size: f32,
-    interp_target: Position,
-    interp_steps: i32,
+    velocity: DVec3,
+    on_ground: bool,
+    /// Server-authoritative position, tracked from move/teleport packets.
+    server_pos: Position,
 }
 
 struct PickupAnimation {
@@ -229,7 +248,7 @@ impl ItemEntityStore {
         }
     }
 
-    pub fn spawn_item(&mut self, id: i32, position: Position) {
+    pub fn spawn_item(&mut self, id: i32, position: Position, velocity: DVec3) {
         let bob_offset =
             ((id as u32).wrapping_mul(2654435761)) as f32 / u32::MAX as f32 * std::f32::consts::TAU;
         self.items.insert(
@@ -245,8 +264,9 @@ impl ItemEntityStore {
                 is_block_model: false,
                 min_y: -0.5,
                 z_size: 1.0,
-                interp_target: position,
-                interp_steps: 0,
+                velocity,
+                on_ground: false,
+                server_pos: position,
             },
         );
     }
@@ -272,19 +292,44 @@ impl ItemEntityStore {
         }
     }
 
-    /// Apply a server position delta via 3-step interpolation, mirroring
-    /// `move_living_delta`. Items are not simulated locally.
-    pub fn move_delta(&mut self, id: i32, dx: f64, dy: f64, dz: f64) {
+    /// Apply a server position delta: advance the authoritative base and
+    /// snap to it. Items have no interpolation handler in vanilla
+    /// (`moveOrInterpolateTo` -> `setPos`); local physics predicts between
+    /// packets and `prev_position` smooths the render lerp.
+    pub fn move_delta(&mut self, id: i32, dx: f64, dy: f64, dz: f64, on_ground: bool) {
         if let Some(entity) = self.items.get_mut(&id) {
-            entity.interp_target += DVec3::new(dx, dy, dz);
-            entity.interp_steps = INTERPOLATION_STEPS;
+            entity.server_pos += DVec3::new(dx, dy, dz);
+            entity.position = entity.server_pos;
+            entity.on_ground = on_ground;
         }
     }
 
-    pub fn teleport(&mut self, id: i32, position: Position) {
+    pub fn teleport(
+        &mut self,
+        id: i32,
+        position: Position,
+        velocity: Option<DVec3>,
+        on_ground: bool,
+    ) {
         if let Some(entity) = self.items.get_mut(&id) {
-            entity.interp_target = position;
-            entity.interp_steps = INTERPOLATION_STEPS;
+            // Vanilla suppresses the render lerp on jumps over 64 blocks
+            // (`tooBigToInterpolate`).
+            if entity.position.distance_squared(*position) > 4096.0 {
+                entity.prev_position = position;
+            }
+            entity.server_pos = position;
+            entity.position = position;
+            if let Some(velocity) = velocity {
+                entity.velocity = velocity;
+            }
+            entity.on_ground = on_ground;
+        }
+    }
+
+    /// Vanilla `handleSetEntityMotion`.
+    pub fn set_motion(&mut self, id: i32, velocity: DVec3) {
+        if let Some(entity) = self.items.get_mut(&id) {
+            entity.velocity = velocity;
         }
     }
 
@@ -327,14 +372,10 @@ impl ItemEntityStore {
         }
     }
 
-    pub fn tick(&mut self) {
-        for entity in self.items.values_mut() {
+    pub fn tick(&mut self, chunk_store: &ChunkStore) {
+        for (&id, entity) in self.items.iter_mut() {
             entity.prev_position = entity.position;
-            if entity.interp_steps > 0 {
-                let alpha = 1.0 / entity.interp_steps as f64;
-                entity.position = entity.position.lerp(entity.interp_target, alpha);
-                entity.interp_steps -= 1;
-            }
+            tick_item_physics(id, entity, chunk_store);
             entity.age += 1;
         }
         for pickup in &mut self.pickups {
@@ -373,6 +414,76 @@ impl ItemEntityStore {
                 }
             })
             .collect()
+    }
+}
+
+/// Vanilla `ItemEntity.getDefaultGravity`.
+const ITEM_GRAVITY: f64 = 0.04;
+/// Vanilla `Entity.getAirDrag`.
+const ITEM_AIR_DRAG: f64 = 0.98;
+/// Item hitbox is 0.25 cubed (`EntityType.ITEM` dimensions).
+const ITEM_HALF_WIDTH: f64 = 0.125;
+
+/// Client-side port of `ItemEntity.tick` movement: gravity or fluid drift,
+/// collide-and-slide, friction, then the half-speed landing bounce.
+/// Server-only parts (merging, despawn, pickup delay) are omitted.
+fn tick_item_physics(id: i32, entity: &mut ItemEntity, chunk_store: &ChunkStore) {
+    let block_x = entity.position.x.floor() as i32;
+    let block_y = entity.position.y.floor() as i32;
+    let block_z = entity.position.z.floor() as i32;
+    let chunk_pos = ChunkPos::new(block_x.div_euclid(16), block_z.div_euclid(16));
+    if !chunk_store.shared.has_chunk(chunk_pos) {
+        // Don't simulate (and fall) through unloaded terrain.
+        return;
+    }
+
+    let state = chunk_store.get_block_state(block_x, block_y, block_z);
+    let fluid = fluid(state);
+    // Vanilla `getFluidHeight(...) > 0.1`: how far the fluid surface sits
+    // above the item's feet, sampled at the position block.
+    let fluid_height = block_y as f64 + fluid.height() as f64 - entity.position.y;
+    match fluid.kind {
+        FluidKind::Water if fluid_height > 0.1 => apply_item_fluid_movement(entity, 0.99),
+        FluidKind::Lava if fluid_height > 0.1 => apply_item_fluid_movement(entity, 0.95),
+        _ => entity.velocity.y -= ITEM_GRAVITY,
+    }
+
+    // Vanilla rest throttle: a settled item only re-runs collision every
+    // 4th tick. `age` increments after this runs; vanilla's `tickCount`
+    // increments before, hence the +1.
+    let horizontal_sq =
+        entity.velocity.x * entity.velocity.x + entity.velocity.z * entity.velocity.z;
+    if entity.on_ground && horizontal_sq <= 1e-5 && (entity.age as i64 + 1 + id as i64) % 4 != 0 {
+        return;
+    }
+
+    let aabb = Aabb::from_center(entity.position.into(), ITEM_HALF_WIDTH, ITEM_HALF_WIDTH);
+    let (delta, on_ground) = resolve_collision(chunk_store, aabb, entity.velocity.into(), 0.0);
+    entity.position += delta;
+    entity.on_ground = on_ground;
+
+    // TODO: per-block slipperiness (ice/slime); vanilla multiplies by the
+    // friction of the block below, default 0.6.
+    let ground_friction = if on_ground {
+        ITEM_AIR_DRAG * 0.6
+    } else {
+        ITEM_AIR_DRAG
+    };
+    entity.velocity.x *= ground_friction;
+    entity.velocity.y *= ITEM_AIR_DRAG;
+    entity.velocity.z *= ground_friction;
+    if on_ground && entity.velocity.y < 0.0 {
+        entity.velocity.y *= -0.5;
+    }
+}
+
+/// Vanilla `ItemEntity.setFluidMovement`: horizontal drag plus a slow
+/// upward drift toward the surface.
+fn apply_item_fluid_movement(entity: &mut ItemEntity, multiplier: f64) {
+    entity.velocity.x *= multiplier;
+    entity.velocity.z *= multiplier;
+    if entity.velocity.y < 0.06 {
+        entity.velocity.y += 5.0e-4;
     }
 }
 
@@ -451,6 +562,30 @@ impl EntityStore {
         }
     }
 
+    pub fn set_villager_data(
+        &mut self,
+        id: i32,
+        kind: VillagerKind,
+        profession: VillagerProfession,
+        level: u32,
+    ) {
+        if let Some(entity) = self.living.get_mut(&id)
+            && entity.entity_type == EntityKind::Villager
+        {
+            entity.villager_kind = kind;
+            entity.villager_profession = profession;
+            entity.villager_level = level;
+        }
+    }
+
+    pub fn set_villager_unhappy(&mut self, id: i32, counter: i32) {
+        if let Some(entity) = self.living.get_mut(&id)
+            && entity.entity_type == EntityKind::Villager
+        {
+            entity.unhappy_counter = counter;
+        }
+    }
+
     pub fn start_sheep_eat(&mut self, id: i32) {
         if let Some(entity) = self.living.get_mut(&id)
             && entity.entity_type == EntityKind::Sheep
@@ -517,9 +652,13 @@ impl EntityStore {
     }
 
     pub fn has_player_uuid(&self, uuid: &uuid::Uuid) -> bool {
+        self.player_by_uuid(uuid).is_some()
+    }
+
+    pub fn player_by_uuid(&self, uuid: &uuid::Uuid) -> Option<&LivingEntity> {
         self.living
             .values()
-            .any(|entity| entity.player_uuid == Some(*uuid))
+            .find(|entity| entity.player_uuid == Some(*uuid))
     }
 
     pub fn tick_living(&mut self) {
@@ -544,6 +683,9 @@ impl EntityStore {
             }
             if entity.swing_time > 0 {
                 entity.swing_time -= 1;
+            }
+            if entity.unhappy_counter > 0 {
+                entity.unhappy_counter -= 1;
             }
             entity.age_in_ticks = entity.age_in_ticks.wrapping_add(1);
         }
@@ -591,5 +733,6 @@ pub fn is_living_mob(kind: &EntityKind) -> bool {
             | EntityKind::Skeleton
             | EntityKind::Creeper
             | EntityKind::Spider
+            | EntityKind::Villager
     )
 }

@@ -264,7 +264,7 @@ pub(super) fn push_server_status(
             max,
             latency_ms,
             version,
-            protocol_match,
+            compat,
             player_names,
             ..
         } => {
@@ -278,10 +278,12 @@ pub(super) fn push_server_status(
                     spans: line.clone(),
                     scale: fs,
                     centered: false,
+                    shadow: true,
                 });
             }
 
-            let status_sprite = if !protocol_match {
+            let incompatible = *compat == Compat::Incompatible;
+            let status_sprite = if incompatible {
                 SpriteId::Incompatible
             } else {
                 ping_sprite(*latency_ms)
@@ -295,16 +297,12 @@ pub(super) fn push_server_status(
                 tint: WHITE,
             });
 
-            let status_text = if !protocol_match {
+            let status_text = if incompatible {
                 version.clone()
             } else {
                 format!("{online}/{max}")
             };
-            let status_color = if !protocol_match {
-                COL_RED
-            } else {
-                COL_DARK_DIM
-            };
+            let status_color = if incompatible { COL_RED } else { COL_DARK_DIM };
             let pw = text_width_fn(&status_text, fs);
             let status_x = icon_x - pw - 5.0 * gs;
             elements.push(MenuElement::Text {
@@ -317,12 +315,29 @@ pub(super) fn push_server_status(
             });
 
             if common::hit_test(cursor, [icon_x, icon_y, icon_w, icon_h]) {
-                let tip = if !protocol_match {
-                    "Incompatible version!".to_string()
+                if incompatible {
+                    common::push_tooltip(
+                        elements,
+                        cursor,
+                        screen_w,
+                        screen_h,
+                        gs,
+                        "Incompatible version!",
+                    );
                 } else {
-                    format!("{latency_ms} ms")
-                };
-                common::push_tooltip(elements, cursor, screen_w, screen_h, gs, &tip);
+                    let mut lines = Vec::new();
+                    if *compat == Compat::Translated {
+                        lines.push(TooltipLine::new(
+                            format!("Server version: {version}"),
+                            WHITE,
+                        ));
+                    }
+                    lines.push(TooltipLine::right_aligned(
+                        format!("{latency_ms} ms"),
+                        ping_color(*latency_ms),
+                    ));
+                    common::push_tooltip_lines(elements, cursor, screen_w, screen_h, gs, lines);
+                }
             } else if common::hit_test(cursor, [status_x, icon_y, pw, fs])
                 && !player_names.is_empty()
             {
@@ -374,6 +389,7 @@ fn wrap_motd_spans(
             italic: span.italic,
             strikethrough: span.strikethrough,
             underline: span.underline,
+            sga: span.sga,
         };
 
         for part in span.text.split_inclusive([' ', '\n']) {
@@ -423,11 +439,20 @@ fn ping_sprite(ms: u64) -> SpriteId {
     }
 }
 
+fn ping_color(ms: u64) -> [f32; 4] {
+    match ping_sprite(ms) {
+        SpriteId::Ping5 => [0.33, 0.87, 0.33, 1.0],
+        SpriteId::Ping4 | SpriteId::Ping3 => [0.92, 0.65, 0.2, 1.0],
+        _ => COL_RED,
+    }
+}
+
 pub(super) fn push_bottom_text(
     elements: &mut Vec<MenuElement>,
     screen_w: f32,
     screen_h: f32,
     gs: f32,
+    version: &str,
     text_width_fn: &dyn Fn(&str, f32) -> f32,
 ) {
     let fs = 7.0 * gs;
@@ -438,7 +463,7 @@ pub(super) fn push_bottom_text(
     elements.push(MenuElement::Text {
         x: pad,
         y,
-        text: "Minecraft 1.21.11".into(),
+        text: format!("Minecraft {version}"),
         scale: fs,
         color: col,
         centered: false,

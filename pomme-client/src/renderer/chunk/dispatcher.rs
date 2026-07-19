@@ -70,6 +70,9 @@ pub struct ChunkMeshing {
     queue: Arc<MeshQueue>,
     workers: Vec<std::thread::JoinHandle<()>>,
     next_epoch: AtomicU64,
+    grass_colormap: Arc<Colormap>,
+    foliage_colormap: Arc<Colormap>,
+    dry_foliage_colormap: Arc<Colormap>,
     biome_climate: Arc<HashMap<u32, BiomeClimate>>,
 }
 impl ChunkMeshing {
@@ -148,8 +151,21 @@ impl ChunkMeshing {
             queue,
             workers,
             next_epoch: AtomicU64::new(1),
+            grass_colormap,
+            foliage_colormap,
+            dry_foliage_colormap,
             biome_climate,
         }
+    }
+
+    /// The grass/foliage/dry-foliage colormaps, shared with the particle
+    /// tinting.
+    pub fn colormaps(&self) -> (Arc<Colormap>, Arc<Colormap>, Arc<Colormap>) {
+        (
+            Arc::clone(&self.grass_colormap),
+            Arc::clone(&self.foliage_colormap),
+            Arc::clone(&self.dry_foliage_colormap),
+        )
     }
     pub fn clear(&mut self) {
         for cell in &self.update_set.buf {
@@ -337,6 +353,7 @@ impl PendingJob {
             dry_foliage_colormap: Arc::clone(dry_foliage_colormap),
             biome_climate: Arc::clone(biome_climate),
             min_y: shared_chunk_store.min_y(),
+            spos: claim_pos,
         };
         // Stage 3: Execute — Mesh section
         let mesh = mesh_section(

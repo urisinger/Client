@@ -43,11 +43,26 @@ pub struct EntityPart {
     pub parent: Option<usize>,
 }
 
+/// Coordinate space a model's parts and vertices were authored in.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModelConvention {
+    /// Vanilla entity convention: cube Y negated at bake, root pivots at
+    /// `(24 - y)/16` (child pivots just negate y), euler signs (-x, -y, +z).
+    /// All mob models use this.
+    #[default]
+    EntityYDown,
+    /// Vanilla block-entity literal space: y-up, coords/16 relative to the
+    /// block's min corner, pivots at `offset/16`, vanilla ZYX euler with
+    /// unmodified signs. Used by the chest models.
+    BlockYUp,
+}
+
 #[derive(Clone)]
 pub struct BakedEntityModel {
     pub parts: Vec<EntityPart>,
     pub vertices: Vec<ChunkVertex>,
     pub part_ranges: Vec<(u32, u32)>,
+    pub convention: ModelConvention,
     /// Per-part scale (parallel to `parts`), applied about each part's pivot at
     /// transform time. Scales geometry only, never UVs — used for baby mobs
     /// whose head and body shrink by different factors. Default 1.0 for
@@ -77,8 +92,14 @@ impl BakedEntityModel {
             parts,
             vertices,
             part_ranges,
+            convention: ModelConvention::default(),
             part_scales,
         }
+    }
+
+    pub(crate) fn with_convention(mut self, convention: ModelConvention) -> Self {
+        self.convention = convention;
+        self
     }
 
     pub fn compute_part_transforms(&self, anim: &PartAnim) -> Vec<Mat4> {
@@ -107,20 +128,33 @@ impl BakedEntityModel {
                 }
             }
 
-            let offset_x = part.offset.x + extra_translation.x;
-            let offset_y = -(part.offset.y + extra_translation.y - 24.0);
-            let offset_z = part.offset.z + extra_translation.z;
-            let offset = Vec3::new(offset_x, offset_y, offset_z) / 16.0;
+            let pivot = part.offset + extra_translation;
+            let offset = match self.convention {
+                ModelConvention::EntityYDown => {
+                    // The +24 re-bases vanilla's y-down ground plane onto the
+                    // engine's y-up origin; child pivots are relative to their
+                    // parent (already re-based), so they only mirror.
+                    let rebase = if part.parent.is_some() { 0.0 } else { 24.0 };
+                    Vec3::new(pivot.x, rebase - pivot.y, pivot.z)
+                }
+                ModelConvention::BlockYUp => pivot,
+            } / 16.0;
 
             // A quaternion override expresses the exact render-space orientation
-            // directly; otherwise use the legacy per-axis euler product (note the
-            // engine's mixed signs: -x, -y, +z).
-            let rot_mat = match quat_rot {
-                Some(q) => Mat4::from_quat(q),
-                None => {
+            // directly; otherwise use the per-axis euler product: the y-down
+            // convention needs the engine's mixed signs (-x, -y, +z), y-up
+            // matches vanilla's `translateAndRotate` ZYX order verbatim.
+            let rot_mat = match (quat_rot, self.convention) {
+                (Some(q), _) => Mat4::from_quat(q),
+                (None, ModelConvention::EntityYDown) => {
                     Mat4::from_rotation_x(-rot.x)
                         * Mat4::from_rotation_y(-rot.y)
                         * Mat4::from_rotation_z(rot.z)
+                }
+                (None, ModelConvention::BlockYUp) => {
+                    Mat4::from_rotation_z(rot.z)
+                        * Mat4::from_rotation_y(rot.y)
+                        * Mat4::from_rotation_x(rot.x)
                 }
             };
             let scale = self.part_scales.get(i).copied().unwrap_or(1.0);
@@ -300,7 +334,13 @@ pub fn bake_baby_pig_model() -> BakedEntityModel {
     bake_model(parts, 32, 32)
 }
 
-pub fn bake_player_model() -> BakedEntityModel {
+/// `slim` is the 3px-wide-arm (Alex) layout; same texture offsets and pivots,
+/// only the arm boxes differ.
+// TODO: jacket/sleeve/pants overlay layers (only the hat is modeled here).
+// TODO: default-skin-by-UUID selection for players without a fetched skin.
+pub fn bake_player_model(slim: bool) -> BakedEntityModel {
+    let arm_w = if slim { 3.0 } else { 4.0 };
+    let right_arm_ox = if slim { -2.0 } else { -3.0 };
     let parts = vec![
         EntityPart {
             name: "head".into(),
@@ -343,8 +383,8 @@ pub fn bake_player_model() -> BakedEntityModel {
             offset: Vec3::new(-5.0, 2.0, 0.0),
             default_rotation: Vec3::ZERO,
             cubes: vec![ModelCube {
-                origin: Vec3::new(-3.0, -2.0, -2.0),
-                size: Vec3::new(4.0, 12.0, 4.0),
+                origin: Vec3::new(right_arm_ox, -2.0, -2.0),
+                size: Vec3::new(arm_w, 12.0, 4.0),
                 tex_offset: (40, 16),
                 deformation: 0.0,
                 mirror: false,
@@ -357,7 +397,7 @@ pub fn bake_player_model() -> BakedEntityModel {
             default_rotation: Vec3::ZERO,
             cubes: vec![ModelCube {
                 origin: Vec3::new(-1.0, -2.0, -2.0),
-                size: Vec3::new(4.0, 12.0, 4.0),
+                size: Vec3::new(arm_w, 12.0, 4.0),
                 tex_offset: (32, 48),
                 deformation: 0.0,
                 mirror: false,
@@ -1100,6 +1140,240 @@ pub fn bake_baby_sheep_wool_model() -> BakedEntityModel {
     bake_baby_sheep_model()
 }
 
+/// One vanilla `texOffs(u, v).addBox(origin, size)`.
+fn vbox(tex_offset: (u32, u32), origin: (f32, f32, f32), size: (f32, f32, f32)) -> ModelCube {
+    ModelCube {
+        origin: origin.into(),
+        size: size.into(),
+        tex_offset,
+        deformation: 0.0,
+        mirror: false,
+    }
+}
+
+fn vpart(name: &str, parent: Option<usize>, offset: Vec3, cubes: Vec<ModelCube>) -> EntityPart {
+    EntityPart {
+        name: name.into(),
+        offset,
+        default_rotation: Vec3::ZERO,
+        cubes,
+        parent,
+    }
+}
+
+fn villager_parts() -> Vec<EntityPart> {
+    vec![
+        vpart(
+            "head",
+            None,
+            Vec3::ZERO,
+            vec![vbox((0, 0), (-4.0, -10.0, -4.0), (8.0, 10.0, 8.0))],
+        ),
+        vpart(
+            "hat",
+            Some(0),
+            Vec3::ZERO,
+            vec![ModelCube {
+                deformation: 0.51,
+                ..vbox((32, 0), (-4.0, -10.0, -4.0), (8.0, 10.0, 8.0))
+            }],
+        ),
+        EntityPart {
+            default_rotation: Vec3::new(-std::f32::consts::FRAC_PI_2, 0.0, 0.0),
+            ..vpart(
+                "hat_rim",
+                Some(1),
+                Vec3::ZERO,
+                vec![vbox((30, 47), (-8.0, -8.0, -6.0), (16.0, 16.0, 1.0))],
+            )
+        },
+        vpart(
+            "nose",
+            Some(0),
+            Vec3::new(0.0, -2.0, 0.0),
+            vec![vbox((24, 0), (-1.0, -1.0, -6.0), (2.0, 4.0, 2.0))],
+        ),
+        vpart(
+            "body",
+            None,
+            Vec3::ZERO,
+            vec![vbox((16, 20), (-4.0, 0.0, -3.0), (8.0, 12.0, 6.0))],
+        ),
+        vpart(
+            "jacket",
+            Some(4),
+            Vec3::ZERO,
+            vec![ModelCube {
+                deformation: 0.5,
+                ..vbox((0, 38), (-4.0, 0.0, -3.0), (8.0, 20.0, 6.0))
+            }],
+        ),
+        EntityPart {
+            default_rotation: Vec3::new(-0.75, 0.0, 0.0),
+            ..vpart(
+                "arms",
+                None,
+                Vec3::new(0.0, 3.0, -1.0),
+                vec![
+                    vbox((44, 22), (-8.0, -2.0, -2.0), (4.0, 8.0, 4.0)),
+                    ModelCube {
+                        mirror: true,
+                        ..vbox((44, 22), (4.0, -2.0, -2.0), (4.0, 8.0, 4.0))
+                    },
+                    vbox((40, 38), (-4.0, 2.0, -2.0), (8.0, 4.0, 4.0)),
+                ],
+            )
+        },
+        vpart(
+            "right_leg",
+            None,
+            Vec3::new(-2.0, 12.0, 0.0),
+            vec![vbox((0, 22), (-2.0, 0.0, -2.0), (4.0, 12.0, 4.0))],
+        ),
+        vpart(
+            "left_leg",
+            None,
+            Vec3::new(2.0, 12.0, 0.0),
+            vec![ModelCube {
+                mirror: true,
+                ..vbox((0, 22), (-2.0, 0.0, -2.0), (4.0, 12.0, 4.0))
+            }],
+        ),
+    ]
+}
+
+fn baby_villager_parts() -> Vec<EntityPart> {
+    // Vanilla's literal is -1.0472 (~ -PI/3 from the Blockbench export).
+    let arm_pitch = Vec3::new(-std::f32::consts::FRAC_PI_3, 0.0, 0.0);
+    vec![
+        vpart("arms", None, Vec3::new(0.0, 17.5, 0.0), vec![]),
+        EntityPart {
+            default_rotation: arm_pitch,
+            ..vpart(
+                "right_hand",
+                Some(0),
+                Vec3::new(-3.0, 1.4025, -0.9599),
+                vec![
+                    vbox((36, 15), (-1.0, -2.4925, -1.8401), (2.0, 4.0, 2.0)),
+                    vbox((16, 15), (5.0, -2.4925, -1.8401), (2.0, 4.0, 2.0)),
+                ],
+            )
+        },
+        EntityPart {
+            default_rotation: arm_pitch,
+            ..vpart(
+                "middlearm_r1",
+                Some(0),
+                Vec3::new(0.0, 0.9024, -1.8175),
+                vec![vbox((24, 17), (-2.0, -0.9924, -0.9825), (4.0, 2.0, 2.0))],
+            )
+        },
+        vpart(
+            "right_leg",
+            None,
+            Vec3::new(-1.0, 21.5, 0.0),
+            vec![vbox((8, 23), (-1.0, -0.5, -1.0), (2.0, 3.0, 2.0))],
+        ),
+        vpart(
+            "left_leg",
+            None,
+            Vec3::new(1.0, 21.5, 0.0),
+            vec![vbox((0, 23), (-1.0, -0.5, -1.0), (2.0, 3.0, 2.0))],
+        ),
+        vpart(
+            "head",
+            None,
+            Vec3::new(0.0, 16.0, 0.0),
+            vec![vbox((0, 0), (-4.0, -8.0, -3.5), (8.0, 8.0, 7.0))],
+        ),
+        vpart(
+            "hat",
+            Some(5),
+            Vec3::new(0.0, -4.0, 0.0),
+            vec![ModelCube {
+                deformation: 0.3,
+                ..vbox((0, 30), (-4.0, -4.0, -3.5), (8.0, 8.0, 7.0))
+            }],
+        ),
+        // Unlike the adult model, the baby hat_rim hangs off the head, not the
+        // hat.
+        vpart(
+            "hat_rim",
+            Some(5),
+            Vec3::new(0.0, -4.5, 0.0),
+            vec![vbox((0, 45), (-7.0, -0.5, -6.0), (14.0, 1.0, 12.0))],
+        ),
+        vpart(
+            "nose",
+            Some(5),
+            Vec3::new(0.0, -2.0, -4.0),
+            vec![vbox((23, 0), (-1.0, 0.0, -0.5), (2.0, 2.0, 1.0))],
+        ),
+        vpart(
+            "body",
+            None,
+            Vec3::new(0.0, 18.75, 0.0),
+            vec![vbox((0, 15), (-2.0, -2.75, -1.5), (4.0, 5.0, 3.0))],
+        ),
+        vpart(
+            "bb_main",
+            None,
+            Vec3::new(0.5, 24.0, 0.0),
+            vec![ModelCube {
+                deformation: 0.2,
+                ..vbox((16, 21), (-2.5, -8.0, -1.5), (4.0, 6.0, 3.0))
+            }],
+        ),
+    ]
+}
+
+/// Vanilla `VillagerModel.createNoHatModel`:
+/// `clearChild("head").clearRecursively()` empties the cubes of the whole head
+/// subtree (head, hat, hat_rim, nose) while keeping the parts, so part order
+/// still matches the full model.
+fn clear_head_subtree(parts: &mut [EntityPart]) {
+    for part in parts {
+        if matches!(part.name.as_str(), "head" | "hat" | "hat_rim" | "nose") {
+            part.cubes.clear();
+        }
+    }
+}
+
+/// Vanilla `villagerLikeScale` (`LayerDefinitions`): the adult layers bake
+/// with the roots scaled 0.9375 and their poses adjusted to keep feet
+/// grounded (`PartPose.scaled(f).translated(0, 24.016 * (1 - f), 0)`).
+const VILLAGER_SCALE: f32 = 0.9375;
+
+pub fn bake_villager_model(no_hat: bool) -> BakedEntityModel {
+    let mut parts = villager_parts();
+    if no_hat {
+        clear_head_subtree(&mut parts);
+    }
+    // Root-only: the transform chain propagates a root's scale to child
+    // pivots and geometry like vanilla's pose stack (children would
+    // double-scale).
+    let mut scales = Vec::with_capacity(parts.len());
+    for part in &mut parts {
+        let is_root = part.parent.is_none();
+        if is_root {
+            part.offset =
+                part.offset * VILLAGER_SCALE + Vec3::new(0.0, 24.016 * (1.0 - VILLAGER_SCALE), 0.0);
+        }
+        scales.push(if is_root { VILLAGER_SCALE } else { 1.0 });
+    }
+    let mut model = bake_model(parts, 64, 64);
+    model.part_scales = scales;
+    model
+}
+
+pub fn bake_baby_villager_model(no_hat: bool) -> BakedEntityModel {
+    let mut parts = baby_villager_parts();
+    if no_hat {
+        clear_head_subtree(&mut parts);
+    }
+    bake_model(parts, 64, 64)
+}
+
 pub fn compute_humanoid_anim(
     model: &BakedEntityModel,
     head_x_rot_deg: f32,
@@ -1362,6 +1636,49 @@ pub fn compute_spider_anim(
             _ => continue,
         };
         anim.rotation_quat.push((i, q));
+    }
+
+    anim
+}
+
+/// Villager: head look, legs at half the humanoid swing, arms static (crossed
+/// pose in the default rotation). When unhappy the head shakes "no" and looks
+/// down (vanilla `VillagerModel.setupAnim`). Part names are shared by the
+/// adult and baby models.
+pub fn compute_villager_anim(
+    model: &BakedEntityModel,
+    head_x_rot_deg: f32,
+    local_head_y_rot_deg: f32,
+    walk_pos: f32,
+    walk_speed: f32,
+    is_unhappy: bool,
+    age_in_ticks: f32,
+) -> PartAnim {
+    let mut anim = PartAnim::default();
+
+    for (i, part) in model.parts.iter().enumerate() {
+        let rot = match part.name.as_str() {
+            "head" => {
+                if is_unhappy {
+                    // Vanilla composes ZYX: zRot = shake, yRot = yaw, xRot = 0.4.
+                    let rot = Quat::from_rotation_z(0.3 * (0.45 * age_in_ticks).sin())
+                        * Quat::from_rotation_y(local_head_y_rot_deg.to_radians())
+                        * Quat::from_rotation_x(0.4);
+                    let (x, y, z) = rot.to_euler(glam::EulerRot::XYZ);
+                    Vec3::new(x, y, z)
+                } else {
+                    head_rotation(head_x_rot_deg, local_head_y_rot_deg)
+                }
+            }
+            "right_leg" => Vec3::new((walk_pos * 0.6662).cos() * 1.4 * walk_speed * 0.5, 0.0, 0.0),
+            "left_leg" => Vec3::new(
+                (walk_pos * 0.6662 + std::f32::consts::PI).cos() * 1.4 * walk_speed * 0.5,
+                0.0,
+                0.0,
+            ),
+            _ => continue,
+        };
+        anim.rotation.push((i, rot));
     }
 
     anim

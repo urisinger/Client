@@ -1,3 +1,4 @@
+use azalea_buf::{AzBuf, AzBufVar};
 use azalea_core::position::ChunkPos;
 use azalea_core::registry_holder::RegistryHolder;
 use azalea_protocol::packets::game::{ClientboundGamePacket, ServerboundGamePacket};
@@ -7,7 +8,24 @@ use super::NetworkEvent;
 use super::commands::{CommandTree, SharedCommandTree};
 use super::sender::PacketSender;
 use crate::entity::components::Position;
-use crate::ui::text::{TextSpan, format_text_spans};
+use crate::ui::text::format_text_spans;
+
+/// Dimension info from a login/respawn registry entry. `has_skylight` lives
+/// in azalea's flattened extras; missing defaults to true (overworld-like).
+fn dimension_info(
+    dim: &azalea_core::registry_holder::dimension_type::DimensionKindElement,
+) -> NetworkEvent {
+    NetworkEvent::DimensionInfo {
+        height: dim.height,
+        min_y: dim.min_y,
+        has_skylight: dim
+            ._extra
+            .get("has_skylight")
+            .and_then(|tag| tag.byte())
+            .map(|b| b != 0)
+            .unwrap_or(true),
+    }
+}
 
 pub fn handle_game_packet(
     packet: &ClientboundGamePacket,
@@ -19,10 +37,7 @@ pub fn handle_game_packet(
     match packet {
         ClientboundGamePacket::Login(p) => {
             if let Some((_, dim)) = p.common.dimension_type(registry_holder) {
-                let _ = event_tx.try_send(NetworkEvent::DimensionInfo {
-                    height: dim.height,
-                    min_y: dim.min_y,
-                });
+                let _ = event_tx.try_send(dimension_info(dim));
             }
             let _ = event_tx.try_send(NetworkEvent::GameModeChanged {
                 game_mode: p.common.game_type as u8,
@@ -42,10 +57,7 @@ pub fn handle_game_packet(
                 pos: ChunkPos::new(p.x, p.z),
                 data: p.chunk_data.data.clone(),
                 heightmaps: p.chunk_data.heightmaps.clone(),
-                sky_light: p.light_data.sky_updates.clone(),
-                block_light: p.light_data.block_updates.clone(),
-                sky_y_mask: p.light_data.sky_y_mask.clone(),
-                block_y_mask: p.light_data.block_y_mask.clone(),
+                light: (&p.light_data).into(),
             });
             let chunk_pos = ChunkPos::new(p.x, p.z);
             let entries: Vec<_> = p
@@ -79,7 +91,7 @@ pub fn handle_game_packet(
         ClientboundGamePacket::Sound(p) => {
             // Coordinates are fixed-point: block position times 8.
             let _ = event_tx.try_send(NetworkEvent::PlaySound {
-                sound: resolve_sound(&p.sound),
+                sound: crate::audio::SoundRef::resolve(&p.sound),
                 category: p.source as u8,
                 pos: Position::new(p.x as f64 / 8.0, p.y as f64 / 8.0, p.z as f64 / 8.0),
                 volume: p.volume,
@@ -89,7 +101,7 @@ pub fn handle_game_packet(
         }
         ClientboundGamePacket::SoundEntity(p) => {
             let _ = event_tx.try_send(NetworkEvent::PlayEntitySound {
-                sound: resolve_sound(&p.sound),
+                sound: crate::audio::SoundRef::resolve(&p.sound),
                 category: p.source as u8,
                 entity_id: p.id.0,
                 volume: p.volume,
@@ -106,6 +118,12 @@ pub fn handle_game_packet(
                 pos: p.pos,
                 kind: p.block_entity_type,
                 nbt,
+            });
+        }
+        ClientboundGamePacket::LightUpdate(p) => {
+            let _ = event_tx.try_send(NetworkEvent::LightUpdate {
+                pos: ChunkPos::new(p.x, p.z),
+                light: (&p.light_data).into(),
             });
         }
         ClientboundGamePacket::ForgetLevelChunk(p) => {
@@ -142,8 +160,9 @@ pub fn handle_game_packet(
                 },
             ));
         }
-        ClientboundGamePacket::ContainerSetContent(p) if p.container_id == 0 => {
-            let _ = event_tx.try_send(NetworkEvent::InventoryContent {
+        ClientboundGamePacket::ContainerSetContent(p) => {
+            let _ = event_tx.try_send(NetworkEvent::ContainerContent {
+                container_id: p.container_id,
                 items: p.items.clone(),
                 carried: p.carried_item.clone(),
                 state_id: p.state_id,
@@ -154,14 +173,30 @@ pub fn handle_game_packet(
                 item: p.contents.clone(),
             });
         }
-        ClientboundGamePacket::ContainerSetSlot(p)
-            if p.container_id == 0 || p.container_id == -2 =>
-        {
-            let _ = event_tx.try_send(NetworkEvent::InventorySlot {
+        ClientboundGamePacket::ContainerSetSlot(p) => {
+            let _ = event_tx.try_send(NetworkEvent::ContainerSlot {
+                container_id: p.container_id,
                 index: p.slot,
                 item: p.item_stack.clone(),
                 state_id: p.state_id,
             });
+        }
+        ClientboundGamePacket::ContainerSetData(p) => {
+            let _ = event_tx.try_send(NetworkEvent::ContainerData {
+                container_id: p.container_id,
+                id: p.id,
+                value: p.value,
+            });
+        }
+        ClientboundGamePacket::OpenScreen(p) => {
+            let _ = event_tx.try_send(NetworkEvent::OpenScreen {
+                container_id: p.container_id,
+                menu_type: p.menu_type,
+                title: p.title.to_string(),
+            });
+        }
+        ClientboundGamePacket::ContainerClose(_) => {
+            let _ = event_tx.try_send(NetworkEvent::ContainerClosed);
         }
         ClientboundGamePacket::SetHealth(p) => {
             let _ = event_tx.try_send(NetworkEvent::PlayerHealth {
@@ -174,6 +209,12 @@ pub fn handle_game_packet(
             let _ = event_tx.try_send(NetworkEvent::PlayerExperience {
                 progress: p.experience_progress,
                 level: p.experience_level as i32,
+            });
+        }
+        ClientboundGamePacket::Waypoint(p) => {
+            let _ = event_tx.try_send(NetworkEvent::Waypoint {
+                operation: p.operation,
+                waypoint: p.waypoint.clone(),
             });
         }
         ClientboundGamePacket::UpdateAttributes(p) => {
@@ -209,13 +250,13 @@ pub fn handle_game_packet(
             });
         }
         ClientboundGamePacket::SystemChat(p) if !p.overlay => {
-            send_chat(event_tx, format_text_spans(&p.content));
+            send_chat(event_tx, &p.content);
         }
         ClientboundGamePacket::PlayerChat(p) => {
-            send_chat(event_tx, format_text_spans(&p.message()));
+            send_chat(event_tx, &p.message());
         }
         ClientboundGamePacket::DisguisedChat(p) => {
-            send_chat(event_tx, format_text_spans(&p.message));
+            send_chat(event_tx, &p.message);
         }
         ClientboundGamePacket::BlockUpdate(p) => {
             let _ = event_tx.try_send(NetworkEvent::BlockUpdate {
@@ -291,6 +332,7 @@ pub fn handle_game_packet(
                 uuid: p.uuid,
                 entity_type: p.entity_type,
                 position: p.position.into(),
+                velocity: lp_to_dvec3(&p.movement),
                 y_rot_deg,
                 x_rot_deg,
                 head_y_rot_deg,
@@ -307,7 +349,7 @@ pub fn handle_game_packet(
             });
         }
         ClientboundGamePacket::MoveEntityPos(p) => {
-            send_entity_moved(event_tx, p.entity_id.0, &p.delta);
+            send_entity_moved(event_tx, p.entity_id.0, &p.delta, p.on_ground);
         }
         ClientboundGamePacket::MoveEntityPosRot(p) => {
             use azalea_core::delta::PositionDeltaTrait;
@@ -319,22 +361,41 @@ pub fn handle_game_packet(
                 dz: p.delta.z(),
                 y_rot_deg: look.y_rot(),
                 x_rot_deg: look.x_rot(),
+                on_ground: p.on_ground,
             });
         }
         ClientboundGamePacket::TeleportEntity(p) => {
+            let delta = p.change.delta;
             let _ = event_tx.try_send(NetworkEvent::EntityTeleported {
                 id: p.id.0,
                 position: p.change.pos.into(),
+                velocity: Some(glam::DVec3::new(delta.x, delta.y, delta.z)),
                 y_rot_deg: p.change.look_direction.y_rot(),
                 x_rot_deg: p.change.look_direction.x_rot(),
+                on_ground: p.on_ground,
             });
         }
         ClientboundGamePacket::EntityPositionSync(p) => {
             let _ = event_tx.try_send(NetworkEvent::EntityTeleported {
                 id: p.id.0,
                 position: p.values.pos.into(),
+                velocity: None,
                 y_rot_deg: p.values.look_direction.y_rot(),
                 x_rot_deg: p.values.look_direction.x_rot(),
+                on_ground: p.on_ground,
+            });
+        }
+        ClientboundGamePacket::SetEntityMotion(p) => {
+            let _ = event_tx.try_send(NetworkEvent::EntityMotion {
+                id: p.id.0,
+                velocity: lp_to_dvec3(&p.delta),
+            });
+        }
+        ClientboundGamePacket::LevelEvent(p) => {
+            let _ = event_tx.try_send(NetworkEvent::LevelEvent {
+                event_type: p.event_type,
+                pos: p.pos,
+                data: p.data,
             });
         }
         ClientboundGamePacket::RemoveEntities(p) => {
@@ -443,7 +504,32 @@ pub fn handle_game_packet(
                         variant: resolved,
                     });
                 }
+                // Index 18 on villagers = unhappy counter (head-shake while > 0).
+                // Emit unconditionally; consumer filters by entity type.
+                if item.index == 18
+                    && let azalea_entity::EntityDataValue::Int(counter) = &item.value
+                {
+                    let _ = event_tx.try_send(NetworkEvent::VillagerUnhappy {
+                        id: p.id.0,
+                        counter: *counter,
+                    });
+                }
+                // Index 19 on villagers = VillagerData (type/profession/level).
+                if item.index == 19
+                    && let azalea_entity::EntityDataValue::VillagerData(data) = &item.value
+                {
+                    let _ = event_tx.try_send(NetworkEvent::VillagerData {
+                        id: p.id.0,
+                        kind: data.kind.into(),
+                        profession: data.profession.into(),
+                        level: data.level,
+                    });
+                }
             }
+        }
+        // Event id 9 = finished using an item (vanilla `completeUsingItem`).
+        ClientboundGamePacket::EntityEvent(p) if p.event_id == 9 => {
+            let _ = event_tx.try_send(NetworkEvent::FinishUseItem { id: p.entity_id.0 });
         }
         // Event id 10 = sheep eat-grass animation start (40-tick head-dip).
         ClientboundGamePacket::EntityEvent(p) if p.event_id == 10 => {
@@ -469,10 +555,7 @@ pub fn handle_game_packet(
         }
         ClientboundGamePacket::Respawn(p) => {
             if let Some((_, dim)) = p.common.dimension_type(registry_holder) {
-                let _ = event_tx.try_send(NetworkEvent::DimensionInfo {
-                    height: dim.height,
-                    min_y: dim.min_y,
-                });
+                let _ = event_tx.try_send(dimension_info(dim));
             }
             let _ = event_tx.try_send(NetworkEvent::GameModeChanged {
                 game_mode: p.common.game_type as u8,
@@ -560,7 +643,11 @@ pub fn handle_game_packet(
             let _ = event_tx.try_send(NetworkEvent::CommandTree { tree });
         }
         ClientboundGamePacket::CommandSuggestions(p) => {
-            tracing::debug!("Command suggestions received (id {})", p.id);
+            let _ = event_tx.try_send(NetworkEvent::CommandSuggestions {
+                id: p.id,
+                start: p.suggestions.range().start(),
+                options: p.suggestions.list().iter().map(|s| s.text()).collect(),
+            });
         }
         ClientboundGamePacket::CustomChatCompletions(p) => {
             tracing::debug!(
@@ -573,43 +660,106 @@ pub fn handle_game_packet(
     }
 }
 
-fn send_chat(event_tx: &Sender<NetworkEvent>, spans: Vec<TextSpan>) {
+fn send_chat(event_tx: &Sender<NetworkEvent>, message: &azalea_chat::FormattedText) {
+    let spans = format_text_spans(message, [1.0; 4]);
     let text: String = spans.iter().map(|s| s.text.as_str()).collect();
     tracing::info!("Chat: {text}");
     let _ = event_tx.try_send(NetworkEvent::ChatMessage { spans });
 }
 
-/// Resolves a sound holder into either a `sounds.json` event name (registry
-/// reference) or a direct sound-file path (inline custom sound).
-fn resolve_sound(
-    holder: &azalea_registry::Holder<
-        azalea_registry::builtin::SoundEvent,
-        azalea_core::sound::CustomSound,
-    >,
-) -> crate::audio::SoundRef {
-    match holder {
-        azalea_registry::Holder::Reference(event) => {
-            // `to_str` yields e.g. `minecraft:block.stone.break`; sounds.json is
-            // keyed by the path without the namespace.
-            let id = event.to_str();
-            let name = id.strip_prefix("minecraft:").unwrap_or(id);
-            crate::audio::SoundRef::Event(name.to_string())
-        }
-        azalea_registry::Holder::Direct(custom) => {
-            crate::audio::SoundRef::Direct(custom.sound_id.to_string())
-        }
-    }
+fn lp_to_dvec3(v: &azalea_core::delta::LpVec3) -> glam::DVec3 {
+    let v = v.to_vec3();
+    glam::DVec3::new(v.x, v.y, v.z)
 }
 
 fn send_entity_moved(
     event_tx: &Sender<NetworkEvent>,
     id: i32,
     delta: &azalea_core::delta::PositionDelta8,
+    on_ground: bool,
 ) {
     let _ = event_tx.try_send(NetworkEvent::EntityMoved {
         id,
         dx: delta.xa as f64 / 4096.0,
         dy: delta.ya as f64 / 4096.0,
         dz: delta.za as f64 / 4096.0,
+        on_ground,
     });
+}
+
+/// Consume `ClientboundLevelParticles` from the raw packet bytes, before
+/// azalea's typed decode. azalea 26.2's `Particle` wire enum is out of sync
+/// with the particle registry (the new 26.2 particles are appended at the end
+/// instead of inserted in registry order), misdecoding every type id past
+/// `bubble`; pomme reads the id itself and skips the type-specific payload,
+/// which is the packet's last field. Returns whether the packet was consumed.
+pub fn handle_raw_game_packet(raw: &[u8], event_tx: &Sender<NetworkEvent>) -> bool {
+    let mut cur = std::io::Cursor::new(raw);
+    if u32::azalea_read_var(&mut cur).ok() != Some(level_particles_packet_id()) {
+        return false;
+    }
+    match parse_level_particles(&mut cur) {
+        Ok(Some(event)) => {
+            let _ = event_tx.try_send(event);
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("Skipping malformed LevelParticles packet: {e}"),
+    }
+    true
+}
+
+/// The wire layout of vanilla `ClientboundLevelParticlesPacket.write`, up to
+/// the particle type id.
+fn parse_level_particles(
+    cur: &mut std::io::Cursor<&[u8]>,
+) -> Result<Option<NetworkEvent>, azalea_buf::BufReadError> {
+    let override_limiter = bool::azalea_read(cur)?;
+    let _always_show = bool::azalea_read(cur)?;
+    let pos = glam::dvec3(
+        f64::azalea_read(cur)?,
+        f64::azalea_read(cur)?,
+        f64::azalea_read(cur)?,
+    );
+    let x_dist = f32::azalea_read(cur)?;
+    let y_dist = f32::azalea_read(cur)?;
+    let z_dist = f32::azalea_read(cur)?;
+    let max_speed = f32::azalea_read(cur)?;
+    // Signed on the wire; Java's `i < count` loop no-ops on negative counts.
+    let count = i32::azalea_read(cur)?.max(0) as u32;
+    let type_id = u32::azalea_read_var(cur)?;
+    // Particle ids shift between versions; translate into the latest id
+    // space (`ServerParticleKind`'s) when speaking an older protocol.
+    let type_id = match super::translate::active() {
+        Some(t) => match t.remap_particle(type_id) {
+            Some(id) => id,
+            None => return Ok(None),
+        },
+        None => type_id,
+    };
+    let Some(kind) = crate::particle::ServerParticleKind::from_id(type_id) else {
+        return Ok(None);
+    };
+    Ok(Some(NetworkEvent::LevelParticles {
+        kind,
+        override_limiter,
+        pos,
+        x_dist,
+        y_dist,
+        z_dist,
+        max_speed,
+        count,
+    }))
+}
+
+/// `ClientboundLevelParticles`' packet id from the vanilla-derived table
+/// (cross-checked against azalea's dispatch table in `azalea_compat`).
+fn level_particles_packet_id() -> u32 {
+    use pomme_protocol::{Direction, PacketTable, Phase};
+
+    static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| {
+        PacketTable::latest()
+            .id(Phase::Game, Direction::Clientbound, "level_particles")
+            .expect("level_particles in packet table")
+    })
 }

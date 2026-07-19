@@ -13,6 +13,26 @@ use crate::ui::text::{TextSpan, format_text_spans};
 pub struct ServerEntry {
     pub name: String,
     pub address: String,
+    /// The protocol from this server's last successful ping, so a join
+    /// before the current ping completes still skips the wire-version probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<i32>,
+    /// Fields other tools own (the launcher's category, ...), passed through
+    /// untouched so a client save doesn't strip them.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// How the client can speak to a pinged server.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Compat {
+    /// The latest supported version: joined without translation.
+    Native,
+    /// An older protocol with embedded translation data: joinable, with the
+    /// wire translated on the fly.
+    Translated,
+    /// A protocol without translation data: a join would be refused.
+    Incompatible,
 }
 
 #[derive(Clone)]
@@ -24,7 +44,10 @@ pub enum PingState {
         max: i32,
         latency_ms: u64,
         version: String,
-        protocol_match: bool,
+        /// The server's protocol number, reused at join time to skip the
+        /// wire-version probe.
+        protocol: i32,
+        compat: Compat,
         favicon_rgba: Option<Vec<u8>>,
         player_names: Vec<String>,
     },
@@ -112,10 +135,7 @@ async fn ping_server(
     generation: PingGeneration,
     spawned_gen: u64,
 ) {
-    use azalea_protocol::packets::ClientIntention;
-    use azalea_protocol::packets::status::ClientboundStatusPacket;
     use azalea_protocol::packets::status::s_ping_request::ServerboundPingRequest;
-    use azalea_protocol::packets::status::s_status_request::ServerboundStatusRequest;
 
     let result = async {
         use azalea_protocol::address::ServerAddr;
@@ -124,21 +144,9 @@ async fn ping_server(
             .as_str()
             .try_into()
             .map_err(|_| format!("Invalid address: {address}"))?;
-        let conn = crate::net::resolve::connect(&server_addr, ClientIntention::Status)
+        let (status, mut conn) = crate::net::resolve::request_status(&server_addr)
             .await
             .map_err(|e| format!("{address}: {e}"))?;
-
-        let mut conn = conn.status();
-
-        conn.write(ServerboundStatusRequest {})
-            .await
-            .map_err(|e| format!("Status request failed: {e}"))?;
-
-        let packet = conn.read().await.map_err(|e| format!("Read failed: {e}"))?;
-        let status = match packet {
-            ClientboundStatusPacket::StatusResponse(s) => s,
-            _ => return Err("Unexpected packet".to_string()),
-        };
 
         let ping_start = Instant::now();
         let time = std::time::SystemTime::now()
@@ -153,9 +161,21 @@ async fn ping_server(
         let _ = conn.read().await.map_err(|e| format!("Pong failed: {e}"))?;
         let latency_ms = ping_start.elapsed().as_millis() as u64;
 
-        let motd = format_text_spans(&status.description);
+        // Vanilla MOTD base color: 0x808080.
+        let motd = format_text_spans(&status.description, [0.5, 0.5, 0.5, 1.0]);
         let version = status.version.name.clone();
-        let protocol_match = status.version.protocol == azalea_protocol::packets::PROTOCOL_VERSION;
+        // Native is keyed to the latest version, not the launched one: the
+        // client's internal representation is always the latest, so any
+        // older server is joined through translation.
+        let compat = if status.version.protocol == pomme_protocol::version::LATEST.protocol {
+            Compat::Native
+        } else if crate::net::translate::joinable(status.version.protocol) {
+            let protocol = status.version.protocol;
+            tokio::task::spawn_blocking(move || crate::net::translate::prewarm(protocol));
+            Compat::Translated
+        } else {
+            Compat::Incompatible
+        };
         let (online, max) = (status.players.online, status.players.max);
 
         let favicon_rgba = status.favicon.as_deref().and_then(decode_favicon);
@@ -172,7 +192,8 @@ async fn ping_server(
             max,
             latency_ms,
             version,
-            protocol_match,
+            protocol: status.version.protocol,
+            compat,
             favicon_rgba,
             player_names,
         })
@@ -213,4 +234,33 @@ pub fn is_valid_address(address: &str) -> bool {
             .split(':')
             .next()
             .is_some_and(|host| !host.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The launcher writes fields the client doesn't model (category); a
+    /// client save must pass them through, not strip them.
+    #[test]
+    fn entry_round_trip_keeps_unknown_fields() {
+        let json = r#"{"name":"a","address":"b:25565","protocol":775,"category":"Modded"}"#;
+        let entry: ServerEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.protocol, Some(775));
+        assert_eq!(
+            entry.extra.get("category").and_then(|v| v.as_str()),
+            Some("Modded")
+        );
+        let back: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(serde_json::to_value(&entry).unwrap(), back);
+    }
+
+    /// Entries without the optional fields load and save without gaining any.
+    #[test]
+    fn entry_round_trip_minimal() {
+        let json = r#"{"name":"a","address":"b"}"#;
+        let entry: ServerEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.protocol, None);
+        assert_eq!(serde_json::to_string(&entry).unwrap(), json);
+    }
 }

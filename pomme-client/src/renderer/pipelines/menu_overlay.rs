@@ -643,7 +643,7 @@ impl MenuOverlayPipeline {
         let mut vertices: Vec<Vertex> = Vec::with_capacity(elements.len() * 24);
         let mut deferred_tooltips: Vec<&MenuElement> = Vec::new();
         let mut draw_ops: Vec<DrawOp> = Vec::new();
-        let mut current_scissor: Option<[f32; 4]> = None;
+        let mut scissor_stack: Vec<[f32; 4]> = Vec::new();
         let mut cmd_start: u32 = 0;
 
         for elem in elements {
@@ -663,15 +663,26 @@ impl MenuOverlayPipeline {
                     draw_ops.push(DrawOp {
                         start: cmd_start,
                         count,
-                        scissor: current_scissor,
+                        scissor: scissor_stack.last().copied(),
                     });
                 }
                 cmd_start = vertices.len() as u32;
-                current_scissor = if let MenuElement::ScissorPush { x, y, w, h } = elem {
-                    Some([*x, *y, *w, *h])
+                if let MenuElement::ScissorPush { x, y, w, h } = elem {
+                    // Nested regions clip to the intersection with the enclosing one.
+                    let rect = match scissor_stack.last() {
+                        Some(outer) => {
+                            let x0 = x.max(outer[0]);
+                            let y0 = y.max(outer[1]);
+                            let x1 = (x + w).min(outer[0] + outer[2]);
+                            let y1 = (y + h).min(outer[1] + outer[3]);
+                            [x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0)]
+                        }
+                        None => [*x, *y, *w, *h],
+                    };
+                    scissor_stack.push(rect);
                 } else {
-                    None
-                };
+                    scissor_stack.pop();
+                }
                 continue;
             }
             match elem {
@@ -824,6 +835,7 @@ impl MenuOverlayPipeline {
                     spans,
                     scale,
                     centered,
+                    shadow,
                 } => {
                     if let Some(ref gm) = self.mc_glyph_map {
                         let start_x = if *centered {
@@ -835,7 +847,7 @@ impl MenuOverlayPipeline {
                         } else {
                             *x
                         };
-                        push_mc_text(&mut vertices, gm, start_x, *y, spans, *scale, true);
+                        push_mc_text(&mut vertices, gm, start_x, *y, spans, *scale, *shadow);
                     }
                 }
                 MenuElement::GradientRect {
@@ -1024,10 +1036,11 @@ impl MenuOverlayPipeline {
                 let margin = 9.0 * px;
                 let line_h = *scale + 2.0 * px;
 
-                let content_w = lines
+                let line_widths: Vec<f32> = lines
                     .iter()
-                    .map(|l| (self.mc_text_width(&l.text, *scale) + px).ceil())
-                    .fold(0.0f32, f32::max);
+                    .map(|l| (self.spans_width(&l.spans, *scale) + px).ceil())
+                    .collect();
+                let content_w = line_widths.iter().copied().fold(0.0f32, f32::max);
                 let content_h = lines.len() as f32 * line_h - 2.0 * px;
 
                 let mut text_x = *x + 12.0;
@@ -1063,14 +1076,18 @@ impl MenuOverlayPipeline {
                     );
                 }
 
-                for (i, line) in lines.iter().enumerate() {
-                    let span = TextSpan::new(line.text.clone(), line.color);
+                for (i, (line, line_w)) in lines.iter().zip(&line_widths).enumerate() {
+                    let line_x = if line.right_align {
+                        text_x + content_w - line_w
+                    } else {
+                        text_x
+                    };
                     push_mc_text(
                         &mut vertices,
                         gm,
-                        text_x,
+                        line_x,
                         text_y + i as f32 * line_h,
-                        &[span],
+                        &line.spans,
                         *scale,
                         true,
                     );
@@ -1083,7 +1100,7 @@ impl MenuOverlayPipeline {
             draw_ops.push(DrawOp {
                 start: cmd_start,
                 count: final_count,
-                scissor: current_scissor,
+                scissor: scissor_stack.last().copied(),
             });
         }
 
@@ -1284,17 +1301,37 @@ impl MenuOverlayPipeline {
     }
 
     pub fn mc_text_width(&self, text: &str, scale: f32) -> f32 {
+        self.text_width_in(text, scale, false)
+    }
+
+    /// Text width in the SGA (`minecraft:alt`) glyphs.
+    pub fn mc_text_width_sga(&self, text: &str, scale: f32) -> f32 {
+        self.text_width_in(text, scale, true)
+    }
+
+    fn text_width_in(&self, text: &str, scale: f32, sga: bool) -> f32 {
         let Some(ref gm) = self.mc_glyph_map else {
             return 0.0;
         };
         let px_scale = scale / gm.cell_h as f32;
         let raw: f32 = text
             .chars()
-            .map(|ch| {
-                let w = gm.glyphs.get(&ch).map(|g| g.width).unwrap_or(gm.cell_w / 2);
-                (w as f32 + 1.0) * px_scale
-            })
+            .map(|ch| glyph_advance(gm, ch, sga) * px_scale)
             .sum();
+        raw.ceil()
+    }
+
+    /// Width of a multi-span line, honoring each span's font.
+    fn spans_width(&self, spans: &[TextSpan], scale: f32) -> f32 {
+        let Some(ref gm) = self.mc_glyph_map else {
+            return 0.0;
+        };
+        let px_scale = scale / gm.cell_h as f32;
+        let raw: f32 = spans
+            .iter()
+            .flat_map(|s| s.text.chars().map(|ch| glyph_advance(gm, ch, s.sga)))
+            .sum::<f32>()
+            * px_scale;
         raw.ceil()
     }
 
@@ -1375,8 +1412,27 @@ impl MenuOverlayPipeline {
 }
 
 pub struct TooltipLine {
-    pub text: String,
-    pub color: [f32; 4],
+    pub spans: Vec<TextSpan>,
+    /// Aligned against the widest line in the tooltip instead of the left.
+    pub right_align: bool,
+}
+
+impl TooltipLine {
+    /// A single-color line.
+    pub fn new(text: String, color: [f32; 4]) -> Self {
+        Self {
+            spans: vec![TextSpan::new(text, color)],
+            right_align: false,
+        }
+    }
+
+    /// A single-color right-aligned line.
+    pub fn right_aligned(text: String, color: [f32; 4]) -> Self {
+        Self {
+            right_align: true,
+            ..Self::new(text, color)
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -1449,6 +1505,7 @@ pub enum MenuElement {
         spans: Vec<TextSpan>,
         scale: f32,
         centered: bool,
+        shadow: bool,
     },
     TiledImage {
         x: f32,
@@ -1530,7 +1587,46 @@ pub enum SpriteId {
     ArmorFull,
     ExperienceBarBackground,
     ExperienceBarProgress,
+    LocatorBarBackground,
+    LocatorDotDefault0,
+    LocatorDotDefault1,
+    LocatorDotDefault2,
+    LocatorDotDefault3,
+    LocatorDotBowtie,
+    LocatorDotMissing,
+    LocatorArrowUp0,
+    LocatorArrowUp1,
+    LocatorArrowDown0,
+    LocatorArrowDown1,
     InventoryBackground,
+    CraftingTableBackground,
+    FurnaceBackground,
+    BlastFurnaceBackground,
+    SmokerBackground,
+    Generic54Top,
+    Generic54Bottom,
+    ShulkerBoxBackground,
+    AnvilBackground,
+    AnvilTextField,
+    AnvilTextFieldDisabled,
+    AnvilError,
+    EnchantingTableBackground,
+    EnchantmentSlot,
+    EnchantmentSlotDisabled,
+    EnchantmentSlotHighlighted,
+    EnchantmentLevel1,
+    EnchantmentLevel2,
+    EnchantmentLevel3,
+    EnchantmentLevel1Disabled,
+    EnchantmentLevel2Disabled,
+    EnchantmentLevel3Disabled,
+    EmptyLapisLazuli,
+    FurnaceLitProgress,
+    FurnaceBurnProgress,
+    BlastFurnaceLitProgress,
+    BlastFurnaceBurnProgress,
+    SmokerLitProgress,
+    SmokerBurnProgress,
     CreativeItemsBackground,
     CreativeSearchBackground,
     CreativeInventoryBackground,
@@ -1777,6 +1873,31 @@ fn build_sprite_atlas(
             0.0,
         ),
         (
+            SpriteId::LocatorDotDefault0,
+            "minecraft/textures/gui/sprites/hud/locator_bar_dot/default_0.png",
+            0.0,
+        ),
+        (
+            SpriteId::LocatorDotDefault1,
+            "minecraft/textures/gui/sprites/hud/locator_bar_dot/default_1.png",
+            0.0,
+        ),
+        (
+            SpriteId::LocatorDotDefault2,
+            "minecraft/textures/gui/sprites/hud/locator_bar_dot/default_2.png",
+            0.0,
+        ),
+        (
+            SpriteId::LocatorDotDefault3,
+            "minecraft/textures/gui/sprites/hud/locator_bar_dot/default_3.png",
+            0.0,
+        ),
+        (
+            SpriteId::LocatorDotBowtie,
+            "minecraft/textures/gui/sprites/hud/locator_bar_dot/bowtie.png",
+            0.0,
+        ),
+        (
             SpriteId::EmptyHelmet,
             "minecraft/textures/gui/sprites/container/slot/helmet.png",
             0.0,
@@ -1809,6 +1930,101 @@ fn build_sprite_atlas(
         (
             SpriteId::SlotHighlightFront,
             "minecraft/textures/gui/sprites/container/slot_highlight_front.png",
+            0.0,
+        ),
+        (
+            SpriteId::AnvilTextField,
+            "minecraft/textures/gui/sprites/container/anvil/text_field.png",
+            0.0,
+        ),
+        (
+            SpriteId::AnvilTextFieldDisabled,
+            "minecraft/textures/gui/sprites/container/anvil/text_field_disabled.png",
+            0.0,
+        ),
+        (
+            SpriteId::AnvilError,
+            "minecraft/textures/gui/sprites/container/anvil/error.png",
+            0.0,
+        ),
+        (
+            SpriteId::EnchantmentSlot,
+            "minecraft/textures/gui/sprites/container/enchanting_table/enchantment_slot.png",
+            0.0,
+        ),
+        (
+            SpriteId::EnchantmentSlotDisabled,
+            "minecraft/textures/gui/sprites/container/enchanting_table/enchantment_slot_disabled.png",
+            0.0,
+        ),
+        (
+            SpriteId::EnchantmentSlotHighlighted,
+            "minecraft/textures/gui/sprites/container/enchanting_table/enchantment_slot_highlighted.png",
+            0.0,
+        ),
+        (
+            SpriteId::EnchantmentLevel1,
+            "minecraft/textures/gui/sprites/container/enchanting_table/level_1.png",
+            0.0,
+        ),
+        (
+            SpriteId::EnchantmentLevel2,
+            "minecraft/textures/gui/sprites/container/enchanting_table/level_2.png",
+            0.0,
+        ),
+        (
+            SpriteId::EnchantmentLevel3,
+            "minecraft/textures/gui/sprites/container/enchanting_table/level_3.png",
+            0.0,
+        ),
+        (
+            SpriteId::EnchantmentLevel1Disabled,
+            "minecraft/textures/gui/sprites/container/enchanting_table/level_1_disabled.png",
+            0.0,
+        ),
+        (
+            SpriteId::EnchantmentLevel2Disabled,
+            "minecraft/textures/gui/sprites/container/enchanting_table/level_2_disabled.png",
+            0.0,
+        ),
+        (
+            SpriteId::EnchantmentLevel3Disabled,
+            "minecraft/textures/gui/sprites/container/enchanting_table/level_3_disabled.png",
+            0.0,
+        ),
+        (
+            SpriteId::EmptyLapisLazuli,
+            "minecraft/textures/gui/sprites/container/slot/lapis_lazuli.png",
+            0.0,
+        ),
+        (
+            SpriteId::FurnaceLitProgress,
+            "minecraft/textures/gui/sprites/container/furnace/lit_progress.png",
+            0.0,
+        ),
+        (
+            SpriteId::FurnaceBurnProgress,
+            "minecraft/textures/gui/sprites/container/furnace/burn_progress.png",
+            0.0,
+        ),
+        (
+            SpriteId::BlastFurnaceLitProgress,
+            "minecraft/textures/gui/sprites/container/blast_furnace/lit_progress.png",
+            0.0,
+        ),
+        (
+            SpriteId::BlastFurnaceBurnProgress,
+            "minecraft/textures/gui/sprites/container/blast_furnace/burn_progress.png",
+            0.0,
+        ),
+        (
+            SpriteId::SmokerLitProgress,
+            "minecraft/textures/gui/sprites/container/smoker/lit_progress.png",
+            0.0,
+        ),
+        (
+            SpriteId::SmokerBurnProgress,
+            "minecraft/textures/gui/sprites/container/smoker/burn_progress.png",
             0.0,
         ),
         (
@@ -2093,31 +2309,45 @@ fn build_sprite_atlas(
         }
     }
 
-    let inv_path = resolve_asset_path(
+    // Locator bar background: pre-tile the 12x5 nine-slice (borders L/R 5,
+    // 2px center repeated) to its fixed 182x5 draw size.
+    let locator_bg_path = resolve_asset_path(
         jar_assets_dir,
         asset_index,
-        "minecraft/textures/gui/container/inventory.png",
+        "minecraft/textures/gui/sprites/hud/locator_bar_background.png",
     );
-    match crate::assets::load_image(&inv_path) {
+    match crate::assets::load_image(&locator_bg_path) {
         Ok(img) => {
             let rgba = img.to_rgba8();
-            let full_w = rgba.width();
-            let crop_w = INV_TEX_W.min(full_w);
-            let crop_h = INV_TEX_H.min(rgba.height());
-            let mut cropped = vec![0u8; (crop_w * crop_h * 4) as usize];
-            for y in 0..crop_h {
-                let src_off = (y * full_w * 4) as usize;
-                let dst_off = (y * crop_w * 4) as usize;
-                let row_bytes = (crop_w * 4) as usize;
-                cropped[dst_off..dst_off + row_bytes]
-                    .copy_from_slice(&rgba.as_raw()[src_off..src_off + row_bytes]);
+            if rgba.width() == 12 && rgba.height() == 5 {
+                let src = rgba.as_raw();
+                let mut out = vec![0u8; 182 * 5 * 4];
+                for y in 0..5usize {
+                    let row = |x: usize| (y * 12 + x) * 4;
+                    let dst_row = y * 182 * 4;
+                    out[dst_row..dst_row + 5 * 4].copy_from_slice(&src[row(0)..row(5)]);
+                    for rep in 0..86usize {
+                        let dst = dst_row + (5 + rep * 2) * 4;
+                        out[dst..dst + 2 * 4].copy_from_slice(&src[row(5)..row(7)]);
+                    }
+                    let dst = dst_row + 177 * 4;
+                    out[dst..dst + 5 * 4].copy_from_slice(&src[row(7)..row(12)]);
+                }
+                images.push((SpriteId::LocatorBarBackground, out, 182, 5, 0.0));
+            } else {
+                tracing::warn!(
+                    "Unexpected locator bar background size: {}x{}",
+                    rgba.width(),
+                    rgba.height()
+                );
+                let (w, h) = (rgba.width(), rgba.height());
+                images.push((SpriteId::LocatorBarBackground, rgba.into_raw(), w, h, 0.0));
             }
-            images.push((SpriteId::InventoryBackground, cropped, crop_w, crop_h, 0.0));
         }
         Err(e) => {
-            tracing::warn!("Failed to load inventory background: {e}");
+            tracing::warn!("Failed to load locator bar background: {e}");
             images.push((
-                SpriteId::InventoryBackground,
+                SpriteId::LocatorBarBackground,
                 vec![255, 0, 255, 255],
                 1,
                 1,
@@ -2126,18 +2356,156 @@ fn build_sprite_atlas(
         }
     }
 
-    for (id, path) in [
+    // Locator arrows: each 7x10 strip holds two 7x5 animation frames.
+    for (frame0, frame1, asset_key) in [
+        (
+            SpriteId::LocatorArrowUp0,
+            SpriteId::LocatorArrowUp1,
+            "minecraft/textures/gui/sprites/hud/locator_bar_arrow_up.png",
+        ),
+        (
+            SpriteId::LocatorArrowDown0,
+            SpriteId::LocatorArrowDown1,
+            "minecraft/textures/gui/sprites/hud/locator_bar_arrow_down.png",
+        ),
+    ] {
+        let path = resolve_asset_path(jar_assets_dir, asset_index, asset_key);
+        let frames = match crate::assets::load_image(&path) {
+            Ok(img) => {
+                let rgba = img.to_rgba8();
+                if rgba.width() == 7 && rgba.height() == 10 {
+                    let src = rgba.into_raw();
+                    let frame_bytes = 7 * 5 * 4;
+                    Some((src[..frame_bytes].to_vec(), src[frame_bytes..].to_vec()))
+                } else {
+                    tracing::warn!(
+                        "Unexpected locator arrow size {}x{} for {asset_key}",
+                        rgba.width(),
+                        rgba.height()
+                    );
+                    None
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load locator arrow {asset_key}: {e}");
+                None
+            }
+        };
+        match frames {
+            Some((f0, f1)) => {
+                images.push((frame0, f0, 7, 5, 0.0));
+                images.push((frame1, f1, 7, 5, 0.0));
+            }
+            None => {
+                for id in [frame0, frame1] {
+                    images.push((id, vec![255, 0, 255, 255], 1, 1, 0.0));
+                }
+            }
+        }
+    }
+
+    // Placeholder for unknown waypoint styles (vanilla shows missingno).
+    images.push((
+        SpriteId::LocatorDotMissing,
+        vec![255, 0, 255, 255],
+        1,
+        1,
+        0.0,
+    ));
+
+    // Container backgrounds live in a 256x256 atlas; crop out the used region
+    // starting at texture row `src_y`.
+    for (id, path, src_y, max_w, max_h) in [
+        (
+            SpriteId::InventoryBackground,
+            "minecraft/textures/gui/container/inventory.png",
+            0,
+            INV_TEX_W,
+            INV_TEX_H,
+        ),
+        (
+            SpriteId::CraftingTableBackground,
+            "minecraft/textures/gui/container/crafting_table.png",
+            0,
+            INV_TEX_W,
+            INV_TEX_H,
+        ),
+        (
+            SpriteId::FurnaceBackground,
+            "minecraft/textures/gui/container/furnace.png",
+            0,
+            INV_TEX_W,
+            INV_TEX_H,
+        ),
+        (
+            SpriteId::BlastFurnaceBackground,
+            "minecraft/textures/gui/container/blast_furnace.png",
+            0,
+            INV_TEX_W,
+            INV_TEX_H,
+        ),
+        (
+            SpriteId::SmokerBackground,
+            "minecraft/textures/gui/container/smoker.png",
+            0,
+            INV_TEX_W,
+            INV_TEX_H,
+        ),
+        (
+            SpriteId::Generic54Top,
+            "minecraft/textures/gui/container/generic_54.png",
+            0,
+            INV_TEX_W,
+            125,
+        ),
+        (
+            SpriteId::Generic54Bottom,
+            "minecraft/textures/gui/container/generic_54.png",
+            126,
+            INV_TEX_W,
+            96,
+        ),
+        (
+            SpriteId::ShulkerBoxBackground,
+            "minecraft/textures/gui/container/shulker_box.png",
+            0,
+            INV_TEX_W,
+            167,
+        ),
+        (
+            SpriteId::AnvilBackground,
+            "minecraft/textures/gui/container/anvil.png",
+            0,
+            INV_TEX_W,
+            INV_TEX_H,
+        ),
+        (
+            SpriteId::EnchantingTableBackground,
+            "minecraft/textures/gui/container/enchanting_table.png",
+            0,
+            INV_TEX_W,
+            INV_TEX_H,
+        ),
         (
             SpriteId::CreativeItemsBackground,
             "minecraft/textures/gui/container/creative_inventory/tab_items.png",
+            0,
+            195,
+            136,
         ),
         (
             SpriteId::CreativeSearchBackground,
             "minecraft/textures/gui/container/creative_inventory/tab_item_search.png",
+            0,
+            195,
+            136,
         ),
         (
             SpriteId::CreativeInventoryBackground,
             "minecraft/textures/gui/container/creative_inventory/tab_inventory.png",
+            0,
+            195,
+            136,
         ),
     ] {
         let path = resolve_asset_path(jar_assets_dir, asset_index, path);
@@ -2145,11 +2513,11 @@ fn build_sprite_atlas(
             Ok(img) => {
                 let rgba = img.to_rgba8();
                 let full_w = rgba.width();
-                let crop_w = 195u32.min(full_w);
-                let crop_h = 136u32.min(rgba.height());
+                let crop_w = max_w.min(full_w);
+                let crop_h = max_h.min(rgba.height().saturating_sub(src_y));
                 let mut cropped = vec![0u8; (crop_w * crop_h * 4) as usize];
                 for y in 0..crop_h {
-                    let src_off = (y * full_w * 4) as usize;
+                    let src_off = ((src_y + y) * full_w * 4) as usize;
                     let dst_off = (y * crop_w * 4) as usize;
                     let row_bytes = (crop_w * 4) as usize;
                     cropped[dst_off..dst_off + row_bytes]
@@ -2158,7 +2526,7 @@ fn build_sprite_atlas(
                 images.push((id, cropped, crop_w, crop_h, 0.0));
             }
             Err(e) => {
-                tracing::warn!("Failed to load creative background {id:?}: {e}");
+                tracing::warn!("Failed to load container background {id:?}: {e}");
                 images.push((id, vec![255, 0, 255, 255], 1, 1, 0.0));
             }
         }
@@ -2590,6 +2958,11 @@ fn push_nine_slice(
     }
 }
 
+/// A glyph's horizontal advance in font-texture pixels.
+fn glyph_advance(gm: &GlyphMap, ch: char, sga: bool) -> f32 {
+    gm.glyph(ch, sga).map(|g| g.width).unwrap_or(gm.cell_w / 2) as f32 + 1.0
+}
+
 fn push_mc_text(
     verts: &mut Vec<Vertex>,
     gm: &GlyphMap,
@@ -2628,7 +3001,7 @@ fn push_mc_text(
                 continue;
             }
 
-            let Some(gi) = gm.glyphs.get(&ch) else {
+            let Some(gi) = gm.glyph(ch, span.sga) else {
                 continue;
             };
             let glyph_w = gi.width as f32 * px_scale;

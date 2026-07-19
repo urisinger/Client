@@ -15,6 +15,7 @@ use crate::renderer::CloudMode;
 use crate::renderer::pipelines::menu_overlay::{
     ICON_CHECK, ICON_CODE, ICON_COMMENT, ICON_GEAR, ICON_GLOBE, ICON_LANGUAGE, ICON_LINK,
     ICON_PAINTBRUSH, ICON_UNIVERSAL_ACCESS, ICON_USER, ICON_USERS, MenuElement, SpriteId,
+    TooltipLine,
 };
 
 #[derive(Serialize, Deserialize)]
@@ -170,7 +171,7 @@ use super::common;
 use super::common::WHITE;
 use super::friends::{self, ActionError, FaceCache, FriendsData};
 use super::server_list::{
-    PingGeneration, PingResults, PingState, ServerEntry, ServerList, is_valid_address,
+    Compat, PingGeneration, PingResults, PingState, ServerEntry, ServerList, is_valid_address,
     ping_all_servers,
 };
 
@@ -199,7 +200,12 @@ const STRIP_COUNT: usize = 14;
 
 pub enum MenuAction {
     None,
-    Connect { server: String, username: String },
+    Connect {
+        server: String,
+        username: String,
+        /// From the entry's ping, when joining out of the server list.
+        protocol: Option<i32>,
+    },
     ChangeTheme(PanoramaTheme),
     Quit,
 }
@@ -325,6 +331,7 @@ fn atlas_dirty(count: usize, last: &mut usize, since: &mut Option<Instant>) -> b
 
 pub struct MainMenu {
     username: String,
+    version: String,
     screen: Screen,
     server_list: ServerList,
     selected_server: Option<usize>,
@@ -360,6 +367,8 @@ pub struct MainMenu {
     field_undo_stack: Vec<(u8, String)>,
     cursor_blink: Instant,
     last_click_time: Instant,
+    /// Steady clock for label scroll animation.
+    created: Instant,
     last_click_index: Option<usize>,
     pub gui_scale_setting: u32,
     pub render_distance: u32,
@@ -412,6 +421,7 @@ impl MainMenu {
         game_dir: &Path,
         rt: Arc<tokio::runtime::Runtime>,
         username: String,
+        version: String,
         access_token: Option<String>,
     ) -> Self {
         let server_list = ServerList::load(game_dir);
@@ -420,6 +430,7 @@ impl MainMenu {
         let settings = load_settings(game_dir);
         Self {
             username,
+            version,
             screen: Screen::Main,
             server_list,
             selected_server: None,
@@ -452,6 +463,7 @@ impl MainMenu {
             field_undo_stack: Vec::new(),
             cursor_blink: Instant::now(),
             last_click_time: Instant::now(),
+            created: Instant::now(),
             last_click_index: None,
             gui_scale_setting: settings.gui_scale,
             render_distance: settings.render_distance,
@@ -712,12 +724,22 @@ impl MainMenu {
             Screen::Disconnected(_) => {
                 self.build_disconnected(screen_w, screen_h, input, &text_width_fn)
             }
-            Screen::Options => self.build_options(screen_w, screen_h, input),
-            Screen::OptionsOnline => self.build_options_online(screen_w, screen_h, input),
-            Screen::OptionsVideo => self.build_options_video(screen_w, screen_h, input),
-            Screen::OptionsSkinCustomization => self.build_options_skin(screen_w, screen_h, input),
-            Screen::OptionsMusicSounds => self.build_options_music(screen_w, screen_h, input),
-            Screen::OptionsControls => self.build_options_controls(screen_w, screen_h, input),
+            Screen::Options => self.build_options(screen_w, screen_h, input, &text_width_fn),
+            Screen::OptionsOnline => {
+                self.build_options_online(screen_w, screen_h, input, &text_width_fn)
+            }
+            Screen::OptionsVideo => {
+                self.build_options_video(screen_w, screen_h, input, &text_width_fn)
+            }
+            Screen::OptionsSkinCustomization => {
+                self.build_options_skin(screen_w, screen_h, input, &text_width_fn)
+            }
+            Screen::OptionsMusicSounds => {
+                self.build_options_music(screen_w, screen_h, input, &text_width_fn)
+            }
+            Screen::OptionsControls => {
+                self.build_options_controls(screen_w, screen_h, input, &text_width_fn)
+            }
             Screen::OptionsKeybinds => self.build_options_stub(
                 screen_w,
                 screen_h,
@@ -729,12 +751,14 @@ impl MainMenu {
                 let back = self.settings_back.clone_screen();
                 self.build_options_stub(screen_w, screen_h, input, "Language", back)
             }
-            Screen::OptionsChatSettings => self.build_options_chat(screen_w, screen_h, input),
+            Screen::OptionsChatSettings => {
+                self.build_options_chat(screen_w, screen_h, input, &text_width_fn)
+            }
             Screen::OptionsResourcePacks => {
                 self.build_options_resource_packs(screen_w, screen_h, input, &text_width_fn)
             }
             Screen::OptionsAccessibility => {
-                self.build_options_accessibility(screen_w, screen_h, input)
+                self.build_options_accessibility(screen_w, screen_h, input, &text_width_fn)
             }
             Screen::OptionsTelemetry => self.build_options_stub(
                 screen_w,

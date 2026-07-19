@@ -8,14 +8,14 @@ use azalea_protocol::packets::login::s_hello::ServerboundHello;
 use azalea_protocol::packets::login::s_key::ServerboundKey;
 use azalea_protocol::packets::login::s_login_acknowledged::ServerboundLoginAcknowledged;
 use azalea_protocol::packets::login::{ClientboundLoginPacket, ServerboundLoginPacket};
-use azalea_protocol::read::ReadPacketError;
+use azalea_protocol::read::{ReadPacketError, deserialize_packet};
 use crossbeam_channel::Sender;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 use super::NetworkEvent;
-use super::handler::handle_game_packet;
-use super::sender::PacketSender;
+use super::handler::{handle_game_packet, handle_raw_game_packet};
+use super::sender::{Outbound, PacketSender};
 
 #[derive(Error, Debug)]
 pub enum ConnectionError {
@@ -58,6 +58,9 @@ pub struct ConnectArgs {
     pub uuid: uuid::Uuid,
     pub access_token: Option<String>,
     pub view_distance: u8,
+    /// The server's protocol from an earlier server-list ping, when joining
+    /// from the list; saves `negotiate_wire_version` its status probe.
+    pub protocol: Option<i32>,
 }
 
 pub struct ConnectionHandle {
@@ -70,13 +73,17 @@ pub struct ConnectionHandle {
 impl Drop for ConnectionHandle {
     fn drop(&mut self) {
         self.task.abort();
+        // The session is over: restore the launched version's wire protocol
+        // and block table so nothing stale leaks into the next one.
+        crate::version::clear_session_protocol();
+        crate::world::block::set_active_protocol(crate::version::selected_protocol());
     }
 }
 
 pub fn spawn_connection(rt: &tokio::runtime::Runtime, args: ConnectArgs) -> ConnectionHandle {
     let (event_tx, event_rx) = crossbeam_channel::bounded(4096);
     let (chat_tx, chat_rx) = crossbeam_channel::bounded::<String>(64);
-    let (packet_tx, packet_rx) = mpsc::unbounded_channel::<ServerboundGamePacket>();
+    let (packet_tx, packet_rx) = mpsc::unbounded_channel::<Outbound>();
     let game_packet_tx = packet_tx.clone();
     let packet_tx = PacketSender::new(packet_tx);
     let task = rt.spawn(async move {
@@ -100,14 +107,15 @@ pub async fn connect_to_server(
     args: ConnectArgs,
     event_tx: Sender<NetworkEvent>,
     chat_rx: crossbeam_channel::Receiver<String>,
-    game_packet_tx: mpsc::UnboundedSender<ServerboundGamePacket>,
-    game_packet_rx: mpsc::UnboundedReceiver<ServerboundGamePacket>,
+    game_packet_tx: mpsc::UnboundedSender<Outbound>,
+    game_packet_rx: mpsc::UnboundedReceiver<Outbound>,
 ) -> Result<(), ConnectionError> {
     let server_addr: ServerAddr = args
         .server
         .as_str()
         .try_into()
         .map_err(|_| ConnectionError::InvalidAddress(args.server.clone()))?;
+    negotiate_wire_version(&server_addr, args.protocol).await;
     let conn = super::resolve::connect(&server_addr, ClientIntention::Login).await?;
     let mut conn = conn.login();
 
@@ -153,12 +161,59 @@ pub async fn connect_to_server(
     .await
 }
 
+/// Adopts the server's protocol as the wire version when translation data
+/// for it exists, so one client joins any supported server version;
+/// otherwise the launched version is kept (and the server shows its own
+/// mismatch message, as before). The protocol comes from `known` (a
+/// server-list ping; a stale one just means the server rejects the handshake
+/// with its mismatch message, same as before) or a status probe. Sets the
+/// session protocol and the matching block-state table, so it must run
+/// before the login handshake and before any world state loads.
+async fn negotiate_wire_version(server_addr: &ServerAddr, known: Option<i32>) {
+    let selected = crate::version::selected_protocol();
+    let probed = match known {
+        Some(p) => Some(p),
+        None => {
+            let probe = async {
+                let (status, _) = super::resolve::request_status(server_addr).await.ok()?;
+                Some(status.version.protocol)
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), probe)
+                .await
+                .ok()
+                .flatten()
+        }
+    };
+    let wire = match probed {
+        Some(p) if super::translate::joinable(p) => p,
+        Some(p) => {
+            tracing::warn!("Server speaks unsupported protocol {p}; connecting as {selected}");
+            selected
+        }
+        None => {
+            tracing::warn!("Server protocol probe failed; connecting as {selected}");
+            selected
+        }
+    };
+    tracing::info!("Negotiated wire protocol {wire}");
+    crate::version::set_session_protocol(wire);
+    crate::world::block::set_active_protocol(wire);
+}
+
 async fn login_sequence(
     conn: &mut Connection<ClientboundLoginPacket, ServerboundLoginPacket>,
     args: &ConnectArgs,
 ) -> Result<(), ConnectionError> {
     loop {
-        let packet: ClientboundLoginPacket = conn.read().await?;
+        // Read the raw frame ourselves so older-version layouts can be
+        // rewritten before the typed decode (26.1's login_finished lacks the
+        // trailing session id).
+        let raw = conn.reader.raw.read().await?;
+        let raw = match super::translate::active() {
+            Some(t) => t.translate_login_frame(raw),
+            None => raw,
+        };
+        let packet: ClientboundLoginPacket = deserialize_packet(&mut std::io::Cursor::new(&raw))?;
         tracing::info!("Login packet: {:?}", std::mem::discriminant(&packet));
         match packet {
             ClientboundLoginPacket::Hello(p) => {
@@ -446,8 +501,8 @@ async fn game_loop(
     conn: Connection<ClientboundGamePacket, ServerboundGamePacket>,
     event_tx: &Sender<NetworkEvent>,
     chat_rx: crossbeam_channel::Receiver<String>,
-    outbound_tx: mpsc::UnboundedSender<ServerboundGamePacket>,
-    mut outbound_rx: mpsc::UnboundedReceiver<ServerboundGamePacket>,
+    outbound_tx: mpsc::UnboundedSender<Outbound>,
+    mut outbound_rx: mpsc::UnboundedReceiver<Outbound>,
     registry_holder: azalea_core::registry_holder::RegistryHolder,
 ) -> Result<(), ConnectionError> {
     let (mut reader, mut writer): (
@@ -461,10 +516,35 @@ async fn game_loop(
         std::sync::Arc::new(parking_lot::Mutex::new(None));
 
     tokio::spawn(async move {
-        while let Some(packet) = outbound_rx.recv().await {
-            if let Err(e) = write_game_packet(&mut writer, packet).await {
-                tracing::error!("Failed to write packet: {e}");
-                break;
+        let translation = super::translate::active();
+        'writer: while let Some(out) = outbound_rx.recv().await {
+            // Frames are in the latest layout (azalea's serializer and
+            // `wire`'s encoders both emit it); older wire versions get them
+            // translated before framing.
+            let frame = match out {
+                Outbound::Packet(mut packet) => {
+                    if let Some(t) = translation {
+                        t.remap_outbound(&mut packet);
+                    }
+                    match azalea_protocol::write::serialize_packet(&*packet) {
+                        Ok(frame) => Vec::from(frame),
+                        Err(e) => {
+                            tracing::error!("Failed to serialize packet: {e}");
+                            break;
+                        }
+                    }
+                }
+                Outbound::Raw(bytes) => bytes,
+            };
+            let frames = match translation {
+                Some(t) if t.translates_outbound() => t.translate_outbound_game_frame(frame),
+                _ => vec![frame],
+            };
+            for frame in frames {
+                if let Err(e) = writer.raw.write(&frame).await {
+                    tracing::error!("Failed to write packet: {e}");
+                    break 'writer;
+                }
             }
         }
     });
@@ -511,7 +591,10 @@ async fn game_loop(
                     },
                 )
             };
-            if chat_outbound_tx.send(packet).is_err() {
+            if chat_outbound_tx
+                .send(Outbound::Packet(Box::new(packet)))
+                .is_err()
+            {
                 break;
             }
         }
@@ -522,45 +605,51 @@ async fn game_loop(
     let registry_holder = std::sync::Arc::new(registry_holder);
     let _ = event_tx.try_send(NetworkEvent::Registries(registry_holder.clone()));
 
+    let translation = super::translate::active();
     loop {
-        match reader.read().await {
-            Ok(packet) => {
+        let raw = match reader.raw.read().await {
+            Ok(raw) => raw,
+            Err(e) => {
+                skip_malformed_packet(e)?;
+                continue;
+            }
+        };
+        let raw = match translation {
+            Some(t) => match t.translate_game_frame(raw) {
+                Some(raw) => raw,
+                None => continue,
+            },
+            None => raw,
+        };
+        if handle_raw_game_packet(&raw, event_tx) {
+            continue;
+        }
+        match deserialize_packet::<ClientboundGamePacket>(&mut std::io::Cursor::new(&raw)) {
+            Ok(mut packet) => {
+                if let Some(t) = translation
+                    && !t.remap_inbound(&mut packet)
+                {
+                    continue;
+                }
                 handle_game_packet(&packet, &sender, event_tx, &registry_holder, &shared_tree)
             }
-            Err(e) if is_recoverable_read_error(&e) => {
-                tracing::warn!("Skipping malformed packet: {e}");
-            }
-            Err(e) => return Err(e.into()),
+            Err(e) => skip_malformed_packet(e)?,
         }
     }
 }
 
-/// azalea 0.16 serializes `ServerboundAttack.entity_id` as a fixed i32, but
-/// the protocol expects a VarInt (vanilla `ServerboundAttackPacket` uses
-/// `ByteBufCodecs.VAR_INT`), so the attack packet is encoded by hand.
-async fn write_game_packet(
-    writer: &mut WriteConnection<ServerboundGamePacket>,
-    packet: ServerboundGamePacket,
-) -> std::io::Result<()> {
-    use azalea_buf::AzBufVar;
-    use azalea_protocol::packets::ProtocolPacket;
-
-    if let ServerboundGamePacket::Attack(p) = &packet {
-        let mut buf = Vec::new();
-        packet.id().azalea_write_var(&mut buf)?;
-        p.entity_id.azalea_write_var(&mut buf)?;
-        return writer.raw.write(&buf).await;
-    }
-    writer.write(packet).await
-}
-
-fn is_recoverable_read_error(err: &ReadPacketError) -> bool {
-    matches!(
-        err,
+/// Recoverable decode errors skip the packet; anything else tears down the
+/// connection.
+fn skip_malformed_packet(err: Box<ReadPacketError>) -> Result<(), ConnectionError> {
+    match &*err {
         ReadPacketError::Parse { .. }
-            | ReadPacketError::UnknownPacketId { .. }
-            | ReadPacketError::LeftoverData { .. }
-    )
+        | ReadPacketError::UnknownPacketId { .. }
+        | ReadPacketError::LeftoverData { .. } => {
+            tracing::warn!("Skipping malformed packet: {err}");
+            Ok(())
+        }
+        _ => Err(err.into()),
+    }
 }
 
 fn friendly_error_reason(err: &ConnectionError) -> String {

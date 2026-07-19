@@ -18,7 +18,8 @@ const OVERWORLD_MIN_Y: i32 = -64;
 /// chunk's mesh samples (see `MeshDispatcher::enqueue`) and, by symmetry, the
 /// set that must re-mesh when `pos` changes. Add the diagonals here when the
 /// corner-sample TODO(chunk-light) lands, so the mesh snapshot and the re-mesh
-/// set stay in sync.
+/// set stay in sync (vanilla's `enableChunkLight` dirties the full 3x3 via
+/// `setSectionRangeDirty`).
 pub(crate) fn mesh_neighborhood(pos: ChunkPos) -> [ChunkPos; 5] {
     [
         pos,
@@ -35,34 +36,73 @@ pub enum ChunkError {
     Parse(String),
 }
 
+/// A column's published light, written by the light engine and snapshotted
+/// (via `Arc`) by the mesher. Sections are light sections: one padding
+/// section below the world, `height/16` block sections, one above.
 #[derive(Clone)]
 pub struct ChunkLightData {
     pub sky_sections: Vec<Option<Box<[u8; 2048]>>>,
     pub block_sections: Vec<Option<Box<[u8; 2048]>>>,
     pub min_y: i32,
+    /// Whether the dimension has skylight; without it sky reads 0 (vanilla's
+    /// dummy sky listener).
+    pub has_sky: bool,
+    /// One above the column's highest sky section holding data, as an index
+    /// into `sky_sections`; `None` means no sky data is tracked and the whole
+    /// column reads as open sky.
+    pub sky_top_section: Option<i32>,
 }
 
 impl ChunkLightData {
+    /// Vanilla `SkyLightSectionStorage.getLightValue` on the visible buffer:
+    /// at/above the column's top section is implicit 15, below it missing
+    /// layers defer upward to the nearest stored layer's bottom plane.
     pub fn get_sky_light(&self, x: i32, y: i32, z: i32) -> u8 {
-        self.get_nibble(&self.sky_sections, x, y, z)
+        if !self.has_sky {
+            return 0;
+        }
+        let Some(top) = self.sky_top_section else {
+            return 15;
+        };
+        let mut index = (y - self.min_y).div_euclid(16) + 1;
+        if index >= top {
+            return 15;
+        }
+        let mut local_y = (y - self.min_y).rem_euclid(16);
+        loop {
+            if let Some(data) = usize::try_from(index)
+                .ok()
+                .and_then(|i| self.sky_sections.get(i))
+                .and_then(Option::as_deref)
+            {
+                return Self::nibble(data, x, local_y, z);
+            }
+            index += 1;
+            if index >= top {
+                return 15;
+            }
+            // Walking up reads the found layer's bottom plane (vanilla
+            // flattens the block position's Y).
+            local_y = 0;
+        }
     }
 
     pub fn get_block_light(&self, x: i32, y: i32, z: i32) -> u8 {
-        self.get_nibble(&self.block_sections, x, y, z)
+        let index = (y - self.min_y).div_euclid(16) + 1;
+        match usize::try_from(index)
+            .ok()
+            .and_then(|i| self.block_sections.get(i))
+            .and_then(Option::as_deref)
+        {
+            Some(data) => Self::nibble(data, x, (y - self.min_y).rem_euclid(16), z),
+            None => 0,
+        }
     }
 
-    fn get_nibble(&self, sections: &[Option<Box<[u8; 2048]>>], x: i32, y: i32, z: i32) -> u8 {
-        let section_idx = ((y - self.min_y + 16) / 16) as usize;
-        if section_idx >= sections.len() {
-            return 15;
-        }
-        let Some(data) = &sections[section_idx] else {
-            return 15;
-        };
+    fn nibble(data: &[u8; 2048], x: i32, local_y: i32, z: i32) -> u8 {
         let lx = x.rem_euclid(16) as usize;
-        let ly = y.rem_euclid(16) as usize;
         let lz = z.rem_euclid(16) as usize;
-        let idx = ly * 256 + lz * 16 + lx;
+        let idx = local_y as usize * 256 + lz * 16 + lx;
         let byte = data[idx / 2];
         if idx.is_multiple_of(2) {
             byte & 0x0F
@@ -88,10 +128,10 @@ pub const fn unpack_chunk_pos(val: u64) -> ChunkPos {
 /// via `crossbeam-epoch`.
 ///
 /// Concurrency contract: any thread may read, but all writes
-/// (`load_chunk`, `set_block_state*`, `store_light`, `unload_chunk`) must stay
-/// on the main thread. Mutation is clone-on-write with an unconditional
-/// `swap`, so two concurrent writers to the same slot would silently lose one
-/// update.
+/// (`load_chunk`, `set_block_state*`, `set_light_data`, `update_light_data`,
+/// `unload_chunk`) must stay on the main thread. Mutation is clone-on-write
+/// with an unconditional `swap`, so two concurrent writers to the same slot
+/// would silently lose one update.
 pub struct SharedChunkStore {
     view_center: AtomicU64,
     pub(crate) chunk_radius: u32,
@@ -200,52 +240,6 @@ impl SharedChunkStore {
         Ok(())
     }
 
-    pub fn store_light(
-        &self,
-        pos: ChunkPos,
-        sky_updates: &[Box<[u8]>],
-        block_updates: &[Box<[u8]>],
-        sky_y_mask: &azalea_core::bitset::BitSet,
-        block_y_mask: &azalea_core::bitset::BitSet,
-    ) {
-        let num_sections = (self.height / 16 + 2) as usize;
-        let mut sky_sections = vec![None; num_sections];
-        let mut block_sections = vec![None; num_sections];
-
-        let mut sky_idx = 0usize;
-        for (i, section) in sky_sections.iter_mut().enumerate().take(num_sections) {
-            if i < sky_y_mask.len() && sky_y_mask.index(i) {
-                if sky_idx < sky_updates.len() && sky_updates[sky_idx].len() == 2048 {
-                    let mut arr = Box::new([0u8; 2048]);
-                    arr.copy_from_slice(&sky_updates[sky_idx]);
-                    *section = Some(arr);
-                }
-                sky_idx += 1;
-            }
-        }
-
-        let mut block_idx = 0usize;
-        for (i, section) in block_sections.iter_mut().enumerate().take(num_sections) {
-            if i < block_y_mask.len() && block_y_mask.index(i) {
-                if block_idx < block_updates.len() && block_updates[block_idx].len() == 2048 {
-                    let mut arr = Box::new([0u8; 2048]);
-                    arr.copy_from_slice(&block_updates[block_idx]);
-                    *section = Some(arr);
-                }
-                block_idx += 1;
-            }
-        }
-
-        let light = ChunkLightData {
-            sky_sections,
-            block_sections,
-            min_y: self.min_y,
-        };
-
-        let guard = epoch::pin();
-        Self::publish(self.light_data.get(pos), light, &guard);
-    }
-
     pub fn get_light_guard<'g>(
         &self,
         pos: ChunkPos,
@@ -254,6 +248,30 @@ impl SharedChunkStore {
         let shared = self.light_data.get(pos).load(Ordering::Acquire, guard);
         // SAFETY: loaded under `guard`, which the returned reference borrows.
         unsafe { shared.as_ref() }
+    }
+
+    /// Publishes a column's light wholesale (the light engine's
+    /// `on_chunk_loaded` path).
+    pub fn set_light_data(&self, pos: ChunkPos, light: ChunkLightData) {
+        let guard = epoch::pin();
+        Self::publish(self.light_data.get(pos), light, &guard);
+    }
+
+    /// Clone-on-write update of a column's existing light (the light engine's
+    /// publish path). Returns false when the column has no light yet.
+    pub fn update_light_data(
+        &self,
+        pos: ChunkPos,
+        mutate: impl FnOnce(&mut ChunkLightData),
+    ) -> bool {
+        let guard = epoch::pin();
+        let Some(current) = self.get_light_guard(pos, &guard) else {
+            return false;
+        };
+        let mut light = current.clone();
+        mutate(&mut light);
+        Self::publish(self.light_data.get(pos), light, &guard);
+        true
     }
 
     pub fn get_sky_light(&self, x: i32, y: i32, z: i32) -> u8 {
@@ -301,36 +319,62 @@ impl SharedChunkStore {
     }
 
     pub fn set_block_state(&self, x: i32, y: i32, z: i32, state: BlockState) {
-        self.set_block_states(std::iter::once((BlockPos::new(x, y, z), state)));
+        self.set_block_state_tracked(x, y, z, state);
     }
 
-    /// Applies a run of block updates, cloning each affected chunk once per
-    /// contiguous run instead of once per block (multi-block section updates
-    /// arrive hundreds of blocks at a time).
-    pub fn set_block_states(&self, updates: impl IntoIterator<Item = (BlockPos, BlockState)>) {
+    /// Sets a block and reports what vanilla `LevelChunk.setBlockState` feeds
+    /// the light engine: the previous state, plus whether the section flipped
+    /// between empty and non-empty. No-op writes (missing chunk, out-of-range
+    /// y) return the new state and no flip.
+    // TODO: multi-block updates clone the whole chunk once per block; batch
+    // them per column while still reporting per-block old states.
+    pub fn set_block_state_tracked(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        state: BlockState,
+    ) -> (BlockState, Option<bool>) {
+        let chunk_pos = ChunkPos::new(x.div_euclid(16), z.div_euclid(16));
         let guard = epoch::pin();
-        let mut pending: Option<(ChunkPos, Chunk)> = None;
-        for (pos, state) in updates {
-            let chunk_pos = ChunkPos::new(pos.x.div_euclid(16), pos.z.div_euclid(16));
-            if pending.as_ref().is_none_or(|(p, _)| *p != chunk_pos) {
-                if let Some((p, chunk)) = pending.take() {
-                    Self::publish(self.chunks.get(p), chunk, &guard);
-                }
-                let Some(chunk_ref) = self.get_chunk_guard(chunk_pos, &guard) else {
-                    continue;
-                };
-                pending = Some((chunk_pos, clone_chunk(chunk_ref)));
-            }
-            let (_, chunk) = pending.as_mut().unwrap();
-            let block_pos = azalea_core::position::ChunkBlockPos {
-                x: pos.x.rem_euclid(16) as u8,
-                y: pos.y,
-                z: pos.z.rem_euclid(16) as u8,
-            };
-            chunk.set_block_state(&block_pos, state, self.min_y);
-        }
-        if let Some((p, chunk)) = pending.take() {
-            Self::publish(self.chunks.get(p), chunk, &guard);
+        let Some(chunk_ref) = self.get_chunk_guard(chunk_pos, &guard) else {
+            return (state, None);
+        };
+        let section_index = (y - self.min_y).div_euclid(16);
+        let Some(section) = usize::try_from(section_index)
+            .ok()
+            .filter(|&i| i < chunk_ref.sections.len())
+        else {
+            return (state, None);
+        };
+        let mut chunk = clone_chunk(chunk_ref);
+        let was_empty = chunk.sections[section].block_count == 0;
+        let block_pos = azalea_core::position::ChunkBlockPos {
+            x: x.rem_euclid(16) as u8,
+            y,
+            z: z.rem_euclid(16) as u8,
+        };
+        let old = chunk.get_and_set_block_state(&block_pos, state, self.min_y);
+        let is_empty = chunk.sections[section].block_count == 0;
+        Self::publish(self.chunks.get(chunk_pos), chunk, &guard);
+        (old, (was_empty != is_empty).then_some(is_empty))
+    }
+
+    /// Whether the block section at world section-y has only air (vanilla
+    /// `LevelChunkSection.hasOnlyAir`; azalea tracks per-section block
+    /// counts). Missing chunks and out-of-range sections read as empty.
+    pub fn section_is_empty(&self, pos: (i32, i32), section_y: i32) -> bool {
+        let guard = epoch::pin();
+        let Some(chunk) = self.get_chunk_guard(ChunkPos::new(pos.0, pos.1), &guard) else {
+            return true;
+        };
+        let index = section_y - self.min_section_y();
+        match usize::try_from(index)
+            .ok()
+            .and_then(|i| chunk.sections.get(i))
+        {
+            Some(section) => section.block_count == 0,
+            None => true,
         }
     }
 
@@ -450,19 +494,6 @@ impl ChunkStore {
     }
 
     #[inline]
-    pub fn store_light(
-        &self,
-        pos: ChunkPos,
-        sky_updates: &[Box<[u8]>],
-        block_updates: &[Box<[u8]>],
-        sky_y_mask: &azalea_core::bitset::BitSet,
-        block_y_mask: &azalea_core::bitset::BitSet,
-    ) {
-        self.shared
-            .store_light(pos, sky_updates, block_updates, sky_y_mask, block_y_mask);
-    }
-
-    #[inline]
     pub fn get_sky_light(&self, x: i32, y: i32, z: i32) -> u8 {
         self.shared.get_sky_light(x, y, z)
     }
@@ -478,8 +509,14 @@ impl ChunkStore {
     }
 
     #[inline]
-    pub fn set_block_states(&self, updates: impl IntoIterator<Item = (BlockPos, BlockState)>) {
-        self.shared.set_block_states(updates);
+    pub fn set_block_state_tracked(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        state: BlockState,
+    ) -> (BlockState, Option<bool>) {
+        self.shared.set_block_state_tracked(x, y, z, state)
     }
 
     #[inline]
@@ -503,6 +540,11 @@ impl ChunkStore {
     }
 
     #[inline]
+    pub fn section_is_empty(&self, pos: (i32, i32), section_y: i32) -> bool {
+        self.shared.section_is_empty(pos, section_y)
+    }
+
+    #[inline]
     pub fn motion_blocking_height(&self, x: i32, z: i32) -> i32 {
         self.shared.motion_blocking_height(x, z)
     }
@@ -523,7 +565,9 @@ fn clone_chunk(chunk: &Chunk) -> Chunk {
 }
 
 pub fn block_state_from_section(chunk: &Chunk, x: i32, y: i32, z: i32, min_y: i32) -> BlockState {
-    let section_idx = ((y - min_y) / 16) as usize;
+    // div_euclid so below-world y maps out of range (-> AIR) instead of
+    // truncating into section 0; vanilla getSectionIndex floors.
+    let section_idx = (y - min_y).div_euclid(16) as usize;
     if section_idx >= chunk.sections.len() {
         return BlockState::AIR;
     }
