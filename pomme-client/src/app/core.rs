@@ -354,11 +354,18 @@ impl AppCore {
         let mut disconnect_reason: Option<String> = None;
         let mut processed = 0u32;
         self.drain_player_skin_results(renderer);
+        // Empty the channel before applying (see `GameState::pending_events`
+        // for why nothing may stay in it); only the applying is budgeted, and
+        // leftovers keep their order for next frame.
         while let Ok(event) = rx.try_recv() {
-            processed += 1;
-            if processed > 4096 {
+            game.pending_events.push_back(event);
+        }
+        const NET_DRAIN_BUDGET_SECS: f32 = 0.003;
+        while processed < 4096 && t_net.elapsed().as_secs_f32() < NET_DRAIN_BUDGET_SECS {
+            let Some(event) = game.pending_events.pop_front() else {
                 break;
-            }
+            };
+            processed += 1;
             match event {
                 NetworkEvent::Connected => {
                     if let Some(state) = connect_phase.as_deref_mut() {

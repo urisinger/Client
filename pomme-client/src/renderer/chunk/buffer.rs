@@ -403,6 +403,9 @@ pub struct ChunkBufferStore {
     /// Post-cull section draw count read back from the GPU (lags a few frames);
     /// exposed for the debug overlay so occlusion's effect is visible.
     last_draw_count: u32,
+    /// CPU cost of the last cull's meta rebuild + sort, for the chunk-load
+    /// bench's frame breakdown.
+    last_meta_rebuild_ms: f32,
 
     /// Monotonic frame counter, bumped once per rendered frame in
     /// `begin_frame`.
@@ -505,9 +508,10 @@ impl ChunkBufferStore {
 
         // Per-section packing yields many more draws than buckets, so pre-size
         // generously: growth (`ensure_meta_capacity`) needs a `device.wait_idle`
-        // to safely rewrite the descriptor sets, and we don't want that stall
-        // firing mid-stream. The remaining grow path stays as a rare safety net.
-        let max_meta = (total_buckets * 16).max(8192) as usize;
+        // to safely rewrite the descriptor sets, and that stall showed up as a
+        // 27ms frame when an RD-32 world (~45k section draws) crossed 16x. The
+        // grow path stays as a rare safety net.
+        let max_meta = (total_buckets * 32).max(8192) as usize;
         let meta_size = (max_meta * size_of::<ChunkMeta>()) as u64;
         let indirect_size = (max_meta * size_of::<DrawCommand>()) as u64;
         let count_size = 4u64;
@@ -765,6 +769,7 @@ impl ChunkBufferStore {
             frustum_allocs,
             fade_enabled: false,
             last_draw_count: 0,
+            last_meta_rebuild_ms: 0.0,
             frame_seq: 0,
             pending_free: VecDeque::new(),
             last_player_chunk: ChunkPos::new(0, 0),
@@ -776,6 +781,10 @@ impl ChunkBufferStore {
     /// cull). Read back from the GPU count buffer, so it lags a few frames.
     pub fn sections_drawn(&self) -> u32 {
         self.last_draw_count
+    }
+
+    pub fn meta_rebuild_ms(&self) -> f32 {
+        self.last_meta_rebuild_ms
     }
 
     /// Whether `pos`'s column is near enough to the eye to render opaque
@@ -1285,6 +1294,7 @@ impl ChunkBufferStore {
         // list must rebuild; otherwise it only changes on edits/loads/visibility
         // (`meta_dirty`). The fade check is O(1) against `fade_until`.
         let any_fading = self.fade_enabled && now < self.fade_until;
+        let t_rebuild = std::time::Instant::now();
         let content_changed = self.meta_dirty || any_fading;
 
         if content_changed {
@@ -1350,6 +1360,7 @@ impl ChunkBufferStore {
             // Draw list reordered: every frame slot's meta buffer needs the refresh.
             self.meta_upload_pending = MAX_FRAMES_IN_FLIGHT as u32;
         }
+        self.last_meta_rebuild_ms = t_rebuild.elapsed().as_secs_f32() * 1000.0;
 
         let count = self.cached_meta.len() as u32;
         // Each frame slot has its own meta buffer; copy only into slots that

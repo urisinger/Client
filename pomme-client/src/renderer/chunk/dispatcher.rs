@@ -123,7 +123,9 @@ impl ChunkMeshing {
         let update_set = Arc::new(ChunkRing::from_fn(|_, _| AtomicU32::new(0)));
         let queue = Arc::new(MeshQueue::new());
         let worker_count = std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(1).max(1))
+            // Leave two cores free: the main thread and the net task both need
+            // headroom while a load burst saturates the workers.
+            .map(|n| n.get().saturating_sub(2).max(1))
             .unwrap_or(1);
         let registry = Arc::new(registry);
         let uv_map = Arc::new(uv_map);
@@ -250,7 +252,11 @@ impl ChunkMeshing {
     ) {
         let min_y_section = self.store.min_section_y();
         let section_count = self.store.section_count();
-        let mut candidate_jobs = Vec::new();
+
+        // Pass 1: cheap per-column screen for work, so an all-dirty burst
+        // (dimension change, benchmark reset) pays the per-section walk only
+        // for columns it will actually visit.
+        let mut active_cols: Vec<(ChunkPos, u32, u32)> = Vec::new();
         for &pos in loaded {
             let vis_mask = visibility
                 .get_in_range(pos, visibility_center)
@@ -264,6 +270,23 @@ impl ChunkMeshing {
             // and the lod unchanged the section loop has no work.
             if active_mask == 0 && self.col_lod.get(&pos) == Some(&lod) {
                 continue;
+            }
+            active_cols.push((pos, active_mask, lod));
+        }
+        // Nearest columns first, so stopping at the job cap keeps the closest
+        // work and leaves the rest completely untouched (bits, lod and
+        // identity stamps included) for later rescans.
+        active_cols.sort_by_key(|(pos, ..)| {
+            let dx = pos.x - player_chunk.x;
+            let dz = pos.z - player_chunk.z;
+            dx * dx + dz * dz
+        });
+
+        const MAX_RESCAN_JOBS: usize = 8192;
+        let mut candidate_jobs = Vec::new();
+        for (pos, active_mask, lod) in active_cols {
+            if candidate_jobs.len() >= MAX_RESCAN_JOBS {
+                break;
             }
             for si in 0..section_count {
                 let spos = ChunkSectionPos::new(pos.x, min_y_section + si, pos.z);

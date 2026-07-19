@@ -275,6 +275,12 @@ pub struct UpdatePhases {
     pub rescan_ms: f32,
     pub mesh_drain_ms: f32,
     pub upload_ms: f32,
+    /// CPU time of the whole render call (command recording, staging memcpy,
+    /// submit) — the part of `update_ms` no other phase covers.
+    pub render_cpu_ms: f32,
+    /// `dispatch_cull`'s meta rebuild + sort, broken out of `render_cpu_ms`
+    /// (measured at ~0.1-2.5ms during load; kept to catch regressions).
+    pub meta_rebuild_ms: f32,
 }
 
 /// Phase split of a run's single worst frame, to localize a hitch. `total_ms`
@@ -379,6 +385,9 @@ enum ChunkPhase {
 const SERVER_WAIT_MIN_SECS: f32 = 1.0;
 const SERVER_WAIT_STABLE_SECS: f32 = 1.5;
 const SERVER_WAIT_MAX_SECS: f32 = 10.0;
+/// A timed load also finishes once the GPU count has held still this long
+/// (some sections legitimately never mesh — see the reached/settled check).
+const LOAD_SETTLE_SECS: f32 = 2.0;
 
 /// What the per-frame driver should do with the render distance this frame.
 pub enum ChunkLoadStep {
@@ -551,24 +560,30 @@ impl ChunkLoadBench {
                     self.first_load_at = Some(Instant::now());
                 }
 
-                // Done when GPU loaded reaches or exceeds the cached chunks target
-                // (baseline_count)
-                let done = gpu_loaded >= self.baseline_count;
+                // Done when GPU loaded reaches the cached target — or when it
+                // stops growing: meshing is visibility-gated, so columns fully
+                // outside the bench camera's frustum never mesh and the exact
+                // target can be unreachable (this hung run 1 at some angles).
+                let reached = gpu_loaded >= self.baseline_count;
+                let settled =
+                    gpu_loaded > 0 && self.last_change.elapsed().as_secs_f32() >= LOAD_SETTLE_SECS;
 
-                if done {
+                if reached || settled {
                     let now = Instant::now();
-                    let elapsed = self.start.elapsed().as_secs_f32();
+                    // A settle-finish ended at the last count change, not now.
+                    let end = if reached { now } else { self.last_change };
+                    let elapsed = end.duration_since(self.start).as_secs_f32();
                     let first_secs = self
                         .first_load_at
                         .map(|t| t.duration_since(self.start).as_secs_f32())
                         .unwrap_or(0.0);
                     self.completed.push(ChunkLoadRun {
                         load_secs: elapsed,
-                        chunks_per_sec: self.baseline_count as f32 / elapsed.max(0.001),
+                        chunks_per_sec: gpu_loaded as f32 / elapsed.max(0.001),
                         time_to_first_secs: first_secs,
                         avg_frame_ms: self.frame_ms_sum / self.frame_samples.max(1) as f32,
                         worst_frame_ms: self.frame_ms_max,
-                        chunk_count: self.baseline_count,
+                        chunk_count: gpu_loaded,
                         mesh_total_secs: self.mesh_ms_sum / 1000.0,
                         mesh_avg_ms: self.mesh_ms_sum / self.mesh_jobs.max(1) as f32,
                         queue_avg_ms: self.queue_ms_sum / self.mesh_jobs.max(1) as f32,

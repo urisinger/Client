@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -145,6 +145,10 @@ pub struct GameState {
     pub tab_list: TabList,
     /// Locator bar waypoints tracked by the server.
     pub waypoints: crate::world::waypoints::WaypointMap,
+    /// Network events pulled off the (bounded, drop-on-full) channel but not
+    /// yet applied: the channel must always be emptied so the net thread's
+    /// `try_send` never drops, while applying is time-budgeted per frame.
+    pub pending_events: VecDeque<crate::net::NetworkEvent>,
     /// Client tick counter (vanilla `player.tickCount`).
     pub tick_count: u64,
     /// Tick of the last XP progress change; the XP bar outprioritizes the
@@ -258,6 +262,7 @@ impl GameState {
             command_tree: None,
             tab_list: TabList::new(),
             waypoints: crate::world::waypoints::WaypointMap::default(),
+            pending_events: VecDeque::new(),
             tick_count: 0,
             xp_display_start_tick: i64::MIN,
             interaction: InteractionState::new(),
@@ -1811,6 +1816,7 @@ pub fn update_game(
     // Recompute after this frame's state changes (a finished benchmark releases
     // the cursor mid-frame), so the renderer doesn't re-hide it from a stale value.
     let hide_cursor = game.input_live() && !game.dead && core.input.is_cursor_captured();
+    let t_render = std::time::Instant::now();
     match gfx.renderer.render_world(
         &gfx.window,
         hide_cursor,
@@ -1847,6 +1853,8 @@ pub fn update_game(
             tracing::error!("Render error: {e}");
         }
     }
+    game.last_update_phases.render_cpu_ms = t_render.elapsed().as_secs_f32() * 1000.0;
+    game.last_update_phases.meta_rebuild_ms = gfx.renderer.meta_rebuild_ms();
     // Whole-frame wall time (incl. render), read next frame to align with `raw_dt`.
     game.last_update_phases.update_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
 

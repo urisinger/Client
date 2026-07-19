@@ -956,6 +956,10 @@ impl Renderer {
         self.chunk_buffers.sections_drawn()
     }
 
+    pub fn meta_rebuild_ms(&self) -> f32 {
+        self.chunk_buffers.meta_rebuild_ms()
+    }
+
     pub fn wait_for_all_frames(&self) {
         let _ = self
             .ctx
