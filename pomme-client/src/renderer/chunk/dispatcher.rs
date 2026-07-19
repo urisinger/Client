@@ -53,12 +53,30 @@ pub const fn unpack_section_pos(val: u64) -> ChunkSectionPos {
     } else {
         z_raw as i32
     };
-    let y = if y_raw & 0x0080_0000 != 0 {
+    let y = if y_raw & 0x0000_8000 != 0 {
         (y_raw | 0xFFFF_0000) as i32
     } else {
         y_raw as i32
     };
     ChunkSectionPos::new(x, y, z)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn section_pos_roundtrips_negative_coords() {
+        for pos in [
+            ChunkSectionPos::new(0, 0, 0),
+            ChunkSectionPos::new(-1, -4, -1),
+            ChunkSectionPos::new(123_456, -4, -123_456),
+            ChunkSectionPos::new(-8_388_608, 19, 8_388_607),
+            ChunkSectionPos::new(7, -32_768, -7),
+        ] {
+            assert_eq!(unpack_section_pos(pack_section_pos(pos)), pos);
+        }
+    }
 }
 pub struct ChunkMeshing {
     /// Section metadata ring: single 64-byte cache line per section slot
@@ -325,7 +343,9 @@ impl PendingJob {
     ) {
         let chunk_pos = ChunkPos::new(self.pos.x, self.pos.z);
         let rel_y = shared_chunk_store.section_y_index(self.pos.y);
-        // Stage 1: Claim — Clear bit in update_set (Acquire)
+        // Claim: clear the dirty bit before snapshotting below, so an edit
+        // landing mid-mesh re-marks the section (ReMarkGuard) instead of being
+        // dropped.
         update_set
             .get(chunk_pos)
             .fetch_and(!(1 << rel_y), Ordering::Acquire);
@@ -344,8 +364,6 @@ impl PendingJob {
             rel_y,
             defused: false,
         };
-        // Stage 2: Fetch — Create SectionStoreSnapshot on worker thread from
-        // SharedChunkStore
         let snapshot = SectionStoreSnapshot {
             section: LocalSection::new_boxed(shared_chunk_store, claim_pos),
             grass_colormap: Arc::clone(grass_colormap),
@@ -355,7 +373,6 @@ impl PendingJob {
             min_y: shared_chunk_store.min_y(),
             spos: claim_pos,
         };
-        // Stage 3: Execute — Mesh section
         let mesh = mesh_section(
             &snapshot,
             claim_pos,
@@ -365,7 +382,7 @@ impl PendingJob {
             claim_ver,
             self.upload_epoch,
         );
-        // Stage 4: Return — Send mesh tagged with claim_ver
+        // Meshing finished: keep the guard from re-marking, then hand off.
         guard.defused = true;
         let _ = tx.send(mesh);
     }

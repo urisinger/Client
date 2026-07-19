@@ -652,18 +652,10 @@ fn greedy_mesh_section(
                     light_tint: pack_light_tint(lights[i], tint),
                 });
             }
-            if lights[0] + lights[2] > lights[1] + lights[3] {
-                indices.extend_from_slice(&[
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 3,
-                    base,
-                    base + 1,
-                ]);
-            } else {
-                indices.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
-            }
+            indices.extend_from_slice(&quad_indices(
+                base,
+                lights[0] + lights[2] > lights[1] + lights[3],
+            ));
         }
     }
 }
@@ -702,7 +694,6 @@ pub(crate) fn mesh_section(
     for local_z in (0..16).step_by(step_usize) {
         for local_x in (0..16).step_by(step_usize) {
             for local_y in (0..16).step_by(step_usize) {
-                // Array indices are natively usize in the for loop
                 let mut state = snapshot.section.get_block_state(local_x, local_y, local_z);
                 let mut kind = classify_block(state);
                 // LOD Air Look-ahead
@@ -718,8 +709,6 @@ pub(crate) fn mesh_section(
                         }
                     }
                 }
-                // If it's still air, jump to next loop (iterator handles the step
-                // automatically)
                 if matches!(kind, BlockKind::Air) {
                     continue;
                 }
@@ -733,7 +722,6 @@ pub(crate) fn mesh_section(
                 // Section-local vertex base (matching the origin the buffer derives),
                 // so positions never pass through absolute f32 world space.
                 let block_pos = [local_x as f32, local_y as f32, local_z as f32];
-                // Route this block's geometry
                 if lod > 0 {
                     emit_lod_cube(
                         &mut sink, block_pos, state, snapshot, registry, uv_map, local_x, local_y,
@@ -1143,8 +1131,7 @@ fn emit_lod_cube(
             });
         }
         // LOD cubes go in the solid pass (matching the un-split single-list path).
-        sink.solid
-            .extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
+        sink.solid.extend_from_slice(&quad_indices(base, false));
     }
 }
 const MISSING_TINT: u32 = pack_tint_shifted([1.0, 0.0, 1.0]);
@@ -1181,8 +1168,7 @@ fn emit_missing_cube(
             });
         }
         // The missing tile is a solid checker, so the cube goes in the solid pass.
-        sink.solid
-            .extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
+        sink.solid.extend_from_slice(&quad_indices(base, false));
     }
 }
 pub(crate) const CUBE_FACE_DIRS: [Direction; 6] = [
@@ -1193,6 +1179,16 @@ pub(crate) const CUBE_FACE_DIRS: [Direction; 6] = [
     Direction::East,
     Direction::West,
 ];
+/// The six indices for a quad's two triangles starting at `base`. `flip` swaps
+/// the split diagonal (vanilla's AO-driven winding flip).
+#[inline]
+fn quad_indices(base: u32, flip: bool) -> [u32; 6] {
+    if flip {
+        [base + 1, base + 2, base + 3, base + 3, base, base + 1]
+    } else {
+        [base, base + 1, base + 2, base + 2, base + 3, base]
+    }
+}
 /// Emit a face into the index list picked by the quad's sprite opacity
 /// (solid vs cutout pass). Fluids route explicitly via [`emit_face_into`].
 #[allow(clippy::too_many_arguments)]
@@ -1246,11 +1242,10 @@ fn emit_face_into(
             light_tint: pack_light_tint(lights[i], tint),
         });
     }
-    if lights[0] + lights[2] > lights[1] + lights[3] {
-        indices.extend_from_slice(&[base + 1, base + 2, base + 3, base + 3, base, base + 1]);
-    } else {
-        indices.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
-    }
+    indices.extend_from_slice(&quad_indices(
+        base,
+        lights[0] + lights[2] > lights[1] + lights[3],
+    ));
 }
 fn shade_brightness(state: azalea_block::BlockState, registry: &BlockRegistry) -> f32 {
     // TODO: non-occluding full cubes (leaves, glass, ice) still darken adjacent

@@ -28,7 +28,7 @@ const NEARBY_DIST_SQ: f32 = 768.0;
 
 /// Whether a column's center is within the always-near X/Z radius of the eye
 /// (vanilla `isNearby`), rebased in f64 for precision at extreme coordinates.
-/// Also gates mesh-scheduling tiers (`in_game::apply_visibility`).
+/// Also suppresses the section fade-in for near columns (`column_nearby`).
 pub fn column_is_near(pos: ChunkPos, eye: DVec3) -> bool {
     let dx = pos.x as f64 * 16.0 + 8.0 - eye.x;
     let dz = pos.z as f64 * 16.0 + 8.0 - eye.z;
@@ -149,6 +149,16 @@ struct ChunkMeta {
 fn write_verts(dst: &mut [u8], off: usize, verts: &[PackedVertex]) {
     let bytes: &[u8] = bytemuck::cast_slice(verts);
     dst[off..off + bytes.len()].copy_from_slice(bytes);
+}
+
+/// Copy a section's opaque indices immediately followed by its water indices
+/// into `dst` starting at byte `off`, returning the total bytes written.
+fn write_indices(dst: &mut [u8], off: usize, opaque: &[u32], water: &[u32]) -> usize {
+    let opaque: &[u8] = bytemuck::cast_slice(opaque);
+    let water: &[u8] = bytemuck::cast_slice(water);
+    dst[off..off + opaque.len()].copy_from_slice(opaque);
+    dst[off + opaque.len()..off + opaque.len() + water.len()].copy_from_slice(water);
+    opaque.len() + water.len()
 }
 
 /// Vertex input for the chunk pipeline: binding 0 is the packed per-vertex
@@ -981,17 +991,14 @@ impl ChunkBufferStore {
                     });
                     stg_v += vbytes;
 
-                    let opaque: &[u8] = bytemuck::cast_slice(&entry.mesh.indices);
-                    let water: &[u8] = bytemuck::cast_slice(&entry.mesh.water_indices);
-                    buf[stg_i..stg_i + opaque.len()].copy_from_slice(opaque);
-                    buf[stg_i + opaque.len()..stg_i + opaque.len() + water.len()]
-                        .copy_from_slice(water);
+                    let ibytes =
+                        write_indices(buf, stg_i, &entry.mesh.indices, &entry.mesh.water_indices);
                     copy_i.push(vk::BufferCopy {
                         src_offset: stg_i as u64,
                         dst_offset: entry.idx_off as u64 * INDEX_SIZE,
-                        size: (opaque.len() + water.len()) as u64,
+                        size: ibytes as u64,
                     });
-                    stg_i += opaque.len() + water.len();
+                    stg_i += ibytes;
                 }
             }
             self.flush_transfer(device, queue, &copy_v, &copy_i);
@@ -1006,12 +1013,8 @@ impl ChunkBufferStore {
             {
                 let ibuf = self.index_alloc.mapped_slice_mut().unwrap();
                 for entry in &entries {
-                    let opaque: &[u8] = bytemuck::cast_slice(&entry.mesh.indices);
-                    let water: &[u8] = bytemuck::cast_slice(&entry.mesh.water_indices);
                     let off = entry.idx_off as usize * INDEX_SIZE as usize;
-                    ibuf[off..off + opaque.len()].copy_from_slice(opaque);
-                    ibuf[off + opaque.len()..off + opaque.len() + water.len()]
-                        .copy_from_slice(water);
+                    write_indices(ibuf, off, &entry.mesh.indices, &entry.mesh.water_indices);
                 }
             }
         }
@@ -1507,8 +1510,7 @@ impl ChunkBufferStore {
 
         let now = std::time::Instant::now();
         for (pos, alloc) in self.chunks.iter() {
-            // The visibility ring's mask skips sections proven occluded; columns
-            // outside its range draw unconditionally (fail open).
+            // Fail open outside the visibility ring's range.
             let col_vis = vis_mask
                 .get_in_range(*pos, visibility_center)
                 .copied()

@@ -173,23 +173,19 @@ impl VulkanContext {
         };
         tracing::info!("GPU: {gpu_name} ({vulkan_version})");
 
-        // Get physical device properties for feature checks
         let properties = physical_device.get_properties();
         let family_props = physical_device.get_queue_family_properties();
         let graphics_family_props = family_props[graphics_family as usize];
 
-        // Check features support
         let base_features = physical_device.get_features();
         let fill_mode_non_solid = base_features.fill_mode_non_solid == vk::TRUE;
         let draw_indirect_first_instance = base_features.draw_indirect_first_instance == vk::TRUE;
 
-        // Check for timestamp queries support
         let queue_supports_timestamps = graphics_family_props.timestamp_valid_bits > 0;
         let timestamp_queries = properties.limits.timestamp_compute_and_graphics == vk::TRUE
             && properties.limits.timestamp_period > 0.0
             && queue_supports_timestamps;
 
-        // Log feature availability
         if fill_mode_non_solid {
             tracing::info!("fillModeNonSolid supported, wireframe mode available");
         } else {

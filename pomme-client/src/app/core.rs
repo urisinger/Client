@@ -1204,7 +1204,7 @@ impl AppCore {
             self.menu.active_packs = self.resource_packs.active_pack_info();
         }
         let player_chunk = game.player_chunk();
-        let min_y_section = game.chunk_store.min_y().div_euclid(16);
+        let min_y_section = game.chunk_store.min_section_y();
         // Edits mesh the affected section(s) immediately on the priority lane,
         // ungated by visibility.
         for &(col, si) in &priority_remesh {

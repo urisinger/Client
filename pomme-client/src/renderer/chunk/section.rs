@@ -3,10 +3,18 @@ use azalea_core::position::{
     ChunkPos, ChunkSectionBiomePos, ChunkSectionBlockPos, ChunkSectionPos,
 };
 use azalea_registry::data::Biome;
-use azalea_world::Chunk;
+use azalea_world::{Chunk, Section};
 use crossbeam_epoch::{self as epoch};
 
 use crate::world::chunk::{ChunkLightData, SharedChunkStore};
+
+/// The section at world section-y within `chunk`, or `None` when the column is
+/// absent or the y falls outside the built sections.
+#[inline]
+fn section_at(chunk: Option<&Chunk>, section_y: i32) -> Option<&Section> {
+    let idx = usize::try_from(section_y).ok()?;
+    chunk?.sections.get(idx)
+}
 
 pub struct LocalSection {
     pub blocks: [[[BlockState; 18]; 18]; 18],
@@ -27,8 +35,7 @@ impl LocalSection {
 
     #[inline]
     fn build(&mut self, shared: &SharedChunkStore, spos: ChunkSectionPos) {
-        let min_y = shared.min_y();
-        let base_y = spos.y - min_y.div_euclid(16);
+        let base_y = spos.y - shared.min_section_y();
         let guard = epoch::pin();
         let chunk_grid: [[Option<&Chunk>; 3]; 3] = std::array::from_fn(|x| {
             std::array::from_fn(|z| {
@@ -54,22 +61,16 @@ impl LocalSection {
                     let chunk = chunk_grid[(lx.div_euclid(16) + 1) as usize]
                         [(lz.div_euclid(16) + 1) as usize];
                     let section_y = base_y + ly.div_euclid(16);
-                    self.blocks[(lx + 1) as usize][(ly + 1) as usize][(lz + 1) as usize] = chunk
-                        .and_then(|c| {
-                            if section_y >= 0 && section_y < c.sections.len() as i32 {
-                                c.sections.get(section_y as usize)
-                            } else {
-                                None
-                            }
-                        })
-                        .map(|s| {
-                            s.get_block_state(ChunkSectionBlockPos {
-                                x: lx.rem_euclid(16) as u8,
-                                y: ly.rem_euclid(16) as u8,
-                                z: lz.rem_euclid(16) as u8,
+                    self.blocks[(lx + 1) as usize][(ly + 1) as usize][(lz + 1) as usize] =
+                        section_at(chunk, section_y)
+                            .map(|s| {
+                                s.get_block_state(ChunkSectionBlockPos {
+                                    x: lx.rem_euclid(16) as u8,
+                                    y: ly.rem_euclid(16) as u8,
+                                    z: lz.rem_euclid(16) as u8,
+                                })
                             })
-                        })
-                        .unwrap_or_default();
+                            .unwrap_or_default();
                 }
             }
         }
@@ -79,22 +80,16 @@ impl LocalSection {
                     let chunk = chunk_grid[(bx.div_euclid(4) + 1) as usize]
                         [(bz.div_euclid(4) + 1) as usize];
                     let section_y = base_y + by.div_euclid(4);
-                    self.biomes[(bx + 1) as usize][(by + 1) as usize][(bz + 1) as usize] = chunk
-                        .and_then(|c| {
-                            if section_y >= 0 && section_y < c.sections.len() as i32 {
-                                c.sections.get(section_y as usize)
-                            } else {
-                                None
-                            }
-                        })
-                        .map(|s| {
-                            s.get_biome(ChunkSectionBiomePos {
-                                x: bx.rem_euclid(4) as u8,
-                                y: by.rem_euclid(4) as u8,
-                                z: bz.rem_euclid(4) as u8,
+                    self.biomes[(bx + 1) as usize][(by + 1) as usize][(bz + 1) as usize] =
+                        section_at(chunk, section_y)
+                            .map(|s| {
+                                s.get_biome(ChunkSectionBiomePos {
+                                    x: bx.rem_euclid(4) as u8,
+                                    y: by.rem_euclid(4) as u8,
+                                    z: bz.rem_euclid(4) as u8,
+                                })
                             })
-                        })
-                        .unwrap_or_default();
+                            .unwrap_or_default();
                 }
             }
         }

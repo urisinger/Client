@@ -540,6 +540,11 @@ impl ChunkStore {
     }
 
     #[inline]
+    pub fn min_section_y(&self) -> i32 {
+        self.shared.min_section_y()
+    }
+
+    #[inline]
     pub fn section_is_empty(&self, pos: (i32, i32), section_y: i32) -> bool {
         self.shared.section_is_empty(pos, section_y)
     }

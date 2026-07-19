@@ -1436,19 +1436,23 @@ impl Renderer {
             extent,
         };
 
-        let timer_pool = if let Some(query_pools) = self.query_pools {
-            cmd.reset_query_pool(query_pools[frame], 0, Timestamp::Count as u32);
-            self.query_reset[frame] = true;
-            Some(query_pools[frame])
-        } else {
-            None
+        // World frames only: the menu path records just a couple of the
+        // Timestamp scopes, and the readback WAITs on all of them, so arming
+        // the pool there would block the next frame's result read forever.
+        let timer_pool = match (&mode, self.query_pools) {
+            (RenderMode::World { .. }, Some(query_pools)) => {
+                cmd.reset_query_pool(query_pools[frame], 0, Timestamp::Count as u32);
+                self.query_reset[frame] = true;
+                Some(query_pools[frame])
+            }
+            _ => None,
         };
         let timer = Timer::new(cmd, timer_pool);
         let frame_start_timer = timer.scope(Timestamp::FrameStart, Timestamp::FrameEnd);
 
-        // Fail open: until this frame slot's visibility pass has run once, its
-        // readback is all zeroes, which would cull every section (and gate its
-        // meshing) instead of drawing everything.
+        // Fail open to all-visible: readback() is None until this slot's
+        // visibility pass has run, and an all-zero mask would cull (and
+        // un-mesh) every section.
         let mut visibility_mask = ChunkRing::<u32>::new(u32::MAX);
         if let Some(readback) = self.visibility_pipeline.readback(frame) {
             visibility_mask.buf.copy_from_slice(readback);

@@ -436,9 +436,9 @@ impl GameState {
             ));
     }
 
-    /// Mark a column dirty by advancing its content generation, returning the
+    /// Mark a section dirty by advancing its content generation, returning the
     /// new value. Any in-flight mesh built from an older generation is
-    /// dropped on arrival, so a deferred column always remeshes with the
+    /// dropped on arrival, so a deferred section always remeshes with the
     /// latest blocks.
     pub fn bump_content_gen(&mut self, pos: ChunkSectionPos) -> u64 {
         self.meshing.bump_content_gen(pos)
@@ -457,7 +457,8 @@ impl GameState {
     /// `runLightUpdates`) and turns the resulting dirty scope into remesh
     /// work: columns whose chunk-load light applied go through the
     /// content-gen path like chunk loads (the visibility rescan enqueues
-    /// them tier-gated), individual lit sections remesh on the priority lane.
+    /// them, visibility-gated), individual lit sections remesh on the priority
+    /// lane.
     pub fn update_light(&mut self) {
         let mut dirty = crate::world::light::LightDirty::default();
         self.light_engine
@@ -465,7 +466,7 @@ impl GameState {
         if dirty.columns.is_empty() && dirty.sections.is_empty() {
             return;
         }
-        let min_section_y = self.chunk_store.min_y() >> 4;
+        let min_section_y = self.chunk_store.min_section_y();
         let section_count = self.chunk_store.section_count();
         let mut bumped: Vec<ChunkPos> = Vec::new();
         for &(x, z) in &dirty.columns {
@@ -1190,7 +1191,7 @@ pub fn update_game(
                 bench.load_elapsed_secs()
             ));
         }
-        info_lines.push(String::new()); // Blank spacing line
+        info_lines.push(String::new());
         info_lines.push(format!(
             "FPS: {:.1} (avg: {:.1} ms, worst: {:.1} ms)",
             1.0 / raw_dt.max(0.0001),

@@ -43,9 +43,9 @@ pub struct DebugInfo<'a> {
     pub chunk_count: u32,
     pub sections_drawn: u32,
     pub occlusion_on: bool,
-    /// Mesh-scheduling tiers (visible, margin, hidden) of loaded columns when
-    /// the visibility gate is active; `None` while it falls back to meshing
-    /// all.
+    /// Section counts across loaded columns for the mesh-gate readout:
+    /// `(visible, unused, occluded)`. The middle slot is unused; `None`
+    /// renders as "meshing all".
     pub mesh_gate: Option<(u32, u32, u32)>,
     pub gpu_name: &'a str,
     pub vulkan_version: &'a str,
