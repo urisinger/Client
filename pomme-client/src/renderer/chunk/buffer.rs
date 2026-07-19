@@ -285,9 +285,13 @@ struct FrustumData {
     cam_block: [i32; 3],
     /// Eye position relative to `cam_block` (small, full precision).
     frac: [f32; 3],
-    /// Pads the struct to a 16-byte multiple so the buffer always covers the
-    /// std140 block size.
-    _pad: f32,
+    /// Hi-Z mask decode parameters: the center and section layout the slot's
+    /// mask was written with (three frames ago). `mask_valid = 0` skips the
+    /// mask test entirely (slot never written).
+    mask_center: [i32; 2],
+    mask_min_section: i32,
+    mask_section_count: i32,
+    mask_valid: u32,
 }
 
 /// One uploaded 16³ section: a self-contained indexed draw plus its tight AABB.
@@ -612,10 +616,24 @@ impl ChunkBufferStore {
 
         let comp_spv = shader::include_spirv!("cull.comp.spv");
         let comp_module = shader::create_shader_module(device, comp_spv);
+        let spec_entries = [vk::SpecializationMapEntry {
+            constant_id: 0,
+            offset: 0,
+            size: size_of::<i32>(),
+        }];
+        let spec_data = [crate::util::MAX_RD as i32];
+        let spec_info = vk::SpecializationInfo {
+            map_entry_count: spec_entries.len() as u32,
+            map_entries: spec_entries.as_ptr(),
+            data_size: std::mem::size_of_val(&spec_data),
+            data: spec_data.as_ptr() as *const _,
+            ..Default::default()
+        };
         let stage = vk::PipelineShaderStageCreateInfo {
             stage: vk::ShaderStageFlags::Compute,
             module: comp_module,
             name: c"main".as_ptr(),
+            specialization_info: &spec_info,
             ..Default::default()
         };
         let pipe_info = [vk::ComputePipelineCreateInfo {
@@ -637,8 +655,9 @@ impl ChunkBufferStore {
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::StorageBuffer,
-                // meta + solid indirect/count + cutout indirect/count = 5 per frame.
-                descriptor_count: 5 * MAX_FRAMES_IN_FLIGHT as u32,
+                // meta + solid indirect/count + cutout indirect/count +
+                // visibility mask = 6 per frame.
+                descriptor_count: 6 * MAX_FRAMES_IN_FLIGHT as u32,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UniformBuffer,
@@ -1295,10 +1314,33 @@ impl ChunkBufferStore {
         self.chunks.len() as u32
     }
 
+    /// Wires each frame slot's Hi-Z visibility mask buffer into the cull
+    /// descriptor set (binding 6). One-time: the mask buffers are never
+    /// recreated.
+    pub fn set_visibility_mask_buffers(
+        &mut self,
+        device: &vk::Device,
+        buffers: &[vk::Buffer; MAX_FRAMES_IN_FLIGHT],
+    ) {
+        for (i, &buffer) in buffers.iter().enumerate() {
+            let (info, mut write) = desc_write(
+                self.compute_sets[i],
+                6,
+                vk::DescriptorType::StorageBuffer,
+                buffer,
+                (crate::util::CHUNK_RING_SIZE * 4) as u64,
+            );
+            write.buffer_info = info.as_ptr();
+            device.update_descriptor_sets(&[write], &[]);
+        }
+    }
+
     /// `anchor` must be the same `Camera::anchor()` this frame's
     /// `CameraUniform` was built with, so the cull's block/fraction split
     /// matches the vertex shader's; `eye` drives the front-to-back sort and
-    /// near checks.
+    /// near checks. `mask` is the Hi-Z decode parameters `(center,
+    /// min_section, section_count)` of the frame slot's visibility mask,
+    /// applied GPU-side in cull.comp; `None` fails open.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_cull(
         &mut self,
@@ -1309,8 +1351,7 @@ impl ChunkBufferStore {
         eye: DVec3,
         player_chunk: ChunkPos,
         limit_rd: Option<u32>,
-        vis_mask: &ChunkRing<u32>,
-        visibility_center: ChunkPos,
+        mask: Option<(ChunkPos, i32, i32)>,
     ) {
         if self.chunks.is_empty() {
             return;
@@ -1350,17 +1391,7 @@ impl ChunkBufferStore {
                 // timer (X/Z distance is per-column).
                 let nearby = self.column_nearby(*pos, eye);
 
-                // The visibility ring's mask skips sections proven occluded;
-                // columns outside its range draw unconditionally (fail open).
-                let col_vis = vis_mask
-                    .get_in_range(*pos, visibility_center)
-                    .copied()
-                    .unwrap_or(u32::MAX);
-
                 for sec in &alloc.sections {
-                    if col_vis & section_bit(sec.section_index as u32) == 0 {
-                        continue;
-                    }
                     let vis = Self::section_visibility(nearby, sec, now);
                     self.cached_meta.push(ChunkMeta {
                         aabb_min: sec.aabb.min,
@@ -1410,12 +1441,17 @@ impl ChunkBufferStore {
             self.meta_upload_pending -= 1;
         }
 
+        let (mask_center, mask_min_section, mask_section_count) =
+            mask.unwrap_or((ChunkPos::new(0, 0), 0, 0));
         let frustum_data = FrustumData {
             planes: *frustum,
             chunk_count: count,
             cam_block: anchor.as_ivec3().to_array(),
             frac: (eye - anchor).as_vec3().to_array(),
-            _pad: 0.0,
+            mask_center: [mask_center.x, mask_center.z],
+            mask_min_section,
+            mask_section_count,
+            mask_valid: mask.is_some() as u32,
         };
         let frustum_bytes = bytemuck::bytes_of(&frustum_data);
         self.frustum_allocs[frame].mapped_slice_mut().unwrap()[..frustum_bytes.len()]
@@ -1707,6 +1743,13 @@ fn create_cull_desc_layout(device: &vk::Device) -> vk::DescriptorSetLayout {
         },
         vk::DescriptorSetLayoutBinding {
             binding: 5,
+            descriptor_type: vk::DescriptorType::StorageBuffer,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::Compute,
+            ..Default::default()
+        },
+        vk::DescriptorSetLayoutBinding {
+            binding: 6,
             descriptor_type: vk::DescriptorType::StorageBuffer,
             descriptor_count: 1,
             stage_flags: vk::ShaderStageFlags::Compute,

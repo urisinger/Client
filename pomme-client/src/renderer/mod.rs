@@ -418,7 +418,8 @@ impl Renderer {
             &ctx.allocator,
         );
 
-        let chunk_buffers = ChunkBufferStore::new(&ctx.device, ctx.physical_device, &ctx.allocator);
+        let mut chunk_buffers =
+            ChunkBufferStore::new(&ctx.device, ctx.physical_device, &ctx.allocator);
 
         let mut item_entity_pipeline = pipelines::item_entity::ItemEntityPipeline::new(
             &ctx.device,
@@ -493,6 +494,8 @@ impl Renderer {
         );
         let visibility_pipeline =
             VisibilityPipeline::new(&ctx.device, &ctx.allocator, &hiz_pipeline);
+        chunk_buffers
+            .set_visibility_mask_buffers(&ctx.device, &visibility_pipeline.output_buffers());
         Ok(Self {
             ctx,
             swapchain: swapchain_state,
@@ -1486,13 +1489,18 @@ impl Renderer {
 
         // Fail open to all-visible: readback() is None until this slot's
         // visibility pass has run, and an all-zero mask would cull every
-        // section's draw.
+        // section's draw. (Only water's CPU gate reads this ring; the opaque
+        // cull reads the slot's GPU mask buffer directly.)
         if let Some(readback) = self.visibility_pipeline.readback(frame) {
             self.visibility_mask.buf.copy_from_slice(readback);
         } else {
             self.visibility_mask.buf.fill(u32::MAX);
         }
         let visibility_center = self.visibility_pipeline.vis_center(frame);
+        // Sampled before this frame's visibility execute below: it describes
+        // the three-frame-old mask still in the slot's buffer when the cull
+        // dispatch reads it.
+        let mask_params = self.visibility_pipeline.mask_params(frame);
 
         if let RenderMode::World {
             render_distance, ..
@@ -1516,8 +1524,7 @@ impl Renderer {
                 self.camera_render_position(),
                 player_chunk,
                 Some(render_distance),
-                &self.visibility_mask,
-                visibility_center,
+                mask_params,
             );
             cull_timer.end();
         }

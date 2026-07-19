@@ -36,6 +36,11 @@ pub struct PerFrameData {
     pub frame_descriptor_set: vk::DescriptorSet,
     pub hiz_descriptor_set: vk::DescriptorSet,
     pub vis_center: ChunkPos,
+    /// Section layout the slot's mask was written with; the cull that reads
+    /// the mask three frames later must decode bits with these, not the
+    /// current frame's values.
+    pub mask_min_section: i32,
+    pub mask_section_count: i32,
 }
 
 impl PerFrameData {
@@ -159,6 +164,8 @@ impl PerFrameData {
             frame_descriptor_set,
             hiz_descriptor_set,
             vis_center: ChunkPos::default(),
+            mask_min_section: 0,
+            mask_section_count: 0,
         }
     }
 
@@ -396,6 +403,25 @@ impl VisibilityPipeline {
         self.per_frame[frame].vis_center
     }
 
+    /// The slot's mask decode parameters `(center, min_section,
+    /// section_count)` for the GPU cull, or `None` (fail open) while the slot
+    /// has never been written.
+    pub fn mask_params(&self, frame: usize) -> Option<(ChunkPos, i32, i32)> {
+        if !self.executed[frame] {
+            return None;
+        }
+        let data = &self.per_frame[frame];
+        Some((
+            data.vis_center,
+            data.mask_min_section,
+            data.mask_section_count,
+        ))
+    }
+
+    pub fn output_buffers(&self) -> [vk::Buffer; MAX_FRAMES_IN_FLIGHT] {
+        std::array::from_fn(|i| self.per_frame[i].output_buffer)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn execute(
         &mut self,
@@ -410,8 +436,20 @@ impl VisibilityPipeline {
         self.executed[frame] = true;
         let frame_data = &mut self.per_frame[frame];
 
-        // 1. Clear the output storage buffer to all zeros
-        cmd.fill_buffer(frame_data.output_buffer, 0, MASK_BYTES, 0);
+        // This frame's cull dispatch read the slot's previous mask earlier in
+        // this command buffer; order that read before the clear (WAR).
+        cmd.pipeline_barrier(
+            vk::PipelineStageFlags::ComputeShader,
+            vk::PipelineStageFlags::Transfer,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[],
+        );
+
+        // 1. Reset the mask to all-visible; the shader only clears bits it
+        // proves occluded, so fail-open paths cost no writes at all.
+        cmd.fill_buffer(frame_data.output_buffer, 0, MASK_BYTES, u32::MAX);
 
         // 2. Barrier to make sure fill command completes before compute writes to SBO
         let clear_barrier = vk::BufferMemoryBarrier {
@@ -452,6 +490,8 @@ impl VisibilityPipeline {
         // The output bitset holds one bit per section layer, so the pass caps
         // at SIZE_Y (32) layers regardless of world height.
         let section_count = (height / 16).min(SIZE_Y as u32);
+        frame_data.mask_min_section = min_section;
+        frame_data.mask_section_count = section_count as i32;
         let max_section = min_section + section_count as i32;
 
         let uniform_data = VisibilityUniform {
@@ -500,10 +540,11 @@ impl VisibilityPipeline {
 
         cmd.dispatch(groups_x, groups_y, groups_z);
 
-        // 6. Barrier to transition SBO write to Transfer Read
+        // 6. Make the mask write visible to the readback copy below AND to
+        // the cull dispatch that reads this buffer three frames from now.
         let sbo_copy_barrier = vk::BufferMemoryBarrier {
             src_access_mask: vk::AccessFlags::ShaderWrite,
-            dst_access_mask: vk::AccessFlags::TransferRead,
+            dst_access_mask: vk::AccessFlags::TransferRead | vk::AccessFlags::ShaderRead,
             src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             buffer: frame_data.output_buffer,
@@ -513,7 +554,7 @@ impl VisibilityPipeline {
         };
         cmd.pipeline_barrier(
             vk::PipelineStageFlags::ComputeShader,
-            vk::PipelineStageFlags::Transfer,
+            vk::PipelineStageFlags::Transfer | vk::PipelineStageFlags::ComputeShader,
             vk::DependencyFlags::empty(),
             &[],
             &[sbo_copy_barrier],

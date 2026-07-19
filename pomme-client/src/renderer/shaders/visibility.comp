@@ -98,11 +98,11 @@ void main() {
     corners_ws[6] = vec3(bmin.x, bmax.y, bmax.z);
     corners_ws[7] = vec3(bmax.x, bmax.y, bmax.z);
     
-    vec4 corners_clip[8];
-    for (int i = 0; i < 8; i++) {
-        vec3 rel = corners_ws[i] - ubo.camera_pos.xyz;
-        corners_clip[i] = ubo.view_proj * vec4(rel, 1.0);
-    }
+    // The mask starts all-visible and only a proven Hi-Z occlusion clears a
+    // bit: it is consumed three frames later against a newer camera, and any
+    // stale claim of occlusion shows as missing terrain. Every uncertain path
+    // below is therefore a bare return (the bit stays set).
+
     for (int plane = 0; plane < 6; plane++) {
         // Frustum plane: dot(plane.xyz, point) + plane.w >= 0 means inside
         // The 6 planes are: left, right, bottom, top, near, far
@@ -120,59 +120,57 @@ void main() {
 
         float d = dot(ubo.frustum_planes[plane].xyz, rel) + ubo.frustum_planes[plane].w;
         if (d < 0.0) {
-            return;  // AABB completely outside this plane
+            // Outside this frame's frustum, so the depth pyramid holds no
+            // occluder for it; the cull pass frustum-tests with the live
+            // camera, so a stale reject here must not read as occlusion.
+            return;
         }
     }
-
 
     // Screen-space bounds for HiZ
     vec2 min_xy = vec2(1.0);
     vec2 max_xy = vec2(0.0);
     float near_depth = 1.0;
-    bool any_valid = false;
-    
+
     for (int i = 0; i < 8; i++) {
-        vec4 clip = corners_clip[i];
+        vec3 rel = corners_ws[i] - ubo.camera_pos.xyz;
+        vec4 clip = ubo.view_proj * vec4(rel, 1.0);
         if (clip.w <= 0.0) {
-            continue;
+            // A corner at or behind the camera plane: the projected rect is
+            // unbounded, so the section can't be occlusion-tested.
+            return;
         }
         vec3 ndc = clip.xyz / clip.w;
         vec2 uv = ndc.xy * 0.5 + vec2(0.5);
-        float d = ndc.z;
-        
-        any_valid = true;
+
         min_xy = min(min_xy, uv);
         max_xy = max(max_xy, uv);
-        near_depth = min(near_depth, d);
+        near_depth = min(near_depth, ndc.z);
     }
-    
+
     min_xy = clamp(min_xy, vec2(0.0), vec2(1.0));
     max_xy = clamp(max_xy, vec2(0.0), vec2(1.0));
-    
-    if (!any_valid) {
-        return;
-    }
-    
+
     vec2 extent = max_xy - min_xy;
     if (extent.x <= 0.0 || extent.y <= 0.0) {
+        // Degenerate (edge-on or fully off one side after clamping).
         return;
     }
-    
+
     // HiZ occlusion test
     ivec2 tex_size = textureSize(hiz, 0);
     vec2 texel_size = extent * vec2(tex_size);
     float mip = clamp(floor(log2(max(texel_size.x, texel_size.y))), 0.0, float(textureQueryLevels(hiz) - 1));
-    
+
     vec4 rect = vec4(min_xy.x, min_xy.y, max_xy.x, max_xy.y);
-    
+
     float sample1 = textureLod(hiz, rect.xy, mip).x;
     float sample2 = textureLod(hiz, rect.zy, mip).x;
     float sample3 = textureLod(hiz, rect.xw, mip).x;
     float sample4 = textureLod(hiz, rect.zw, mip).x;
     float max_z = max(max(sample1, sample2), max(sample3, sample4));
-    
-    if (near_depth <= max_z) {
-        uint section_bit = 1u << uint(section_y);
-        atomicOr(visible[chunk_index], section_bit);
+
+    if (near_depth > max_z) {
+        atomicAnd(visible[chunk_index], ~(1u << uint(section_y)));
     }
 }
