@@ -8,7 +8,10 @@ use crossbeam_epoch as epoch;
 use crossbeam_epoch::Atomic;
 use glam::DVec3;
 
-use super::mesher::{BiomeClimate, Colormap, SectionMeshData, SectionStoreSnapshot, mesh_section};
+use super::buffer::aabb_in_frustum;
+use super::mesher::{
+    BiomeClimate, ChunkAABB, Colormap, SectionMeshData, SectionStoreSnapshot, mesh_section,
+};
 use super::section::LocalSection;
 use crate::renderer::Renderer;
 use crate::renderer::chunk::atlas::AtlasUVMap;
@@ -282,14 +285,16 @@ impl ChunkMeshing {
             0.0,
         );
     }
-    /// Per-frame rescan of the dirty bits, distance-sorted nearest to camera.
+    /// Per-frame rescan of the dirty bits, ordered in-frustum-first then
+    /// nearest-first, so load bursts fill the view before the surroundings.
     /// Visibility never gates meshing (occlusion gates only drawing, like
     /// vanilla), so turning the camera reveals already-meshed terrain.
     pub fn rescan_mesh_jobs(
         &mut self,
         loaded: &std::collections::HashSet<ChunkPos>,
         player_chunk: ChunkPos,
-        camera_pos: &DVec3,
+        frustum: &[[f32; 4]; 6],
+        eye: DVec3,
     ) {
         let min_y_section = self.store.min_section_y();
         let section_count = self.store.section_count();
@@ -309,13 +314,20 @@ impl ChunkMeshing {
             }
             active_cols.push((pos, active_mask, lod));
         }
-        // Nearest columns first, so stopping at the job cap keeps the closest
-        // work and leaves the rest completely untouched (bits, lod and
-        // identity stamps included) for later rescans.
-        active_cols.sort_by_key(|(pos, ..)| {
+        // In-frustum columns first, nearest-first within each half, so
+        // stopping at the job cap fills the view before the surroundings and
+        // leaves the rest completely untouched (bits, lod and identity stamps
+        // included) for later rescans.
+        let min_y = self.store.min_y();
+        let column_aabb = ChunkAABB {
+            min: [0.0; 4],
+            max: [16.0, self.store.height() as f32, 16.0, 0.0],
+        };
+        active_cols.sort_by_cached_key(|(pos, ..)| {
             let dx = pos.x - player_chunk.x;
             let dz = pos.z - player_chunk.z;
-            dx * dx + dz * dz
+            let out = !aabb_in_frustum(&column_aabb, [pos.x * 16, min_y, pos.z * 16], frustum, eye);
+            (out, dx * dx + dz * dz)
         });
 
         const MAX_RESCAN_JOBS: usize = 8192;
@@ -356,17 +368,23 @@ impl ChunkMeshing {
             }
             self.col_lod.insert(pos, lod);
         }
-        candidate_jobs.sort_by(
-            |PendingJob { pos: pos_a, .. }, PendingJob { pos: pos_b, .. }| {
-                let da = (pos_a.x as f64 * 16.0 + 8.0 - camera_pos.x).powi(2)
-                    + (pos_a.y as f64 * 16.0 + 8.0 - camera_pos.y).powi(2)
-                    + (pos_a.z as f64 * 16.0 + 8.0 - camera_pos.z).powi(2);
-                let db = (pos_b.x as f64 * 16.0 + 8.0 - camera_pos.x).powi(2)
-                    + (pos_b.y as f64 * 16.0 + 8.0 - camera_pos.y).powi(2)
-                    + (pos_b.z as f64 * 16.0 + 8.0 - camera_pos.z).powi(2);
-                da.partial_cmp(&db).unwrap()
-            },
-        );
+        let section_aabb = ChunkAABB {
+            min: [0.0; 4],
+            max: [16.0, 16.0, 16.0, 0.0],
+        };
+        candidate_jobs.sort_by_cached_key(|PendingJob { pos, .. }| {
+            let dist_sq = (pos.x as f64 * 16.0 + 8.0 - eye.x).powi(2)
+                + (pos.y as f64 * 16.0 + 8.0 - eye.y).powi(2)
+                + (pos.z as f64 * 16.0 + 8.0 - eye.z).powi(2);
+            let out = !aabb_in_frustum(
+                &section_aabb,
+                [pos.x * 16, pos.y * 16, pos.z * 16],
+                frustum,
+                eye,
+            );
+            // Non-negative f64s order correctly by their bit patterns.
+            (out, dist_sq.to_bits())
+        });
         self.queue.send(candidate_jobs);
         self.notify();
     }

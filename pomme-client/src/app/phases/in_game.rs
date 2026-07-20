@@ -511,12 +511,14 @@ impl GameState {
     /// render distance meshes regardless of visibility — occlusion gates only
     /// drawing — and the queue orders the backlog nearest-first. Runs every
     /// frame to drain it.
-    pub fn rescan_mesh_jobs(&mut self, player_chunk: ChunkPos) {
-        self.meshing.rescan_mesh_jobs(
-            self.chunk_store.loaded_set(),
-            player_chunk,
-            &self.player.position,
-        );
+    pub fn rescan_mesh_jobs(
+        &mut self,
+        player_chunk: ChunkPos,
+        frustum: &[[f32; 4]; 6],
+        eye: glam::DVec3,
+    ) {
+        self.meshing
+            .rescan_mesh_jobs(self.chunk_store.loaded_set(), player_chunk, frustum, eye);
     }
 }
 

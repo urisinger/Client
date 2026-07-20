@@ -406,6 +406,10 @@ impl AppCore {
                     game.xp_display_start_tick = i64::MIN;
 
                     renderer.clear_chunk_meshes();
+                    // The server's protocol may have switched the block-table
+                    // id space; the dispatcher's registry clone inherits the
+                    // rebuilt tables.
+                    renderer.rebuild_block_state_tables();
                     game.meshing.recreate_dispatcher(
                         renderer,
                         Arc::clone(&game.chunk_store.shared),
@@ -1232,7 +1236,11 @@ impl AppCore {
         // their dirty bits in GameState::update_light. Visibility itself is
         // GPU-side (the Hi-Z pass), so no CPU visibility refresh runs here.
         let t_rescan = std::time::Instant::now();
-        game.rescan_mesh_jobs(player_chunk);
+        game.rescan_mesh_jobs(
+            player_chunk,
+            &renderer.camera_frustum_planes(),
+            renderer.camera_render_position(),
+        );
         game.last_update_phases.rescan_ms = ms(t_rescan);
 
         disconnect_reason

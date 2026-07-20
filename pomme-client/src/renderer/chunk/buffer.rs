@@ -246,7 +246,12 @@ struct DrawCommand {
 /// (the GPU opaque path); used by the CPU-driven water pass. The section
 /// origin is rebased against the eye in f64 for precision at extreme
 /// coordinates.
-fn aabb_in_frustum(aabb: &ChunkAABB, origin: [i32; 3], planes: &[[f32; 4]; 6], eye: DVec3) -> bool {
+pub(crate) fn aabb_in_frustum(
+    aabb: &ChunkAABB,
+    origin: [i32; 3],
+    planes: &[[f32; 4]; 6],
+    eye: DVec3,
+) -> bool {
     let base = (origin_dvec(origin) - eye).as_vec3();
     let mn = [
         base.x + aabb.min[0],

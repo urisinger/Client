@@ -743,7 +743,7 @@ pub(crate) fn mesh_section(
                     );
                 } else if let Some(quads) = registry.get_multipart_quads(state) {
                     emit_multipart(
-                        &mut sink, block_pos, &quads, snapshot, registry, uv_map, local_x, local_y,
+                        &mut sink, block_pos, quads, snapshot, registry, uv_map, local_x, local_y,
                         local_z,
                     );
                 } else if let Some(textures) = registry.get_textures(state) {
@@ -1042,7 +1042,7 @@ fn emit_fluid(
 fn emit_multipart(
     sink: &mut MeshSink,
     block_pos: [f32; 3],
-    quads: &[&crate::world::block::model::BakedQuad],
+    quads: &[crate::world::block::model::BakedQuad],
     snapshot: &SectionStoreSnapshot,
     registry: &BlockRegistry,
     uv_map: &AtlasUVMap,

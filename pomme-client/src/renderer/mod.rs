@@ -942,6 +942,16 @@ impl Renderer {
         self.camera.position
     }
 
+    pub fn camera_frustum_planes(&self) -> [[f32; 4]; 6] {
+        self.camera.frustum_planes()
+    }
+
+    /// Re-syncs the block registry's dense state tables with the active block
+    /// table; the id space changes with the server's protocol.
+    pub fn rebuild_block_state_tables(&mut self) {
+        self.registry.build_state_tables();
+    }
+
     /// Camera position used for rendering (eye plus any third-person offset).
     pub fn camera_render_position(&self) -> glam::DVec3 {
         *self.camera.position + self.camera.third_person_offset().as_dvec3()
