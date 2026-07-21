@@ -196,6 +196,9 @@ pub struct Renderer {
     /// readback (all-visible until the pass has run). Persistent to avoid a
     /// per-frame ring allocation.
     visibility_mask: ChunkRing<u32>,
+    /// CPU wait in the last frame's `acquire_next_image`: where FIFO vblank
+    /// backpressure lands, consumed by the vsync frame pacer.
+    last_acquire_ms: f32,
 }
 
 impl Renderer {
@@ -540,6 +543,7 @@ impl Renderer {
             hiz_pipeline,
             visibility_pipeline,
             visibility_mask: ChunkRing::new(u32::MAX),
+            last_acquire_ms: 0.0,
         })
     }
 
@@ -944,6 +948,10 @@ impl Renderer {
 
     pub fn camera_frustum_planes(&self) -> [[f32; 4]; 6] {
         self.camera.frustum_planes()
+    }
+
+    pub fn last_acquire_ms(&self) -> f32 {
+        self.last_acquire_ms
     }
 
     /// Re-syncs the block registry's dense state tables with the active block
@@ -1425,7 +1433,7 @@ impl Renderer {
 
         self.swapchain_dirty |= image.suboptimal;
         let image_index = image.value;
-        let _acquire_ms = t_acquire.elapsed().as_secs_f32() * 1000.0;
+        self.last_acquire_ms = t_acquire.elapsed().as_secs_f32() * 1000.0;
 
         let render_finished = self.render_finished_per_image[image_index as usize];
 
