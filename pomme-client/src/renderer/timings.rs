@@ -26,10 +26,14 @@ pub enum Timestamp {
 pub struct RenderTimings {
     pub ticks: [u64; Timestamp::Count as usize],
     pub timestamp_period: f32,
+    /// Modulus mask from the queue's `timestamp_valid_bits`; deltas wrap
+    /// within this width, so subtract wrapping and mask instead of saturating.
+    pub timestamp_mask: u64,
 }
 impl RenderTimings {
     pub fn duration(&self, start: Timestamp, end: Timestamp) -> f32 {
-        let diff_ticks = self.ticks[end as usize].saturating_sub(self.ticks[start as usize]);
+        let diff_ticks =
+            self.ticks[end as usize].wrapping_sub(self.ticks[start as usize]) & self.timestamp_mask;
         (diff_ticks as f64 * self.timestamp_period as f64 / 1_000_000.0) as f32
     }
     pub fn frame_ms(&self) -> f32 {

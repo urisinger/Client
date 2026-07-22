@@ -1912,7 +1912,7 @@ pub fn update_game(
             game.pause_screen = PauseScreen::Main;
             game.paused = false;
             // Initialize the server request to the target render distance.
-            apply_render_distance(core, game, connection, core.menu.render_distance);
+            apply_render_distance(core, game, connection, rd);
             core.apply_cursor_grab(&gfx.window, Some(game));
         }
         PauseAction::ReportBugs => {

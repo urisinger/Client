@@ -77,6 +77,26 @@ fn apply_server_block(
 
 /// Queues a column's packet light for the per-tick apply. Chunk loads enable
 /// the column, standalone light updates are corrections.
+/// Tears down a resident column: store, light, block entities, meshes.
+/// No-op when `pos` isn't loaded — see `ChunkStore::unload_chunk`.
+fn unload_column(
+    game: &mut GameState,
+    renderer: &mut Renderer,
+    pos: azalea_core::position::ChunkPos,
+) {
+    if !game.chunk_store.unload_chunk(&pos) {
+        return;
+    }
+    game.light_engine.on_chunk_unloaded((pos.x, pos.z));
+    game.light_engine
+        .queue_task(crate::world::light::LightTask::Remove {
+            pos: (pos.x, pos.z),
+        });
+    game.block_entity_anim.drop_chunk(pos.x, pos.z);
+    game.meshing.on_chunk_unload(pos);
+    renderer.remove_chunk_mesh(&pos);
+}
+
 fn queue_light_apply(
     game: &mut GameState,
     pos: azalea_core::position::ChunkPos,
@@ -363,9 +383,12 @@ impl AppCore {
         const NET_DRAIN_BUDGET_SECS: f32 = 0.003;
         // Record the worst single apply for the bench breakdown, timed by
         // boundary stamps so the loop stays at one clock read per event.
+        // Budget from here, not t_net: a slow skin drain above must not eat
+        // the whole budget and apply zero events this frame.
+        let t_apply = std::time::Instant::now();
         let mut worst_event = "";
         let mut worst_event_secs = 0.0f32;
-        let mut event_start = t_net.elapsed().as_secs_f32();
+        let mut event_start = 0.0f32;
         while processed < 4096 && event_start < NET_DRAIN_BUDGET_SECS {
             let Some(event) = game.pending_events.pop_front() else {
                 break;
@@ -422,6 +445,25 @@ impl AppCore {
                     light,
                     sky_sources,
                 } => {
+                    // Ring slots alias every MAX_SIZE chunks; evict a resident
+                    // alias first so its meshes and bookkeeping don't linger
+                    // under the new occupant (a long teleport can load the
+                    // alias before the server forgets the old column).
+                    const RING: i32 = crate::util::MAX_SIZE as i32;
+                    for dx in -1..=1 {
+                        for dz in -1..=1 {
+                            if dx == 0 && dz == 0 {
+                                continue;
+                            }
+                            let alias = azalea_core::position::ChunkPos::new(
+                                pos.x + dx * RING,
+                                pos.z + dz * RING,
+                            );
+                            if game.chunk_store.loaded_set().contains(&alias) {
+                                unload_column(game, renderer, alias);
+                            }
+                        }
+                    }
                     game.chunk_store.insert_chunk(pos, *chunk);
                     game.light_engine.on_chunk_loaded(
                         &game.chunk_store,
@@ -436,15 +478,7 @@ impl AppCore {
                     queue_light_apply(game, pos, &light, false);
                 }
                 NetworkEvent::ChunkUnloaded { pos } => {
-                    game.chunk_store.unload_chunk(&pos);
-                    game.light_engine.on_chunk_unloaded((pos.x, pos.z));
-                    game.light_engine
-                        .queue_task(crate::world::light::LightTask::Remove {
-                            pos: (pos.x, pos.z),
-                        });
-                    game.block_entity_anim.drop_chunk(pos.x, pos.z);
-                    game.meshing.on_chunk_unload(pos);
-                    renderer.remove_chunk_mesh(&pos);
+                    unload_column(game, renderer, pos);
                 }
                 NetworkEvent::ChunkCacheCenter { x, z } => {
                     tracing::debug!("Chunk cache center: [{x}, {z}]");
@@ -1169,7 +1203,7 @@ impl AppCore {
                     game.tab_list.set_header_footer(header, footer);
                 }
             }
-            let event_end = t_net.elapsed().as_secs_f32();
+            let event_end = t_apply.elapsed().as_secs_f32();
             let event_secs = event_end - event_start;
             if event_secs > worst_event_secs {
                 worst_event_secs = event_secs;

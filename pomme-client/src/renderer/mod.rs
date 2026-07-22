@@ -488,6 +488,10 @@ impl Renderer {
 
         let properties = ctx.physical_device.get_properties();
         let timestamp_period = properties.limits.timestamp_period;
+        let timestamp_mask = match ctx.features.timestamp_valid_bits {
+            0 | 64 => u64::MAX,
+            bits => (1u64 << bits) - 1,
+        };
         let hiz_pipeline = HizPipeline::new(
             &ctx.device,
             &ctx.allocator,
@@ -539,6 +543,7 @@ impl Renderer {
             last_timings: RenderTimings {
                 ticks: [0; _],
                 timestamp_period,
+                timestamp_mask,
             },
             hiz_pipeline,
             visibility_pipeline,
@@ -1035,6 +1040,12 @@ impl Renderer {
     pub fn clear_chunk_meshes(&mut self) {
         self.wait_for_all_frames();
         self.chunk_buffers.clear();
+        // Queued-but-unstaged meshes belong to the cleared world; staged into
+        // the fresh buffers they would draw as ghosts, and their pre-reset
+        // epochs would out-rank every legitimate upload for those sections.
+        self.mesh_queue.clear();
+        // The old world's visibility masks must not cull the new one.
+        self.visibility_pipeline.reset();
     }
 
     pub fn registry(&self) -> &BlockRegistry {

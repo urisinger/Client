@@ -60,6 +60,13 @@ pub fn handle_game_packet(
         ClientboundGamePacket::Login(p) => {
             if let Some((_, dim)) = p.common.dimension_type(registry_holder) {
                 let _ = event_tx.try_send(dimension_info(dim, dimension));
+            } else {
+                // Without DimensionInfo the chunk parser keeps stale bounds
+                // and the main thread never rebuilds its block-state tables.
+                tracing::warn!(
+                    "Login dimension {:?} not in the registry; keeping previous dimension state",
+                    p.common.dimension
+                );
             }
             let _ = event_tx.try_send(NetworkEvent::GameModeChanged {
                 game_mode: p.common.game_type as u8,
@@ -598,6 +605,11 @@ pub fn handle_game_packet(
         ClientboundGamePacket::Respawn(p) => {
             if let Some((_, dim)) = p.common.dimension_type(registry_holder) {
                 let _ = event_tx.try_send(dimension_info(dim, dimension));
+            } else {
+                tracing::warn!(
+                    "Respawn dimension {:?} not in the registry; keeping previous dimension state",
+                    p.common.dimension
+                );
             }
             let _ = event_tx.try_send(NetworkEvent::GameModeChanged {
                 game_mode: p.common.game_type as u8,

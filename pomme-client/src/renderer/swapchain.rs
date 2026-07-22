@@ -294,7 +294,9 @@ fn create_render_pass(
             format: vk::Format::D32Sfloat,
             samples: vk::SampleCountFlags::Type1,
             load_op: vk::AttachmentLoadOp::Clear,
-            store_op: vk::AttachmentStoreOp::DontCare,
+            // The Hi-Z pass samples this depth after the pass ends; DontCare
+            // would leave the contents undefined once the pass finishes.
+            store_op: vk::AttachmentStoreOp::Store,
             stencil_load_op: vk::AttachmentLoadOp::DontCare,
             stencil_store_op: vk::AttachmentStoreOp::DontCare,
             initial_layout: vk::ImageLayout::Undefined,

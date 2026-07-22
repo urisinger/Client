@@ -74,7 +74,7 @@ impl PerFrameData {
             &format!("visibility_output_sbo_{}", frame_idx),
         );
 
-        let (readback_buffer, readback_allocation) = util::create_host_buffer(
+        let (readback_buffer, readback_allocation) = util::create_readback_buffer(
             device,
             allocator,
             sbo_size,
@@ -382,6 +382,13 @@ impl VisibilityPipeline {
 
             device.update_descriptor_sets(&[write], &[]);
         }
+    }
+
+    /// Forgets every slot's mask, as if none had ever been written. Call on a
+    /// world clear: the previous world's masks would otherwise keep culling
+    /// (fail closed) for up to `MAX_FRAMES_IN_FLIGHT` frames of the new one.
+    pub fn reset(&mut self) {
+        self.executed = [false; MAX_FRAMES_IN_FLIGHT];
     }
 
     /// The frame slot's visibility bitset, or `None` while the slot has never

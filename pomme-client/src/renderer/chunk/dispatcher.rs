@@ -393,10 +393,14 @@ impl ChunkMeshing {
     }
     /// Whether a drained result predates its section slot's current lifetime
     /// (ver behind the snapshot's gen: the ring was recreated or the slot
-    /// recycled). Every drain site must drop such meshes; results whose ver
-    /// merely advanced stay, the newer upload supersedes them by epoch.
+    /// recycled) or the slot no longer belongs to the mesh's section (chunk
+    /// unloaded sets pos to u64::MAX; an aliasing column repoints it). Every
+    /// drain site must drop such meshes; results whose ver merely advanced
+    /// stay, the newer upload supersedes them by epoch.
     pub fn is_stale(&self, mesh: &SectionMeshData) -> bool {
-        self.section_meta.get(mesh.spos).ver.load(Ordering::Acquire) < mesh.content_gen
+        let meta = self.section_meta.get(mesh.spos);
+        meta.ver.load(Ordering::Acquire) < mesh.content_gen
+            || meta.pos.load(Ordering::Acquire) != pack_section_pos(mesh.spos)
     }
     pub fn pending_jobs(&self) -> usize {
         self.queue.pending_jobs()

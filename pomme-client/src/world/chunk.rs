@@ -13,19 +13,21 @@ use crate::util::{ChunkRing, MAX_RD, SIZE_Y};
 const OVERWORLD_HEIGHT: u32 = 384;
 const OVERWORLD_MIN_Y: i32 = -64;
 
-/// `pos` and its four axis-neighbor chunks. This is both the neighborhood a
-/// chunk's mesh samples (see `MeshDispatcher::enqueue`) and, by symmetry, the
-/// set that must re-mesh when `pos` changes. Add the diagonals here when the
-/// corner-sample TODO(chunk-light) lands, so the mesh snapshot and the re-mesh
-/// set stay in sync (vanilla's `enableChunkLight` dirties the full 3x3 via
-/// `setSectionRangeDirty`).
-pub(crate) fn mesh_neighborhood(pos: ChunkPos) -> [ChunkPos; 5] {
+/// `pos` and its eight neighbor chunks. This is both the neighborhood a
+/// chunk's mesh samples (corner AO reads diagonal cells at section corners)
+/// and, by symmetry, the set that must re-mesh when `pos` changes (vanilla's
+/// `enableChunkLight` dirties the full 3x3 via `setSectionRangeDirty`).
+pub(crate) fn mesh_neighborhood(pos: ChunkPos) -> [ChunkPos; 9] {
     [
         pos,
         ChunkPos::new(pos.x - 1, pos.z),
         ChunkPos::new(pos.x + 1, pos.z),
         ChunkPos::new(pos.x, pos.z - 1),
         ChunkPos::new(pos.x, pos.z + 1),
+        ChunkPos::new(pos.x - 1, pos.z - 1),
+        ChunkPos::new(pos.x - 1, pos.z + 1),
+        ChunkPos::new(pos.x + 1, pos.z - 1),
+        ChunkPos::new(pos.x + 1, pos.z + 1),
     ]
 }
 
@@ -443,13 +445,21 @@ impl ChunkStore {
         }
     }
 
-    pub fn unload_chunk(&mut self, pos: &ChunkPos) {
+    /// Returns whether the column was actually resident. False means the ring
+    /// slot belongs to someone else (or nothing): the caller must skip its
+    /// teardown, since slots carry no position tag and alias every MAX_SIZE
+    /// chunks — a late forget for an evicted column must not destroy the
+    /// current occupant.
+    pub fn unload_chunk(&mut self, pos: &ChunkPos) -> bool {
+        if !self.loaded.remove(pos) {
+            return false;
+        }
         self.shared.unload_chunk(pos);
-        self.loaded.remove(pos);
         let cx = pos.x;
         let cz = pos.z;
         self.block_entities
             .retain(|bp, _| bp.x.div_euclid(16) != cx || bp.z.div_euclid(16) != cz);
+        true
     }
 
     pub fn loaded_set(&self) -> &std::collections::HashSet<ChunkPos> {

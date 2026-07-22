@@ -49,6 +49,9 @@ const DEVICE_EXTENSIONS: &[&CStr] = &[
 #[derive(Clone, Copy, Debug)]
 pub struct DeviceFeatures {
     pub timestamp_queries: bool,
+    /// Valid low bits of the graphics queue's timestamps; deltas must be
+    /// masked to this width or they read garbage at counter wrap.
+    pub timestamp_valid_bits: u32,
 }
 
 pub struct VulkanContext {
@@ -206,15 +209,20 @@ impl VulkanContext {
             );
         }
 
-        if draw_indirect_first_instance {
-            tracing::info!("drawIndirectFirstInstance supported, chunk fade-in available");
-        } else {
-            tracing::warn!(
-                "drawIndirectFirstInstance not supported, chunk fade-in may display incorrectly"
+        // The cull shader routes each section's origin through firstInstance;
+        // without the feature every indirect chunk draw is invalid usage
+        // (geometry at wrong positions), so it is a hard requirement.
+        if !draw_indirect_first_instance {
+            tracing::error!(
+                "drawIndirectFirstInstance not supported; GPU-driven chunk drawing requires it"
             );
+            return Err(ContextError::NoSuitableGpu);
         }
 
-        let features = DeviceFeatures { timestamp_queries };
+        let features = DeviceFeatures {
+            timestamp_queries,
+            timestamp_valid_bits: graphics_family_props.timestamp_valid_bits,
+        };
 
         let queue_priority = 1.0f32;
 
@@ -259,9 +267,7 @@ impl VulkanContext {
         if fill_mode_non_solid {
             enabled_features.fill_mode_non_solid = vk::TRUE;
         }
-        if draw_indirect_first_instance {
-            enabled_features.draw_indirect_first_instance = vk::TRUE;
-        }
+        enabled_features.draw_indirect_first_instance = vk::TRUE;
 
         let device_info = vk::DeviceCreateInfo {
             queue_create_info_count: queue_create_infos.len() as u32,

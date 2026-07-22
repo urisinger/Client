@@ -26,6 +26,25 @@ layout(set = 0, binding = 1, std140) uniform UniformBlock {
 
 layout(set = 1, binding = 0) uniform sampler2D hiz;
 
+// Inverts the CPU's rem_euclid(MAX_SIZE) slot mapping: the unique world
+// coordinate in the ring's +-MAX_RD window around `center`, the same math as
+// cull.comp (a fixed candidate list breaks once the center is farther than
+// MAX_SIZE from the origin).
+int slot_to_world(int slot, int center) {
+    int d = (slot - center) % MAX_SIZE;
+    if (d < 0) d += MAX_SIZE;
+    if (d > MAX_RD) d -= MAX_SIZE;
+    return center + d;
+}
+
+// Texel span of the screen rect at `mip`, clamped to the mip's edge.
+ivec2 texel_span(vec2 min_xy, vec2 max_xy, int mip) {
+    ivec2 mip_size = textureSize(hiz, mip);
+    ivec2 lo = ivec2(floor(min_xy * vec2(mip_size)));
+    ivec2 hi = min(ivec2(floor(max_xy * vec2(mip_size))), mip_size - 1);
+    return hi - lo;
+}
+
 void main() {
     const float CHUNK_SIZE = 16.0;
     const float SECTION_HEIGHT = 16.0;
@@ -45,35 +64,9 @@ void main() {
     
     int chunk_index = rx * MAX_SIZE + rz;
     
-    // Convert ring index (rx, rz) to world chunk position.
-    // CPU uses rem_euclid, so many world positions map to the same ring index.
-    // Pick the candidate closest to vis_center.
-    int cand_x0 = rx;
-    int cand_x1 = rx + MAX_SIZE;
-    int cand_x2 = rx - MAX_SIZE;
-    
-    int d0 = abs(cand_x0 - ubo.vis_center.x);
-    int d1 = abs(cand_x1 - ubo.vis_center.x);
-    int d2 = abs(cand_x2 - ubo.vis_center.x);
-    
-    int world_chunk_x;
-    if (d0 <= d1 && d0 <= d2) world_chunk_x = cand_x0;
-    else if (d1 <= d2) world_chunk_x = cand_x1;
-    else world_chunk_x = cand_x2;
-    
-    int cand_z0 = rz;
-    int cand_z1 = rz + MAX_SIZE;
-    int cand_z2 = rz - MAX_SIZE;
-    
-    int e0 = abs(cand_z0 - ubo.vis_center.z);
-    int e1 = abs(cand_z1 - ubo.vis_center.z);
-    int e2 = abs(cand_z2 - ubo.vis_center.z);
-    
-    int world_chunk_z;
-    if (e0 <= e1 && e0 <= e2) world_chunk_z = cand_z0;
-    else if (e1 <= e2) world_chunk_z = cand_z1;
-    else world_chunk_z = cand_z2;
-    
+    int world_chunk_x = slot_to_world(rx, ubo.vis_center.x);
+    int world_chunk_z = slot_to_world(rz, ubo.vis_center.z);
+
     int dy = section_y;
     
     float min_y = float(ubo.vis_center.y) * SECTION_HEIGHT + float(dy) * SECTION_HEIGHT;
@@ -160,14 +153,31 @@ void main() {
     // HiZ occlusion test
     ivec2 tex_size = textureSize(hiz, 0);
     vec2 texel_size = extent * vec2(tex_size);
-    float mip = clamp(floor(log2(max(texel_size.x, texel_size.y))), 0.0, float(textureQueryLevels(hiz) - 1));
+    int levels = textureQueryLevels(hiz);
+    int mip = clamp(int(floor(log2(max(texel_size.x, texel_size.y)))), 0, levels - 1);
+
+    // The 4 corner samples cover at most a 2x2 texel block, but an
+    // arbitrarily placed rect can straddle 3 texels per axis at this mip,
+    // skipping the middle texel's depth. Step up a level when that happens;
+    // if the footprint still doesn't fit (truncated pyramid), stay visible.
+    ivec2 span = texel_span(min_xy, max_xy, mip);
+    if (span.x > 1 || span.y > 1) {
+        mip += 1;
+        if (mip >= levels) {
+            return;
+        }
+        span = texel_span(min_xy, max_xy, mip);
+        if (span.x > 1 || span.y > 1) {
+            return;
+        }
+    }
 
     vec4 rect = vec4(min_xy.x, min_xy.y, max_xy.x, max_xy.y);
 
-    float sample1 = textureLod(hiz, rect.xy, mip).x;
-    float sample2 = textureLod(hiz, rect.zy, mip).x;
-    float sample3 = textureLod(hiz, rect.xw, mip).x;
-    float sample4 = textureLod(hiz, rect.zw, mip).x;
+    float sample1 = textureLod(hiz, rect.xy, float(mip)).x;
+    float sample2 = textureLod(hiz, rect.zy, float(mip)).x;
+    float sample3 = textureLod(hiz, rect.xw, float(mip)).x;
+    float sample4 = textureLod(hiz, rect.zw, float(mip)).x;
     float max_z = max(max(sample1, sample2), max(sample3, sample4));
 
     if (near_depth > max_z) {
