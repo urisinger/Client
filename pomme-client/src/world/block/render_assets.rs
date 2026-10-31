@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use azalea_block::BlockState;
 use azalea_inventory::ItemStackData;
@@ -85,6 +85,8 @@ impl FaceTextures {
 /// A block state's model lookups, resolved once per state.
 struct StateRender {
     model: Option<Arc<BakedModel>>,
+    multipart: Option<Arc<[model::BakedQuad]>>,
+    textures: Option<Arc<FaceTextures>>,
     opaque_full_cube: bool,
     occludes: bool,
     hidden_when_enclosed: bool,
@@ -92,12 +94,8 @@ struct StateRender {
 
 #[derive(Default)]
 pub struct BlockRenderAssets {
-    textures: HashMap<String, FaceTextures>,
+    textures: HashMap<String, Arc<FaceTextures>>,
     baked: HashMap<String, HashMap<String, Arc<BakedModel>>>,
-    /// Per block-state table slot, every state's resolved model lookups,
-    /// indexed by state id; built on first use of the slot. The mesher queries
-    /// these for every block and neighbour, so they must not hash or parse.
-    state_render: [OnceLock<Box<[StateRender]>>; super::TABLE_SLOTS],
     multipart: HashMap<String, Vec<model::MultipartEntry>>,
     item_models: HashMap<String, BakedModel>,
     flat_item_textures: std::collections::HashSet<String>,
@@ -111,7 +109,7 @@ pub struct BlockRenderAssets {
 /// state table.
 #[derive(Clone, Copy)]
 pub(crate) struct BlockRenderView<'a> {
-    assets: &'a BlockRenderAssets,
+    states: &'a [StateRender],
     block_state_table: BlockStateTable,
 }
 
@@ -121,6 +119,7 @@ pub(crate) struct BlockRenderView<'a> {
 #[derive(Clone)]
 pub(crate) struct OwnedBlockRenderView {
     assets: Arc<BlockRenderAssets>,
+    states: Arc<[StateRender]>,
     block_state_table: BlockStateTable,
 }
 
@@ -130,14 +129,27 @@ impl OwnedBlockRenderView {
     }
 
     pub(crate) fn new(assets: Arc<BlockRenderAssets>, block_state_table: BlockStateTable) -> Self {
+        let states = assets.build_state_table(block_state_table);
         Self {
             assets,
+            states,
             block_state_table,
         }
     }
 
     pub(crate) fn as_view(&self) -> BlockRenderView<'_> {
-        self.assets.for_version(self.block_state_table)
+        BlockRenderView {
+            states: &self.states,
+            block_state_table: self.block_state_table,
+        }
+    }
+
+    pub(crate) fn for_table(&self, table: BlockStateTable) -> Self {
+        if table.table_slot() == self.block_state_table.table_slot() {
+            self.clone()
+        } else {
+            Self::new(Arc::clone(&self.assets), table)
+        }
     }
 }
 
@@ -189,9 +201,11 @@ impl BlockRenderAssets {
         let item_tint_sources = baked_items.tint_sources;
 
         Self {
-            textures,
+            textures: textures
+                .into_iter()
+                .map(|(name, textures)| (name, Arc::new(textures)))
+                .collect(),
             baked,
-            state_render: [const { OnceLock::new() }; super::TABLE_SLOTS],
             multipart,
             item_models,
             flat_item_textures,
@@ -199,13 +213,6 @@ impl BlockRenderAssets {
             item_gui_transforms,
             item_ground_transforms,
             item_tint_sources,
-        }
-    }
-
-    pub(crate) fn for_version(&self, block_state_table: BlockStateTable) -> BlockRenderView<'_> {
-        BlockRenderView {
-            assets: self,
-            block_state_table,
         }
     }
 
@@ -283,43 +290,49 @@ impl BlockRenderAssets {
         self.item_ground_transforms.get(name).copied()
     }
 
-    fn state_render(
-        &self,
-        block_state_table: BlockStateTable,
-        state: BlockState,
-    ) -> Option<&StateRender> {
-        let slot = block_state_table.table_slot();
-        self.state_render[slot]
-            .get_or_init(|| {
-                block_state_table
-                    .table()
-                    .iter()
-                    .map(|block_state_data| {
-                        let model = self
-                            .resolve_model(block_state_data.id, &block_state_data.properties)
-                            .cloned();
-                        // TODO: the occlusion graph reads this for vanilla's
-                        // `isSolidRender` (`canOcclude` and a full occlusion shape),
-                        // but it still counts the model's quads and ignores
-                        // `canOcclude`, so glass counts as solid there.
-                        let opaque_full_cube = !block_state_data.is_air
-                            && model.as_ref().is_some_and(|m| m.is_full_cube);
-                        let occludes = block_state_data.occludes_neighbor_faces();
-                        let all_quads_cull = model
-                            .as_ref()
-                            .is_some_and(|m| m.quads.iter().all(|q| q.cullface.is_some()));
-                        StateRender {
-                            model,
-                            opaque_full_cube,
-                            occludes,
-                            hidden_when_enclosed: occludes
-                                && all_quads_cull
-                                && matches!(block_state_data.fluid.kind, super::FluidKind::Empty),
+    /// Resolve the selected protocol's complete dense lookup table before any
+    /// worker uses it. Asset reload/protocol selection creates a new snapshot.
+    fn build_state_table(&self, block_state_table: BlockStateTable) -> Arc<[StateRender]> {
+        block_state_table
+            .table()
+            .iter()
+            .map(|block_state_data| {
+                let model = self
+                    .resolve_model(block_state_data.id, &block_state_data.properties)
+                    .cloned();
+                // TODO: the occlusion graph reads this for vanilla's
+                // `isSolidRender` (`canOcclude` and a full occlusion shape),
+                // but it still counts the model's quads and ignores
+                // `canOcclude`, so glass counts as solid there.
+                let opaque_full_cube =
+                    !block_state_data.is_air && model.as_ref().is_some_and(|m| m.is_full_cube);
+                let occludes = block_state_data.occludes_neighbor_faces();
+                let all_quads_cull = model
+                    .as_ref()
+                    .is_some_and(|m| m.quads.iter().all(|q| q.cullface.is_some()));
+                let mut multipart = Vec::new();
+                if let Some(entries) = self.multipart.get(block_state_data.id) {
+                    for entry in entries {
+                        if constraints_match(
+                            &block_state_data.properties,
+                            entry.when.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+                        ) {
+                            multipart.extend_from_slice(&entry.model.quads);
                         }
-                    })
-                    .collect()
+                    }
+                }
+                StateRender {
+                    model,
+                    multipart: (!multipart.is_empty()).then(|| Arc::from(multipart)),
+                    textures: self.textures.get(block_state_data.id).cloned(),
+                    opaque_full_cube,
+                    occludes,
+                    hidden_when_enclosed: occludes
+                        && all_quads_cull
+                        && matches!(block_state_data.fluid.kind, super::FluidKind::Empty),
+                }
             })
-            .get(u32::from(state) as usize)
+            .collect()
     }
 
     fn resolve_model(&self, block: &str, props: &super::PropMap) -> Option<&Arc<BakedModel>> {
@@ -366,6 +379,24 @@ impl BlockRenderAssets {
 
         face_textures.chain(quad_textures)
     }
+
+    pub(crate) fn all_baked_quads(&self) -> impl Iterator<Item = &model::BakedQuad> {
+        self.baked
+            .values()
+            .flat_map(|variants| variants.values())
+            .chain(
+                self.multipart
+                    .values()
+                    .flat_map(|entries| entries.iter().map(|entry| &entry.model)),
+            )
+            .flat_map(|model| model.quads.iter())
+    }
+
+    pub(crate) fn all_face_textures(&self) -> impl Iterator<Item = (&str, &FaceTextures)> {
+        self.textures
+            .iter()
+            .map(|(name, textures)| (name.as_str(), textures.as_ref()))
+    }
 }
 
 impl<'a> BlockRenderView<'a> {
@@ -374,52 +405,41 @@ impl<'a> BlockRenderView<'a> {
     }
 
     pub(crate) fn get_textures(self, state: BlockState) -> Option<&'a FaceTextures> {
-        self.assets
+        self.states
+            .get(u32::from(state) as usize)?
             .textures
-            .get(self.block_state_table.block_state_data(state).id)
-    }
-
-    pub(crate) fn get_baked_model(self, state: BlockState) -> Option<&'a BakedModel> {
-        self.assets
-            .state_render(self.block_state_table, state)?
-            .model
             .as_deref()
     }
 
-    pub(crate) fn get_multipart_quads(
-        self,
-        state: BlockState,
-    ) -> Option<Vec<&'a model::BakedQuad>> {
-        let block_state_data = self.block_state_table.block_state_data(state);
-        let entries = self.assets.multipart.get(block_state_data.id)?;
-        let mut quads = Vec::new();
-        for entry in entries {
-            let when = entry.when.iter().map(|(k, v)| (k.as_str(), v.as_str()));
-            if constraints_match(&block_state_data.properties, when) {
-                quads.extend(entry.model.quads.iter());
-            }
-        }
-        if quads.is_empty() { None } else { Some(quads) }
+    pub(crate) fn get_baked_model(self, state: BlockState) -> Option<&'a BakedModel> {
+        self.states.get(u32::from(state) as usize)?.model.as_deref()
+    }
+
+    pub(crate) fn get_multipart_quads(self, state: BlockState) -> Option<&'a [model::BakedQuad]> {
+        self.states
+            .get(u32::from(state) as usize)?
+            .multipart
+            .as_deref()
     }
 
     pub(crate) fn is_opaque_full_cube(self, state: BlockState) -> bool {
-        self.assets
-            .state_render(self.block_state_table, state)
+        self.states
+            .get(u32::from(state) as usize)
             .is_some_and(|r| r.opaque_full_cube)
     }
 
     /// Full cubes that can occlude, excluding glass and other no-occlusion
     /// cubes.
     pub(crate) fn occludes_neighbor(self, state: BlockState) -> bool {
-        self.assets
-            .state_render(self.block_state_table, state)
+        self.states
+            .get(u32::from(state) as usize)
             .is_some_and(|r| r.occludes)
     }
 
     /// Non-fluid occluders whose every quad has a cullface.
     pub(crate) fn hidden_when_enclosed(self, state: BlockState) -> bool {
-        self.assets
-            .state_render(self.block_state_table, state)
+        self.states
+            .get(u32::from(state) as usize)
             .is_some_and(|r| r.hidden_when_enclosed)
     }
 }
@@ -598,6 +618,115 @@ fn save_cache(path: &Path, textures: &HashMap<String, FaceTextures>) {
         && let Err(e) = crate::util::write_atomic(path, json.as_bytes())
     {
         tracing::warn!("Failed to write block cache: {e}");
+    }
+}
+
+#[cfg(test)]
+mod dense_tests {
+    use super::model::{BakedQuad, Direction, TextureId, face_positions};
+    use super::*;
+
+    fn quad(uid: u32, direction: Direction) -> BakedQuad {
+        BakedQuad {
+            cuboid_uid: uid,
+            direction,
+            positions: face_positions(direction, [0.0; 3], [1.0; 3]),
+            uvs: [[0.0; 2]; 4],
+            texture: TextureId::intern("test"),
+            cullface: Some(direction),
+            tint: Tint::None,
+            tint_index: None,
+            shade_light: 1.0,
+            shade_face: Some(direction),
+            emission: 0,
+            ambient_occlusion: true,
+        }
+    }
+
+    fn assets() -> BlockRenderAssets {
+        let mut assets = BlockRenderAssets::default();
+        assets.textures.insert(
+            "oak_fence".into(),
+            Arc::new(FaceTextures::uniform("test", Tint::None)),
+        );
+        assets.multipart.insert(
+            "oak_fence".into(),
+            vec![
+                model::MultipartEntry {
+                    when: HashMap::from([("east".into(), "true".into())]),
+                    model: Arc::new(BakedModel {
+                        quads: vec![quad(10, Direction::Up)],
+                        is_full_cube: false,
+                    }),
+                },
+                model::MultipartEntry {
+                    when: HashMap::from([("west".into(), "true".into())]),
+                    model: Arc::new(BakedModel {
+                        quads: vec![quad(11, Direction::Up)],
+                        is_full_cube: false,
+                    }),
+                },
+            ],
+        );
+        assets
+    }
+
+    #[test]
+    fn dense_state_tables_resolve_multipart_once_and_share_snapshots() {
+        let table = BlockStateTable::native();
+        let owned = OwnedBlockRenderView::new(Arc::new(assets()), table);
+        assert_eq!(owned.states.len(), table.table().len());
+        let east = table.find_state("oak_fence", &[("east", "true"), ("west", "false")]);
+        let west = table.find_state("oak_fence", &[("east", "false"), ("west", "true")]);
+        let neither = table.find_state("oak_fence", &[("east", "false"), ("west", "false")]);
+        let view = owned.as_view();
+        assert_eq!(view.get_multipart_quads(east).unwrap()[0].cuboid_uid, 10);
+        assert_eq!(view.get_multipart_quads(west).unwrap()[0].cuboid_uid, 11);
+        assert!(view.get_multipart_quads(neither).is_none());
+        assert!(std::ptr::eq(
+            view.get_multipart_quads(east).unwrap(),
+            view.get_multipart_quads(east).unwrap()
+        ));
+        assert!(view.get_textures(east).is_some());
+        let clone = owned.clone();
+        assert!(Arc::ptr_eq(&owned.states, &clone.states));
+        assert!(Arc::ptr_eq(&owned.states, &owned.for_table(table).states));
+        let legacy_table = BlockStateTable::for_protocol(767);
+        let legacy = owned.for_table(legacy_table);
+        let legacy_east =
+            legacy_table.find_state("oak_fence", &[("east", "true"), ("west", "false")]);
+        assert_eq!(
+            legacy.as_view().get_multipart_quads(legacy_east).unwrap()[0].cuboid_uid,
+            10
+        );
+        assert_eq!(view.get_multipart_quads(east).unwrap()[0].cuboid_uid, 10);
+    }
+
+    #[test]
+    fn baked_geometry_is_deduplicated_at_asset_load_with_fixed_fluid_templates() {
+        let assets = assets();
+        let table = crate::renderer::chunk::packed_face::GlobalCuboidTable::build(
+            &assets,
+            &crate::renderer::chunk::atlas::AtlasUVMap::test_uniform(),
+        );
+        assert_eq!(table.id(10), table.id(11));
+        let geometry = &table.data[usize::from(table.id(10))];
+        assert_eq!(
+            geometry.faces[Direction::Up as usize].positions[0],
+            [0.0, 1.0, 0.0, 0.0]
+        );
+        let fluid = &table.data[usize::from(table.fluid_id(false, true, false))];
+        assert_eq!(fluid.faces[Direction::Up as usize].positions[0][3], 1.0);
+        assert_eq!(fluid.faces[Direction::Down as usize].positions[0][1], 0.001);
+        let backward = &table.data[usize::from(table.fluid_id(false, true, true))];
+        assert_eq!(
+            backward.faces[Direction::Down as usize].positions[0][1],
+            1.0
+        );
+        assert_eq!(
+            backward.faces[Direction::Down as usize].positions[0][3],
+            1.0
+        );
     }
 }
 

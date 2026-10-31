@@ -60,6 +60,15 @@ pub struct AtlasUVMap {
 }
 
 impl AtlasUVMap {
+    #[cfg(test)]
+    pub(crate) fn test_uniform() -> Self {
+        Self::new(
+            HashMap::new(),
+            HashMap::new(),
+            vec![[0, 0, 1, 1]],
+            AtlasRegion::UNIT,
+        )
+    }
     fn new(
         regions: HashMap<String, AtlasRegion>,
         sprite_alpha_masks: HashMap<String, SpriteAlphaMask>,

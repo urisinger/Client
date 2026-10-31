@@ -6,6 +6,10 @@ use azalea_block::BlockState;
 
 use super::block_lighter::{self, LightLevels, LightSource, VertexLight};
 use super::occlusion_graph::{VisibilitySet, compute_visibility};
+use super::packed_face::{
+    BlockRecord, CUBOIDS_PER_WINDOW, FaceBatch, FaceRecord, FluidHeights, GlobalCuboidTable,
+    PackedMesh,
+};
 use crate::position::ChunkPos;
 use crate::renderer::chunk::atlas::{AtlasRegion, AtlasUVMap};
 use crate::shaderpack::block_ids::{BlockIds, PackBlockIds};
@@ -17,6 +21,7 @@ use crate::world::chunk::{ChunkRing, ChunkStore, SectionBlocks};
 
 #[derive(Copy, Clone)]
 struct TerrainVertex {
+    source: Option<(u16, u8)>,
     position: [f32; 3],
     /// Sprite-local UV where 1.0 spans one full sprite.
     sprite_uv: [f32; 2],
@@ -67,22 +72,25 @@ pub struct PackVertex {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TerrainFormat {
     #[default]
+    Compact,
+    /// Expanded vertices fetched through the fixed-function vertex input.
     Vanilla,
     ShaderPack,
 }
 
 impl TerrainFormat {
     /// A shader pack's while its block ids are meshed in.
-    fn of(pack: &Option<Arc<PackBlockIds>>) -> Self {
+    fn of(pack: &Option<Arc<PackBlockIds>>, compact: bool) -> Self {
         match pack {
             Some(_) => Self::ShaderPack,
+            None if compact => Self::Compact,
             None => Self::Vanilla,
         }
     }
 
     pub fn vertex_size(self) -> u64 {
         match self {
-            Self::Vanilla => size_of::<PackedVertex>() as u64,
+            Self::Compact | Self::Vanilla => size_of::<PackedVertex>() as u64,
             Self::ShaderPack => size_of::<PackVertex>() as u64,
         }
     }
@@ -90,6 +98,7 @@ impl TerrainFormat {
 
 /// A mesh's vertices in its [`TerrainFormat`].
 pub enum TerrainVertices {
+    Compact(Vec<PackedVertex>),
     Vanilla(Vec<PackedVertex>),
     ShaderPack(Vec<PackVertex>),
 }
@@ -97,6 +106,7 @@ pub enum TerrainVertices {
 impl TerrainVertices {
     fn pack(format: TerrainFormat, vertices: &[TerrainVertex]) -> Self {
         match format {
+            TerrainFormat::Compact => Self::Compact(vertices.iter().map(pack_vertex).collect()),
             TerrainFormat::Vanilla => Self::Vanilla(vertices.iter().map(pack_vertex).collect()),
             TerrainFormat::ShaderPack => {
                 Self::ShaderPack(vertices.iter().map(pack_shader_vertex).collect())
@@ -106,13 +116,14 @@ impl TerrainVertices {
 
     pub fn len(&self) -> usize {
         match self {
-            Self::Vanilla(v) => v.len(),
+            Self::Compact(v) | Self::Vanilla(v) => v.len(),
             Self::ShaderPack(v) => v.len(),
         }
     }
 
     pub fn format(&self) -> TerrainFormat {
         match self {
+            Self::Compact(_) => TerrainFormat::Compact,
             Self::Vanilla(_) => TerrainFormat::Vanilla,
             Self::ShaderPack(_) => TerrainFormat::ShaderPack,
         }
@@ -120,7 +131,7 @@ impl TerrainVertices {
 
     pub fn bytes(&self) -> &[u8] {
         match self {
-            Self::Vanilla(v) => bytemuck::cast_slice(v),
+            Self::Compact(v) | Self::Vanilla(v) => bytemuck::cast_slice(v),
             Self::ShaderPack(v) => bytemuck::cast_slice(v),
         }
     }
@@ -129,7 +140,7 @@ impl TerrainVertices {
     #[cfg(any(test, feature = "cpu-bench"))]
     pub fn vanilla(&self) -> Option<&[PackedVertex]> {
         match self {
-            Self::Vanilla(v) => Some(v),
+            Self::Compact(v) | Self::Vanilla(v) => Some(v),
             Self::ShaderPack(_) => None,
         }
     }
@@ -204,6 +215,14 @@ fn packed_with_shade(v: &TerrainVertex, shade: f32) -> PackedVertex {
     }
 }
 
+/// LOD-only encoding: face code 7 marks UVs spanning 0..16. Keep its
+/// conversion out of the original full-detail and shader-pack vertex paths.
+fn pack_lod_vertex(v: &TerrainVertex) -> PackedVertex {
+    let mut vertex = *v;
+    vertex.sprite_uv = v.sprite_uv.map(|axis| axis / 16.0);
+    pack_vertex(&vertex)
+}
+
 /// A quad's face for [`PackedVertex::sprite`]'s top bits: `Direction` + 1,
 /// or 0 for none.
 fn face_code(face: Option<Direction>) -> u16 {
@@ -255,12 +274,15 @@ pub const PACKED_WHITE_SHIFTED: u32 = pack_tint_shifted([1.0, 1.0, 1.0]);
 /// its own tight AABB, giving per-section cull granularity instead of
 /// per-column.
 pub struct SectionMesh {
+    pub lod: u32,
     /// 0-based section index from the column's min_y; stable identity for
     /// per-section upload/replace.
     pub section_index: i32,
-    /// Vertices already quantized against the section origin in the worker, so
-    /// upload is a plain memcpy.
+    /// Expanded vertices, used by shader packs and when compact meshes are off.
+    /// Compact vanilla meshes retain these only for CPU tests/benchmarks.
     pub vertices: TerrainVertices,
+    /// Compact terrain payload; absent for expanded terrain and shader packs.
+    pub packed: Option<PackedMesh>,
     /// Section-local bounds of the un-quantized vertex positions, for
     /// culling (rebase via the section origin).
     pub aabb: ChunkAABB,
@@ -285,6 +307,8 @@ struct MeshSink {
     solid: Vec<u32>,
     cutout: Vec<u32>,
     water: Vec<u32>,
+    packed: PackedMesh,
+    face_source: Option<(u16, u8)>,
 }
 
 impl MeshSink {
@@ -292,16 +316,43 @@ impl MeshSink {
     /// (recording the split), the section-local AABB from the float positions
     /// and the vertices quantized so upload is a plain memcpy; `None` if it
     /// drew nothing. Leaves the sink empty for the next section.
-    fn finish(&mut self, section_index: i32, format: TerrainFormat) -> Option<SectionMesh> {
+    fn finish(
+        &mut self,
+        section_index: i32,
+        format: TerrainFormat,
+        lod: u32,
+    ) -> Option<SectionMesh> {
         let section = (!self.solid.is_empty() || !self.cutout.is_empty() || !self.water.is_empty())
             .then(|| {
                 let mut indices = Vec::with_capacity(self.solid.len() + self.cutout.len());
                 indices.extend_from_slice(&self.solid);
                 indices.extend_from_slice(&self.cutout);
                 SectionMesh {
+                    lod,
                     section_index,
-                    vertices: TerrainVertices::pack(format, &self.vertices),
-                    aabb: section_aabb(&self.vertices),
+                    vertices: if format == TerrainFormat::Compact
+                        && !cfg!(any(test, feature = "cpu-bench"))
+                    {
+                        TerrainVertices::Compact(Vec::new())
+                    } else if format == TerrainFormat::Vanilla && lod > 0 {
+                        TerrainVertices::Vanilla(
+                            self.vertices.iter().map(pack_lod_vertex).collect(),
+                        )
+                    } else {
+                        TerrainVertices::pack(format, &self.vertices)
+                    },
+                    aabb: {
+                        let mut bounds = section_aabb(&self.vertices);
+                        // Fluid surface heights are rounded to UNORM4. Keep
+                        // culling conservative on both sides of that rounding.
+                        if !self.packed.heights.is_empty() {
+                            bounds.min[1] -= 1.0 / 30.0;
+                            bounds.max[1] += 1.0 / 30.0;
+                        }
+                        bounds
+                    },
+                    packed: (format == TerrainFormat::Compact)
+                        .then(|| std::mem::take(&mut self.packed)),
                     indices,
                     solid_index_count: self.solid.len() as u32,
                     water_indices: self.water.clone(),
@@ -311,7 +362,114 @@ impl MeshSink {
         self.solid.clear();
         self.cutout.clear();
         self.water.clear();
+        self.packed = PackedMesh::default();
+        self.face_source = None;
         section
+    }
+
+    /// Pack references to baked elements, without reconstructing geometry.
+    fn pack_block(
+        &mut self,
+        first: usize,
+        origin: [f32; 3],
+        lod: u32,
+        fluid: bool,
+        model_offset: [f32; 3],
+    ) {
+        let vertices = &self.vertices[first..];
+        if vertices.is_empty() {
+            return;
+        }
+        let mut heights = [0.0f32; 4];
+        if fluid {
+            for vertex in vertices {
+                let x = vertex.position[0] - origin[0];
+                let z = vertex.position[2] - origin[2];
+                let corner = match (x >= 0.5, z >= 0.5) {
+                    (false, false) => 0,
+                    (false, true) => 1,
+                    (true, true) => 2,
+                    (true, false) => 3,
+                };
+                heights[corner] = heights[corner].max(vertex.position[1] - origin[1]);
+            }
+        }
+        let mut start = 0;
+        while start < vertices.len() {
+            let tint = vertices[start].tint;
+            let global_id = vertices[start]
+                .source
+                .expect("terrain face lacks a baked source")
+                .0;
+            let mut used = [false; 6];
+            let mut faces = [(0u8, [0u8; 4]); 6];
+            let mut face_count = 0;
+            while start < vertices.len()
+                && vertices[start].tint == tint
+                && vertices[start].source.unwrap().0 == global_id
+            {
+                let quad = &vertices[start..start + 4];
+                let direction = usize::from(quad[0].source.unwrap().1);
+                if used[direction] {
+                    break;
+                }
+                used[direction] = true;
+                let shades = std::array::from_fn(|corner| {
+                    let light = quad[corner].light;
+                    (light.shade() * f32::from(light.sky.max(light.block)) / 240.0 * 31.0)
+                        .round()
+                        .clamp(0.0, 31.0) as u8
+                });
+                faces[face_count] = (direction as u8, shades);
+                face_count += 1;
+                start += 4;
+            }
+            let offset_bits = model_offset.map(f32::to_bits);
+            let needs_batch = self.packed.batches.last().is_none_or(|batch| {
+                self.packed.blocks.len() as u32 - batch.first_block >= u32::from(CUBOIDS_PER_WINDOW)
+                    || batch.fluid != u32::from(fluid)
+                    || batch.lod != lod
+                    || (!fluid
+                        && [batch.offset_xy[0], batch.offset_xy[1], batch.first_height]
+                            != offset_bits)
+            });
+            if needs_batch {
+                self.packed.batches.push(FaceBatch {
+                    first_face: self.packed.faces.len() as u32,
+                    face_count: 0,
+                    first_block: self.packed.blocks.len() as u32,
+                    lod,
+                    first_height: if fluid {
+                        self.packed.heights.len() as u32
+                    } else {
+                        offset_bits[2]
+                    },
+                    fluid: u32::from(fluid),
+                    offset_xy: if fluid {
+                        [0; 2]
+                    } else {
+                        [offset_bits[0], offset_bits[1]]
+                    },
+                });
+            }
+            let batch = self.packed.batches.last_mut().unwrap();
+            let block = (self.packed.blocks.len() as u32 - batch.first_block) as u16;
+            let [_, r, g, b] = tint.to_le_bytes();
+            self.packed.blocks.push(BlockRecord::new(
+                origin.map(|v| v as u8),
+                global_id,
+                [r, g, b],
+            ));
+            if fluid {
+                self.packed.heights.push(FluidHeights::new(heights));
+            }
+            for &(direction, shades) in &faces[..face_count] {
+                self.packed
+                    .faces
+                    .push(FaceRecord::new(block, direction, shades));
+                batch.face_count += 1;
+            }
+        }
     }
 
     /// Index list a quad's triangles go in: solid sprites render in the
@@ -820,6 +978,7 @@ pub struct MeshDispatcher {
     next_epoch: AtomicU64,
     render_view: OwnedBlockRenderView,
     uv_map: Arc<AtlasUVMap>,
+    geometry: Arc<GlobalCuboidTable>,
     grass_colormap: Arc<Colormap>,
     foliage_colormap: Arc<Colormap>,
     dry_foliage_colormap: Arc<Colormap>,
@@ -829,6 +988,7 @@ pub struct MeshDispatcher {
     cardinal_lighting: CardinalLighting,
     /// A shader pack's block ids, meshed in its vertex format.
     pack: Option<Arc<PackBlockIds>>,
+    compact: bool,
     pool: Arc<BufferPool>,
 }
 
@@ -839,6 +999,7 @@ impl MeshDispatcher {
     pub fn load(
         render_view: OwnedBlockRenderView,
         uv_map: AtlasUVMap,
+        geometry: Arc<GlobalCuboidTable>,
         jar_assets_dir: &std::path::Path,
         asset_index: &Option<crate::assets::AssetIndex>,
         packs: Option<&crate::resource_pack::ResourcePackManager>,
@@ -856,6 +1017,7 @@ impl MeshDispatcher {
         Self::new(
             render_view,
             uv_map,
+            geometry,
             colormap("grass"),
             colormap("foliage"),
             colormap("dry_foliage"),
@@ -868,6 +1030,7 @@ impl MeshDispatcher {
     pub fn new(
         render_view: OwnedBlockRenderView,
         uv_map: AtlasUVMap,
+        geometry: Arc<GlobalCuboidTable>,
         grass_colormap: Colormap,
         foliage_colormap: Colormap,
         dry_foliage_colormap: Colormap,
@@ -877,6 +1040,7 @@ impl MeshDispatcher {
         Self::with_colormaps(
             render_view,
             Arc::new(uv_map),
+            geometry,
             Arc::new(grass_colormap),
             Arc::new(foliage_colormap),
             Arc::new(dry_foliage_colormap),
@@ -889,6 +1053,7 @@ impl MeshDispatcher {
     fn with_colormaps(
         render_view: OwnedBlockRenderView,
         uv_map: Arc<AtlasUVMap>,
+        geometry: Arc<GlobalCuboidTable>,
         grass_colormap: Arc<Colormap>,
         foliage_colormap: Arc<Colormap>,
         dry_foliage_colormap: Arc<Colormap>,
@@ -935,18 +1100,24 @@ impl MeshDispatcher {
             next_epoch: AtomicU64::new(1),
             render_view,
             uv_map,
+            geometry,
             grass_colormap,
             foliage_colormap,
             dry_foliage_colormap,
             biome_climate,
             cardinal_lighting,
             pack: None,
+            compact: true,
             pool: Arc::new(BufferPool::new(worker_count)),
         }
     }
 
     pub fn format(&self) -> TerrainFormat {
-        TerrainFormat::of(&self.pack)
+        TerrainFormat::of(&self.pack, self.compact)
+    }
+
+    pub fn compact(&self) -> bool {
+        self.compact
     }
 
     /// Whether this meshes for `block_ids`' pack, or with none for vanilla.
@@ -958,26 +1129,30 @@ impl MeshDispatcher {
         }
     }
 
-    /// A fresh dispatcher on the same assets meshing for `pack`; dropping
-    /// this one discards its queued work for the old one.
-    pub fn with_pack(&self, pack: Option<Arc<PackBlockIds>>) -> Self {
+    /// A fresh dispatcher on the same assets with the requested mesh format;
+    /// dropping this one discards its queued work for the old format.
+    pub fn with_pack(&self, pack: Option<Arc<PackBlockIds>>, compact: bool) -> Self {
         let mut dispatcher = self.recreate_for_version(self.render_view.clone());
         dispatcher.pack = pack;
+        dispatcher.compact = compact;
         dispatcher
     }
 
     /// Negotiation precedes world population. Capture the session's new view
     /// of the same CPU assets, retaining UVs, colormaps and dimension lighting.
     pub(crate) fn recreate_for_version(&self, render_view: OwnedBlockRenderView) -> Self {
-        Self::with_colormaps(
+        let mut dispatcher = Self::with_colormaps(
             render_view,
             Arc::clone(&self.uv_map),
+            Arc::clone(&self.geometry),
             Arc::clone(&self.grass_colormap),
             Arc::clone(&self.foliage_colormap),
             Arc::clone(&self.dry_foliage_colormap),
             Arc::clone(&self.biome_climate),
             self.cardinal_lighting,
-        )
+        );
+        dispatcher.compact = self.compact;
+        dispatcher
     }
 
     pub fn set_biome_climate(&mut self, climate: Arc<HashMap<u32, BiomeClimate>>) {
@@ -1141,6 +1316,7 @@ impl MeshDispatcher {
     fn build_snapshot(&self, chunk_store: &ChunkStore, pos: ChunkPos) -> ChunkStoreSnapshot {
         let chunks_needed = chunk::mesh_neighborhood(pos);
         ChunkStoreSnapshot {
+            geometry: Arc::clone(&self.geometry),
             block_state_table: self.render_view.block_state_table(),
             chunks: chunks_needed
                 .iter()
@@ -1161,6 +1337,7 @@ impl MeshDispatcher {
             biome_climate: Arc::clone(&self.biome_climate),
             cardinal_lighting: self.cardinal_lighting,
             pack: self.pack.clone(),
+            compact: self.compact,
             min_y: chunk_store.min_y(),
             height: chunk_store.height(),
             blocks: None,
@@ -1426,6 +1603,7 @@ fn lower_current_thread_priority() {
 }
 
 struct ChunkStoreSnapshot {
+    geometry: Arc<GlobalCuboidTable>,
     block_state_table: BlockStateTable,
     chunks: Vec<(ChunkPos, Option<Arc<parking_lot::RwLock<chunk::Chunk>>>)>,
     light: std::collections::HashMap<(i32, i32), Arc<crate::world::chunk::ChunkLightData>>,
@@ -1435,6 +1613,7 @@ struct ChunkStoreSnapshot {
     biome_climate: Arc<HashMap<u32, BiomeClimate>>,
     cardinal_lighting: CardinalLighting,
     pack: Option<Arc<PackBlockIds>>,
+    compact: bool,
     min_y: i32,
     height: u32,
     /// The meshed span's blocks, copied in by `mesh_chunk_snapshot`.
@@ -1794,7 +1973,7 @@ fn mesh_chunk_snapshot(
     let mut logged_missing: std::collections::HashSet<&'static str> =
         std::collections::HashSet::new();
 
-    let step = 1i32 << lod;
+    let step = super::packed_face::lod_scale(lod) as i32;
 
     let min_y = snapshot.min_y();
     let max_y = min_y + snapshot.height() as i32;
@@ -1928,13 +2107,28 @@ fn mesh_chunk_snapshot(
                     if !fluid {
                         snapshot.flatten_shade(&mut sink.vertices[first_vertex..]);
                     }
+                    if snapshot.pack.is_none() && snapshot.compact {
+                        sink.pack_block(
+                            first_vertex,
+                            block_pos,
+                            lod,
+                            fluid,
+                            if lod == 0 && !fluid {
+                                model_offset.as_vec3().to_array()
+                            } else {
+                                [0.0; 3]
+                            },
+                        );
+                    }
                     by += step;
                 }
                 local_x += step;
             }
             local_z += step;
         }
-        if let Some(section) = sink.finish(si, TerrainFormat::of(&snapshot.pack)) {
+        if let Some(section) =
+            sink.finish(si, TerrainFormat::of(&snapshot.pack, snapshot.compact), lod)
+        {
             sections.push(section);
         }
     }
@@ -1990,7 +2184,7 @@ fn emit_block_model(
             sink,
             model_pos,
             state,
-            quads.iter().copied(),
+            quads.iter(),
             snapshot,
             registry,
             uv_map,
@@ -2088,6 +2282,8 @@ fn emit_quads<'q>(
         }
 
         let region = uv_map.region(quad.texture);
+        sink.face_source = (snapshot.compact && snapshot.pack.is_none())
+            .then(|| (snapshot.geometry.id(quad.cuboid_uid), quad.direction as u8));
         let tint = tint_color(quad.tint, snapshot, state, bx, by, bz);
         let lights = quad_light(
             snapshot,
@@ -2154,6 +2350,9 @@ fn emit_cube_faces(
         );
 
         let is_side = i >= 2;
+        let name = snapshot.block_state_table.block_state_data(state).id();
+        sink.face_source = (snapshot.compact && snapshot.pack.is_none())
+            .then(|| (snapshot.geometry.cube_id(name), *dir as u8));
         if let Some(overlay) = textures.side_overlay.as_deref().filter(|_| is_side) {
             emit_face(
                 sink,
@@ -2165,6 +2364,8 @@ fn emit_cube_faces(
                 PACKED_WHITE_SHIFTED,
             );
             let overlay_region = uv_map.get_region(overlay);
+            sink.face_source = (snapshot.compact && snapshot.pack.is_none())
+                .then(|| (snapshot.geometry.overlay_id(name), *dir as u8));
             emit_face(
                 sink,
                 block_pos,
@@ -2215,7 +2416,7 @@ fn classify_block(block_state_data: &BlockStateData) -> BlockKind {
 
 const MAX_FLUID_HEIGHT: f32 = 8.0 / 9.0;
 /// `FluidRenderer`'s `offs` anti-z-fighting inset.
-const FLUID_INSET: f32 = 0.001;
+pub(super) const FLUID_INSET: f32 = 0.001;
 
 fn same_fluid(block_state_data: &BlockStateData, kind: FluidKind) -> bool {
     block_state_data.fluid().kind == kind
@@ -2435,6 +2636,18 @@ fn emit_fluid(
             MAX_FLUID_HEIGHT,
         );
     let bottom_offset = if render_down { FLUID_INSET } else { 0.0 };
+    let (fluid_id, backward_id) = if snapshot.compact && snapshot.pack.is_none() {
+        (
+            snapshot
+                .geometry
+                .fluid_id(matches!(kind, BlockKind::Lava), render_down, false),
+            snapshot
+                .geometry
+                .fluid_id(matches!(kind, BlockKind::Lava), render_down, true),
+        )
+    } else {
+        (0, 0)
+    };
 
     if render_up {
         for height in &mut heights {
@@ -2464,7 +2677,15 @@ fn emit_fluid(
                 positions[3][1] = north_east;
 
                 emit_face_into(
-                    vertices, indices, block_pos, &positions, &uvs, light, region, tint,
+                    vertices,
+                    indices,
+                    block_pos,
+                    &positions,
+                    &uvs,
+                    light,
+                    region,
+                    tint,
+                    Some((fluid_id, *dir as u8)),
                 );
 
                 // TODO: gate on `FluidState.shouldRenderBackwardUpFace`.
@@ -2479,6 +2700,7 @@ fn emit_fluid(
                     light,
                     region,
                     tint,
+                    Some((backward_id, Direction::Down as u8)),
                 );
                 continue;
             }
@@ -2518,7 +2740,15 @@ fn emit_fluid(
         }
 
         emit_face_into(
-            vertices, indices, block_pos, &positions, &uvs, light, region, tint,
+            vertices,
+            indices,
+            block_pos,
+            &positions,
+            &uvs,
+            light,
+            region,
+            tint,
+            Some((fluid_id, *dir as u8)),
         );
     }
 }
@@ -2588,8 +2818,14 @@ fn emit_lod_cube(
         let s = step as f32;
         let sy = if is_fluid { fluid_top } else { s };
         let base = sink.vertices.len() as u32;
+        let global_id = if snapshot.compact && snapshot.pack.is_none() {
+            snapshot.geometry.cube_id(block_state_data.id())
+        } else {
+            0
+        };
         for i in 0..4 {
             sink.vertices.push(TerrainVertex {
+                source: Some((global_id, *dir as u8)),
                 entity: 0,
                 flat_shade: 1.0,
                 position: [
@@ -2597,9 +2833,20 @@ fn emit_lod_cube(
                     block_pos[1] + positions[i][1] * sy,
                     block_pos[2] + positions[i][2] * s,
                 ],
-                sprite_uv: uvs[i],
+                sprite_uv: if snapshot.pack.is_none() && !snapshot.compact {
+                    [
+                        uvs[i][0] * s,
+                        uvs[i][1] * if *dir as u8 >= 2 { sy } else { s },
+                    ]
+                } else {
+                    uvs[i]
+                },
                 sprite: region.sprite,
-                face: face_code(Some(*dir)),
+                face: if snapshot.pack.is_none() && !snapshot.compact {
+                    7
+                } else {
+                    face_code(Some(*dir))
+                },
                 light,
                 tint,
             });
@@ -2644,6 +2891,7 @@ fn emit_missing_cube(
         let base = sink.vertices.len() as u32;
         for (pos, uv) in positions.iter().zip(uvs) {
             sink.vertices.push(TerrainVertex {
+                source: Some((snapshot.geometry.missing_id, *dir as u8)),
                 entity: 0,
                 flat_shade: 1.0,
                 position: [
@@ -2686,6 +2934,7 @@ fn emit_face(
     tint: u32,
 ) {
     let opaque = region.opaque;
+    let source = sink.face_source;
     let MeshSink {
         vertices,
         solid,
@@ -2694,7 +2943,7 @@ fn emit_face(
     } = sink;
     let indices = if opaque { solid } else { cutout };
     emit_face_into(
-        vertices, indices, block_pos, positions, uvs, lights, region, tint,
+        vertices, indices, block_pos, positions, uvs, lights, region, tint, source,
     );
 }
 
@@ -2708,6 +2957,7 @@ fn emit_face_into(
     lights: [VertexLight; 4],
     region: AtlasRegion,
     tint: u32,
+    source: Option<(u16, u8)>,
 ) {
     let base = vertices.len() as u32;
     let face = face_code(crate::world::block::model::direction_from_positions(
@@ -2715,6 +2965,7 @@ fn emit_face_into(
     ));
     for i in 0..4 {
         vertices.push(TerrainVertex {
+            source,
             entity: 0,
             flat_shade: 1.0,
             position: [
@@ -2834,6 +3085,7 @@ mod terrain_uv_tests {
 
     fn packed(sprite_uv: [f32; 2]) -> PackedVertex {
         pack_vertex(&TerrainVertex {
+            source: None,
             entity: 0,
             flat_shade: 1.0,
             position: [0.0; 3],
@@ -2885,6 +3137,7 @@ mod terrain_uv_tests {
     #[test]
     fn light_packs_block_and_sky_with_the_shaded_tint() {
         let vertex = pack_vertex(&TerrainVertex {
+            source: None,
             entity: 0,
             flat_shade: 1.0,
             position: [0.0; 3],
@@ -2902,6 +3155,7 @@ mod terrain_uv_tests {
     fn shader_packs_get_the_tint_unshaded_and_the_shades_apart() {
         assert_eq!(size_of::<PackVertex>(), 24);
         let vertex = pack_shader_vertex(&TerrainVertex {
+            source: None,
             entity: 0,
             flat_shade: 0.9,
             position: [0.0; 3],
@@ -2948,6 +3202,251 @@ mod tint_tests {
             63
         );
         assert_eq!(tint_sample_y(Tint::Grass, upper, 64, block_state_table), 64);
+    }
+}
+
+#[cfg(test)]
+mod packed_mesh_tests {
+    use super::*;
+
+    #[test]
+    fn expanded_mesh_retains_vertices_without_a_compact_payload() {
+        let mut sink = MeshSink::default();
+        cube(&mut sink, [0.0; 3], 0, None);
+        sink.solid.extend_from_slice(&[0, 1, 2, 2, 3, 0]);
+        let section = sink.finish(0, TerrainFormat::Vanilla, 0).unwrap();
+        assert!(section.packed.is_none());
+        assert_eq!(section.vertices.format(), TerrainFormat::Vanilla);
+        assert_eq!(section.vertices.len(), 24);
+        assert_eq!(section.vertices.bytes().len(), 24 * 16);
+        assert_eq!(section.indices, [0, 1, 2, 2, 3, 0]);
+        assert_eq!(TerrainFormat::of(&None, false), TerrainFormat::Vanilla);
+        assert_eq!(TerrainFormat::of(&None, true), TerrainFormat::Compact);
+    }
+
+    #[test]
+    fn expanded_lod_uvs_cover_the_full_supported_range() {
+        let mut sink = MeshSink::default();
+        cube(&mut sink, [0.0; 3], 0, None);
+        for scale in [2.0, 4.0, 8.0, 16.0] {
+            for uv in [[0.0, scale], [scale, 0.0], [scale, 8.0 / 9.0]] {
+                let mut vertex = sink.vertices[0];
+                vertex.face = 7;
+                vertex.sprite_uv = uv;
+                let packed = pack_lod_vertex(&vertex);
+                assert_eq!(u32::from(packed.sprite) >> SPRITE_BITS, 7);
+                let decoded = packed
+                    .sprite_uv_fixed()
+                    .map(|axis| f32::from(axis) / TERRAIN_UV_FIXED_SCALE * 16.0);
+                for axis in 0..2 {
+                    let tolerance = 8.0 / TERRAIN_UV_FIXED_SCALE + 16.0 * f32::EPSILON;
+                    assert!((decoded[axis] - uv[axis]).abs() <= tolerance);
+                }
+            }
+        }
+    }
+
+    fn cube(sink: &mut MeshSink, origin: [f32; 3], lod: u32, fluid_height: Option<f32>) {
+        let start = sink.vertices.len();
+        let step = super::super::packed_face::lod_scale(lod) as f32;
+        for direction in Direction::VALUES {
+            let (positions, uvs) = cube_face_geometry(direction);
+            for (position, uv) in positions.into_iter().zip(uvs) {
+                sink.vertices.push(TerrainVertex {
+                    source: Some((0, direction as u8)),
+                    position: std::array::from_fn(|axis| {
+                        origin[axis]
+                            + position[axis]
+                                * if axis == 1 {
+                                    fluid_height.unwrap_or(step)
+                                } else {
+                                    step
+                                }
+                    }),
+                    sprite_uv: uv,
+                    sprite: 7,
+                    face: face_code(Some(direction)),
+                    light: VertexLight::flat(1.0, LightLevels::new(15, 0)),
+                    tint: pack_tint_shifted([0.2, 0.4, 1.0]),
+                    entity: 0,
+                    flat_shade: 1.0,
+                });
+            }
+        }
+        sink.pack_block(start, origin, lod, fluid_height.is_some(), [0.0; 3]);
+    }
+
+    fn decoded_position(mesh: &PackedMesh, index: usize, corner: usize) -> [f32; 3] {
+        let face = mesh.faces[index];
+        let batch = mesh
+            .batches
+            .iter()
+            .rev()
+            .find(|batch| batch.first_face as usize <= index)
+            .unwrap();
+        let block = mesh.blocks[batch.first_block as usize + usize::from(face.cuboid())];
+        // A fixed baked unit-cube fixture, shared by every test mesh.
+        let (positions, _) = cube_face_geometry(Direction::VALUES[usize::from(face.direction())]);
+        let mut local = [
+            positions[corner][0],
+            positions[corner][1],
+            positions[corner][2],
+            0.0,
+        ];
+        if block.global_id() == 1 {
+            local[1] *= 0.5;
+        }
+        if batch.lod > 0 {
+            let (positions, _) =
+                cube_face_geometry(Direction::VALUES[usize::from(face.direction())]);
+            for axis in 0..3 {
+                local[axis] = positions[corner][axis] * (1 << batch.lod) as f32;
+            }
+        }
+        if batch.fluid != 0 {
+            let hc = match (local[0] >= 0.5, local[2] >= 0.5) {
+                (false, false) => 0,
+                (false, true) => 1,
+                (true, true) => 2,
+                (true, false) => 3,
+            };
+            let height = mesh.heights[batch.first_height as usize + usize::from(face.cuboid())]
+                .heights()[hc];
+            if batch.lod > 0 {
+                local[1] = local[1] / (1 << batch.lod) as f32 * height;
+            } else if local[3] != 0.0 {
+                local[1] *= height;
+            }
+        }
+        let offset = if batch.fluid != 0 {
+            [0.0; 3]
+        } else {
+            [batch.offset_xy[0], batch.offset_xy[1], batch.first_height].map(f32::from_bits)
+        };
+        std::array::from_fn(|axis| f32::from(block.position()[axis]) + local[axis] + offset[axis])
+    }
+
+    #[test]
+    fn all_lods_preserve_cube_extents_and_materials() {
+        for lod in 0..=4 {
+            let mut sink = MeshSink::default();
+            cube(&mut sink, [0.0; 3], lod, None);
+            assert_eq!(sink.packed.blocks.len(), 1);
+            assert_eq!(sink.packed.faces.len(), 6);
+            assert_eq!(sink.packed.blocks[0].tint(), [51, 102, 255]);
+            for face in 0..6 {
+                for corner in 0..4 {
+                    assert_eq!(
+                        decoded_position(&sink.packed, face, corner),
+                        sink.vertices[face * 4 + corner].position
+                    );
+                }
+                assert_eq!(sink.packed.faces[face].shades(), [31; 4]);
+            }
+            assert_eq!(sink.packed.blocks[0].global_id(), 0);
+        }
+    }
+
+    #[test]
+    fn windows_split_without_changing_face_order() {
+        let mut sink = MeshSink::default();
+        for _ in 0..683 {
+            cube(&mut sink, [0.0; 3], 0, None);
+        }
+        assert!(
+            sink.packed
+                .blocks
+                .iter()
+                .all(|block| block.global_id() == 0)
+        );
+        assert_eq!(sink.packed.batches.len(), 2);
+        assert_eq!(sink.packed.batches[1].first_block, 682);
+        assert_eq!(sink.packed.batches[1].first_face, 682 * 6);
+        for face in 0..683 * 6 {
+            assert_eq!(sink.packed.faces[face].direction(), (face % 6) as u8);
+            assert_eq!(
+                decoded_position(&sink.packed, face, 0),
+                sink.vertices[face * 4].position
+            );
+        }
+        let indices: Vec<u32> = (0..683 * 6 * 4).rev().collect();
+        let water = vec![0, 1, 2, 682 * 6 * 4, 682 * 6 * 4 + 3];
+        let (opaque_draw, water_draw) = sink.packed.draw_indices(&indices, &water);
+        for (original, encoded) in indices
+            .iter()
+            .zip(&opaque_draw)
+            .chain(water.iter().zip(&water_draw))
+        {
+            // The vertex shader now decodes the batch directly, without any
+            // search through face ranges. Both render layers use the encoding.
+            let batch = &sink.packed.batches[(encoded >> 14) as usize];
+            let face = batch.first_face + ((encoded & 0x3fff) >> 2);
+            assert_eq!(face * 4 + (encoded & 3), *original);
+        }
+    }
+
+    #[test]
+    fn procedural_cube_masks_match_model_corner_winding() {
+        let masks = [0xf0c3ccu32, 0x9999f0, 0x3cf069];
+        for (direction, value) in Direction::VALUES.into_iter().enumerate() {
+            let (positions, _) = cube_face_geometry(value);
+            for (corner, expected) in positions.into_iter().enumerate() {
+                let position: [f32; 3] = std::array::from_fn(|axis| {
+                    ((masks[axis] >> (direction * 4 + corner)) & 1) as f32
+                });
+                assert_eq!(position, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn detailed_geometry_keeps_fractional_offsets_and_non_cube_faces() {
+        let mut sink = MeshSink::default();
+        let origin = [13.0, 7.0, 3.0];
+        cube(&mut sink, origin, 0, None);
+        sink.packed = PackedMesh::default();
+        for vertex in &mut sink.vertices {
+            vertex.position[0] -= 0.125;
+            vertex.position[1] = origin[1] + (vertex.position[1] - origin[1]) * 0.5;
+            vertex.sprite_uv = [0.25, 0.75];
+            vertex.source.as_mut().unwrap().0 = 1;
+        }
+        sink.pack_block(0, origin, 0, false, [-0.125, 0.0, 0.0]);
+        for face in 0..6 {
+            for corner in 0..4 {
+                assert_eq!(
+                    decoded_position(&sink.packed, face, corner),
+                    sink.vertices[face * 4 + corner].position
+                );
+            }
+        }
+        assert_eq!(sink.packed.blocks[0].global_id(), 1);
+    }
+
+    #[test]
+    fn fluid_batches_keep_height_precision_and_section_bounds() {
+        let mut sink = MeshSink::default();
+        cube(&mut sink, [0.0; 3], 1, None);
+        cube(&mut sink, [2.0, 2.0, 2.0], 1, Some(8.0 / 15.0));
+        cube(&mut sink, [4.0, 4.0, 4.0], 1, None);
+        assert_eq!(sink.packed.batches.len(), 3);
+        assert_eq!(sink.packed.heights.len(), 1);
+        for face in 0..18 {
+            for corner in 0..4 {
+                let decoded = decoded_position(&sink.packed, face, corner);
+                for axis in 0..3 {
+                    assert!(
+                        (decoded[axis] - sink.vertices[face * 4 + corner].position[axis]).abs()
+                            < 0.00001
+                    );
+                }
+            }
+        }
+        sink.solid.extend_from_slice(&[0, 1, 2]);
+        let section = sink.finish(0, TerrainFormat::Compact, 0).unwrap();
+        assert!(section.packed.is_some());
+        assert!(section.aabb.min[1] < 0.0);
+        assert!(section.aabb.max[1] > 6.0);
     }
 }
 

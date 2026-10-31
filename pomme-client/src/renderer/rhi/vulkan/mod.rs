@@ -73,6 +73,7 @@ pub struct Device {
     pub max_texture_array_layers: u32,
     /// The widest 2D texture, in texels.
     pub max_texture_size: u32,
+    pub max_storage_buffer_range: u32,
     depth_clamp: bool,
 }
 
@@ -106,6 +107,7 @@ impl Device {
             discrete: properties.device_type == vk::PhysicalDeviceType::DiscreteGpu,
             max_texture_array_layers: properties.limits.max_image_array_layers,
             max_texture_size: properties.limits.max_image_dimension2_d,
+            max_storage_buffer_range: properties.limits.max_storage_buffer_range,
             depth_clamp: physical_device.get_features().depth_clamp == vk::TRUE,
         }
     }

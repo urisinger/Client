@@ -67,6 +67,9 @@ use crate::world::block::render_assets::{BlockRenderAssets, BlockRenderView};
 
 /// The live atlas's layout, so meshes bake in UVs that match it.
 impl MeshSource for Renderer {
+    fn terrain_geometry(&self) -> Arc<chunk::packed_face::GlobalCuboidTable> {
+        Arc::clone(&self.terrain_geometry)
+    }
     fn shared_render_assets(&self) -> Arc<BlockRenderAssets> {
         Arc::clone(&self.render_assets)
     }
@@ -238,6 +241,7 @@ pub struct Renderer {
     camera: Camera,
 
     render_assets: Arc<BlockRenderAssets>,
+    terrain_geometry: Arc<chunk::packed_face::GlobalCuboidTable>,
     jar_assets_dir: PathBuf,
     asset_index: Option<AssetIndex>,
 
@@ -371,6 +375,10 @@ impl Renderer {
         let lightmap = Lightmap::new(&ctx.device);
         let chunk_pipeline =
             ChunkPipeline::new(&ctx.device, swapchain_state.targets(), &atlas, &lightmap);
+        let terrain_geometry = Arc::new(chunk::packed_face::GlobalCuboidTable::build(
+            &render_assets,
+            &atlas.uv_map,
+        ));
 
         let hand_pipeline = HandPipeline::new(
             &ctx.device,
@@ -479,7 +487,12 @@ impl Renderer {
             swapchain_state.targets(),
         );
 
-        let chunk_buffers = ChunkBufferStore::new(&ctx.device, ctx.indirect_draw);
+        let chunk_buffers = ChunkBufferStore::new(
+            &ctx.device,
+            ctx.indirect_draw,
+            chunk_pipeline.mesh_layout,
+            &terrain_geometry.data,
+        );
 
         let mut item_entity_pipeline = pipelines::item_entity::ItemEntityPipeline::new(
             &ctx.device,
@@ -536,6 +549,7 @@ impl Renderer {
             swapchain: swapchain_state,
             camera,
             render_assets,
+            terrain_geometry,
             jar_assets_dir: jar_assets_dir.to_path_buf(),
             asset_index: asset_index.clone(),
             atlas,
@@ -1537,6 +1551,15 @@ impl Renderer {
             Some(packs),
         )
         .expect("failed to rebuild atlas");
+        self.terrain_geometry = Arc::new(chunk::packed_face::GlobalCuboidTable::build(
+            &self.render_assets,
+            &self.atlas.uv_map,
+        ));
+        self.chunk_buffers.replace_geometry(
+            &self.ctx.device,
+            self.chunk_pipeline.mesh_layout,
+            &self.terrain_geometry.data,
+        );
 
         self.chunk_pipeline
             .rebind_atlas(&self.ctx.device, &self.atlas);
@@ -2066,20 +2089,34 @@ impl Renderer {
                     let t_cull = std::time::Instant::now();
                     // A pack that failed to build leaves its vertex format until
                     // the next frame remeshes; skip those.
-                    let vanilla_terrain = self.chunk_buffers.format() == TerrainFormat::Vanilla;
+                    let terrain_format = self.chunk_buffers.format();
+                    let has_lods = self.chunk_buffers.has_lods();
+                    let vanilla_terrain = terrain_format != TerrainFormat::ShaderPack;
                     if vanilla_terrain {
                         // Solid (no discard) first so it lays down depth and early-Z
                         // lets the front-to-back order reject occluded fragments;
                         // cutout after.
                         self.moving_block_buffers
                             .upload(&self.ctx.device, frame, moving_blocks);
-                        self.chunk_pipeline.bind(&mut pass, frame, false);
+                        self.chunk_pipeline
+                            .bind(&mut pass, frame, false, terrain_format, has_lods);
                         self.chunk_buffers
                             .draw_indirect(&pass, frame, false, View::Camera);
+                        if !moving_blocks.is_empty()
+                            && (terrain_format == TerrainFormat::Compact || has_lods)
+                        {
+                            self.chunk_pipeline.bind_moving(&mut pass, frame, false);
+                        }
                         self.moving_block_buffers.draw(&pass, frame, false);
-                        self.chunk_pipeline.bind(&mut pass, frame, true);
+                        self.chunk_pipeline
+                            .bind(&mut pass, frame, true, terrain_format, has_lods);
                         self.chunk_buffers
                             .draw_indirect(&pass, frame, true, View::Camera);
+                        if !moving_blocks.is_empty()
+                            && (terrain_format == TerrainFormat::Compact || has_lods)
+                        {
+                            self.chunk_pipeline.bind_moving(&mut pass, frame, true);
+                        }
                         self.moving_block_buffers.draw(&pass, frame, true);
                     }
                     terrain_timer.end();
@@ -2149,7 +2186,8 @@ impl Renderer {
                     // but doesn't write depth. CPU frustum-culled, reusing the entity
                     // frustum/eye.
                     if vanilla_terrain {
-                        self.chunk_pipeline.bind_water(&mut pass, frame);
+                        self.chunk_pipeline
+                            .bind_water(&mut pass, frame, terrain_format, has_lods);
                         self.chunk_buffers
                             .draw_water(&pass, &ent_frustum, anchor, eye);
                     }

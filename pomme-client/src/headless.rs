@@ -155,6 +155,7 @@ fn drive(
     dirs: &DataDirs,
 ) -> i32 {
     let chunk_detail = saved_chunk_detail(&dirs.game_dir);
+    let compact = crate::ui::menu::saved_compact_terrain_meshes(&dirs.game_dir);
     let skin_options = game.last_skin_options;
     // Columns with at least one non-empty section, as the GPU buffers count
     // them.
@@ -240,6 +241,10 @@ fn drive(
         game.last_update_phases.net_decode_ms = ms(t_net);
         // Meshing doesn't wait on visibility, which only orders the drawing.
         let t_rescan = Instant::now();
+        if game.mesh_dispatcher.compact() != compact {
+            game.mesh_dispatcher = game.mesh_dispatcher.with_pack(None, compact);
+            game.rebuild_meshes();
+        }
         game.rescan_mesh_jobs(chunk_detail);
         game.last_update_phases.rescan_ms = ms(t_rescan);
 

@@ -276,6 +276,11 @@ impl MainMenu {
             format!("Chunk Detail: {} chunks", self.chunk_detail)
         };
         let sd = format!("Simulation Distance: {} chunks", self.simulation_distance);
+        let compact_label = if self.compact_terrain_meshes {
+            "Compact Terrain Meshes: ON"
+        } else {
+            "Compact Terrain Meshes: OFF"
+        };
         let mf = if self.max_framerate >= super::MAX_FRAMERATE_UNLIMITED {
             "Max Framerate: Unlimited".to_string()
         } else {
@@ -327,7 +332,7 @@ impl MainMenu {
             // TODO: static stub, not wired (see mesher::enqueue).
             OptRow::Pair("Prioritize Chunk Updates: None", &sd),
             OptRow::Pair("Smooth Lighting: ON", &clouds_label),
-            OptRow::PairLeft(&cd),
+            OptRow::Pair(&cd, compact_label),
             OptRow::Pair("Particles: All", "Mipmap Levels: 4"),
             OptRow::Pair(entity_shadows_label, "Entity Distance: 100%"),
             OptRow::Pair(&blur_label, "Cloud Range: 128"),
@@ -1440,6 +1445,10 @@ impl MainMenu {
                         self.cloud_mode = self.cloud_mode.cycle();
                         self.save_settings(key_bindings);
                     }
+                    if label.starts_with("Compact Terrain Meshes:") {
+                        self.compact_terrain_meshes = !self.compact_terrain_meshes;
+                        self.save_settings(key_bindings);
+                    }
                     if label.starts_with("Shader Pack:") {
                         self.shader_pack =
                             next_shader_pack(&self.shader_packs_dir, self.shader_pack.as_deref());
@@ -2472,6 +2481,23 @@ mod tests {
         MenuInput {
             tab: true,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn compact_terrain_toggle_is_saved_in_both_directions() {
+        let dir = std::env::temp_dir().join(format!("pomme-compact-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let _cleanup = scopeguard::guard((), |_| {
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+        let mut grid = Grid::new("Compact Terrain Meshes: ON", "Other");
+        grid.menu.settings_dir = dir.clone();
+        grid.menu.compact_terrain_meshes = true;
+        for enabled in [false, true] {
+            assert!(grid.frame(&click(300.0)).clicked_button);
+            assert_eq!(grid.menu.compact_terrain_meshes, enabled);
+            assert_eq!(super::super::saved_compact_terrain_meshes(&dir), enabled);
         }
     }
 

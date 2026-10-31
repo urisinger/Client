@@ -15,4 +15,5 @@ pub const TERRAIN_UV_BITS: u32 = 12;
 
 /// Bits of `PackedVertex::sprite` holding the sprite id; the 3 above hold the
 /// quad's face (`Direction` + 1, 0 when it has none), for shader packs.
+/// Expanded vanilla LODs use code 7 for repeating UVs with a 0..16 range.
 pub const SPRITE_BITS: u32 = 13;

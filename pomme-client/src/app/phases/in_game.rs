@@ -4430,7 +4430,9 @@ pub fn update_game(
         );
     }
     let block_ids = gfx.renderer.pack_block_ids();
-    if !game.mesh_dispatcher.meshes_for(block_ids.as_ref()) {
+    if !game.mesh_dispatcher.meshes_for(block_ids.as_ref())
+        || game.mesh_dispatcher.compact() != core.menu.compact_terrain_meshes
+    {
         // TODO: rebuild after a datapack reload replaces the block tags.
         let pack = block_ids.map(|ids| {
             Arc::new(crate::shaderpack::block_ids::PackBlockIds::new(
@@ -4439,7 +4441,9 @@ pub fn update_game(
                 game.block_registry.tags(),
             ))
         });
-        game.mesh_dispatcher = game.mesh_dispatcher.with_pack(pack);
+        game.mesh_dispatcher = game
+            .mesh_dispatcher
+            .with_pack(pack, core.menu.compact_terrain_meshes);
         gfx.renderer
             .set_terrain_format(game.mesh_dispatcher.format());
         game.rebuild_meshes();

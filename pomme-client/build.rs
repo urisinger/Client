@@ -84,6 +84,7 @@ fn main() {
         "item_instance.glsl",
         "lightmap.glsl",
         "light.glsl",
+        "packed_face.glsl",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -93,9 +94,11 @@ fn main() {
 
     let shaders = [
         ("chunk.vert", shaderc::ShaderKind::Vertex),
+        ("compact_chunk.vert", shaderc::ShaderKind::Vertex),
         ("chunk.frag", shaderc::ShaderKind::Fragment),
         ("chunk_solid.frag", shaderc::ShaderKind::Fragment),
         ("water.vert", shaderc::ShaderKind::Vertex),
+        ("compact_water.vert", shaderc::ShaderKind::Vertex),
         ("water.frag", shaderc::ShaderKind::Fragment),
         ("cube.vert", shaderc::ShaderKind::Vertex),
         ("cube.frag", shaderc::ShaderKind::Fragment),
@@ -166,6 +169,21 @@ fn main() {
         let out_path = Path::new(&out_dir).join(&out_name);
         fs::write(&out_path, artifact.as_binary_u8())
             .unwrap_or_else(|e| panic!("failed to write {}: {e}", out_path.display()));
+
+        // Keep the original terrain shaders free of LOD work. Only meshes
+        // that can repeat textures use these separately compiled variants.
+        if matches!(
+            *file,
+            "chunk.vert" | "water.vert" | "chunk.frag" | "chunk_solid.frag" | "water.frag"
+        ) {
+            let source = source.replacen("#version 450", "#version 450\n#define TERRAIN_LOD", 1);
+            let artifact = compiler
+                .compile_into_spirv(&source, *kind, file, "main", Some(&options))
+                .unwrap_or_else(|e| panic!("failed to compile LOD {file}: {e}"));
+            let out_path = Path::new(&out_dir).join(format!("lod_{file}.spv"));
+            fs::write(&out_path, artifact.as_binary_u8())
+                .unwrap_or_else(|e| panic!("failed to write {}: {e}", out_path.display()));
+        }
     }
 }
 

@@ -40,6 +40,8 @@ struct Settings {
     // of 8 move to Off too.
     #[serde(rename = "chunk_detail_v2", default = "default_chunk_detail")]
     chunk_detail: u32,
+    #[serde(default = "default_compact_terrain_meshes")]
+    compact_terrain_meshes: bool,
     simulation_distance: u32,
     #[serde(default = "default_fov")]
     fov: u32,
@@ -213,6 +215,10 @@ fn default_volume() -> f32 {
     1.0
 }
 
+fn default_compact_terrain_meshes() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -220,6 +226,7 @@ impl Default for Settings {
             gui_scale: 0,
             render_distance: 12,
             chunk_detail: CHUNK_DETAIL_OFF,
+            compact_terrain_meshes: default_compact_terrain_meshes(),
             simulation_distance: 12,
             fov: 70,
             fov_effect_scale: 1.0,
@@ -273,6 +280,10 @@ impl Default for Settings {
 /// window would.
 pub(crate) fn saved_chunk_detail(game_dir: &Path) -> u32 {
     load_settings(game_dir).chunk_detail
+}
+
+pub(crate) fn saved_compact_terrain_meshes(game_dir: &Path) -> bool {
+    load_settings(game_dir).compact_terrain_meshes
 }
 
 fn load_settings(game_dir: &Path) -> Settings {
@@ -719,6 +730,7 @@ pub struct MainMenu {
     /// beyond it. Pomme-custom: vanilla has no LOD, this buys its look back
     /// within a VRAM budget.
     pub chunk_detail: u32,
+    pub compact_terrain_meshes: bool,
     pub simulation_distance: u32,
     /// Server-announced view distance cap; 0 when unknown (slider runs 2..32).
     pub server_render_distance: u32,
@@ -881,6 +893,7 @@ impl MainMenu {
             gui_scale_setting: settings.gui_scale,
             render_distance: settings.render_distance,
             chunk_detail: settings.chunk_detail,
+            compact_terrain_meshes: settings.compact_terrain_meshes,
             simulation_distance: settings.simulation_distance,
             server_render_distance: 0,
             fov: settings.fov,
@@ -1133,6 +1146,7 @@ impl MainMenu {
                     .saved()
                     .unwrap_or(self.render_distance),
                 chunk_detail: self.chunk_detail,
+                compact_terrain_meshes: self.compact_terrain_meshes,
                 simulation_distance: self.simulation_distance,
                 fov: self.fov,
                 fov_effect_scale: self.fov_effect_scale,
@@ -1669,6 +1683,16 @@ mod tests {
         assert_eq!(settled(&mut menu), Some(vec!["face".to_owned()]));
         menu.set_screen(Screen::Main, &key_bindings);
         assert_eq!(settled(&mut menu), both);
+    }
+
+    #[test]
+    fn old_settings_keep_compact_meshes_enabled() {
+        let mut json = serde_json::to_value(Settings::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("compact_terrain_meshes");
+        let settings: Settings = serde_json::from_value(json).unwrap();
+        assert!(settings.compact_terrain_meshes);
     }
 
     #[test]

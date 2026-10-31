@@ -83,7 +83,7 @@ impl BlockDefinitions {
 /// Session-owned metadata selection and numeric bindings to shared definitions.
 pub(crate) struct BlockRegistry {
     definitions: Rc<BlockDefinitions>,
-    render_assets: Arc<BlockRenderAssets>,
+    render_assets: OwnedBlockRenderView,
     protocol: i32,
     block_state_table: BlockStateTable,
     bindings: BlockBindings,
@@ -100,7 +100,7 @@ impl BlockRegistry {
         let bindings = BlockBindings::new(&definitions, block_state_table);
         Self {
             definitions,
-            render_assets,
+            render_assets: OwnedBlockRenderView::new(render_assets, block_state_table),
             protocol,
             block_state_table,
             bindings,
@@ -124,6 +124,7 @@ impl BlockRegistry {
             let block_state_table = BlockStateTable::for_protocol(protocol);
             if self.block_state_table.table_slot() != block_state_table.table_slot() {
                 self.bindings = BlockBindings::new(&self.definitions, block_state_table);
+                self.render_assets = self.render_assets.for_table(block_state_table);
             }
             self.block_state_table = block_state_table;
             self.protocol = protocol;
@@ -141,15 +142,15 @@ impl BlockRegistry {
     }
 
     pub(crate) fn render_view(&self) -> BlockRenderView<'_> {
-        self.render_assets.for_version(self.block_state_table)
+        self.render_assets.as_view()
     }
 
     pub(crate) fn owned_render_view(&self) -> OwnedBlockRenderView {
-        OwnedBlockRenderView::new(self.render_assets.clone(), self.block_state_table)
+        self.render_assets.clone()
     }
 
     pub(crate) fn replace_render_assets(&mut self, render_assets: Arc<BlockRenderAssets>) {
-        self.render_assets = render_assets;
+        self.render_assets = OwnedBlockRenderView::new(render_assets, self.block_state_table);
     }
 
     pub(crate) fn placeable_block_for_item(&self, item_name: &str) -> Option<BlockState> {

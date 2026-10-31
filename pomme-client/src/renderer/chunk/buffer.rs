@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::mem::offset_of;
 
@@ -6,12 +7,16 @@ use glam::DVec3;
 use super::mesher::{
     ChunkAABB, ChunkMeshData, PackVertex, PackedVertex, SectionMesh, TerrainFormat,
 };
+use super::packed_face::GlobalCuboid;
 use crate::position::ChunkPos;
 use crate::renderer::rhi::IndirectDrawFeatures;
 use crate::renderer::{MAX_FRAMES_IN_FLIGHT, rhi, shader, util};
 
 const BUCKET_VERTICES: u32 = 32768;
 const BUCKET_INDICES: u32 = 49152;
+// A multiple of both terrain strides (16 and 24), and of index alignment.
+// All streams belonging to a section occupy one arena region.
+const MESH_ALIGNMENT: u64 = 48;
 const INDEX_SIZE: u64 = size_of::<u32>() as u64;
 const BYTES_PER_BUCKET: u64 =
     BUCKET_VERTICES as u64 * size_of::<PackedVertex>() as u64 + BUCKET_INDICES as u64 * INDEX_SIZE;
@@ -46,10 +51,8 @@ pub fn column_is_near(pos: ChunkPos, eye: DVec3) -> bool {
     dx * dx + dz * dz < NEARBY_DIST_SQ as f64
 }
 
-/// First-fit free-list sub-allocator over a fixed element range, coalescing on
-/// free. Each section gets an exact-size vertex (and index) slice instead of
-/// whole fixed buckets — vanilla's `UberGpuBuffer` model — so re-uploading one
-/// section never disturbs the rest and there is no per-section bucket waste.
+/// First-fit free-list sub-allocator, coalescing on free. The mesh arena uses
+/// aligned units so every section owns one region for all of its streams.
 struct FreeList {
     capacity: u32,
     /// Free regions `(offset, len)`, sorted by offset and coalesced (no two
@@ -105,6 +108,25 @@ impl FreeList {
                 self.free[pos - 1] = (po, pl + l);
                 self.free.remove(pos);
             }
+        }
+    }
+}
+
+/// Byte layout of one section's contiguous vertex and index payload.
+#[derive(Debug)]
+struct MeshLayout {
+    index_offset: u64,
+    units: u32,
+}
+
+impl MeshLayout {
+    fn new(vertices: u32, indices: u32, stride: u64) -> Self {
+        assert_eq!(MESH_ALIGNMENT % stride, 0);
+        let index_offset = u64::from(vertices) * stride;
+        let bytes = index_offset + u64::from(indices) * INDEX_SIZE;
+        Self {
+            index_offset,
+            units: u32::try_from(bytes.div_ceil(MESH_ALIGNMENT)).expect("section mesh too large"),
         }
     }
 }
@@ -213,6 +235,37 @@ const PACK_VERTEX_ATTRIBUTES: [rhi::VertexAttribute; 7] = {
 /// indexed by the `first_instance` the cull shader writes.
 pub const CHUNK_VERTEX_BUFFERS: [rhi::VertexBufferLayout<'static>; 2] =
     chunk_vertex_buffers(size_of::<PackedVertex>(), &VERTEX_ATTRIBUTES);
+
+/// Terrain faces are vertex-pulled. Only per-section instance data is fetched
+/// through vertex attributes; buffer zero has no per-vertex attributes.
+pub const COMPACT_CHUNK_VERTEX_BUFFERS: [rhi::VertexBufferLayout<'static>; 2] = [
+    rhi::VertexBufferLayout {
+        stride: 16,
+        step_mode: rhi::VertexStepMode::Vertex,
+        attributes: &[],
+    },
+    rhi::VertexBufferLayout {
+        stride: size_of::<ChunkMeta>() as u32,
+        step_mode: rhi::VertexStepMode::Instance,
+        attributes: &[
+            rhi::VertexAttribute {
+                location: 5,
+                format: rhi::VertexFormat::Sint32x3,
+                offset: offset_of!(ChunkMeta, origin) as u32,
+            },
+            rhi::VertexAttribute {
+                location: 6,
+                format: rhi::VertexFormat::Float32,
+                offset: offset_of!(ChunkMeta, visibility) as u32,
+            },
+            rhi::VertexAttribute {
+                location: 9,
+                format: rhi::VertexFormat::Uint32,
+                offset: offset_of!(ChunkMeta, vertex_offset) as u32,
+            },
+        ],
+    },
+];
 
 /// [`CHUNK_VERTEX_BUFFERS`] over [`PackVertex`]es, for a shader pack.
 pub const PACK_CHUNK_VERTEX_BUFFERS: [rhi::VertexBufferLayout<'static>; 2] =
@@ -379,6 +432,7 @@ struct FrustumData {
 /// drives the per-section fade so editing one section never re-fades the rest
 /// of the column.
 pub(crate) struct SectionAlloc {
+    lod: u32,
     section_index: i32,
     aabb: ChunkAABB,
     /// Section world origin (`chunk*16`, `min_y + si*16`), used to rebase the
@@ -421,6 +475,7 @@ impl ChunkAlloc {
         let sections = section_indices
             .into_iter()
             .map(|si| SectionAlloc {
+                lod: 0,
                 section_index: si,
                 aabb: ChunkAABB {
                     min: [0.0, 0.0, 0.0, 0.0],
@@ -448,19 +503,17 @@ pub struct ChunkBufferStore {
     /// Capacity (in draws) of the per-frame meta/indirect buffers. Grown on
     /// demand because per-section packing yields many more draws than buckets.
     max_meta: usize,
-    vertex_buffer: rhi::backend::Buffer,
-    index_buffer: rhi::backend::Buffer,
+    mesh_buffer: rhi::backend::Buffer,
+    geometry_buffer: rhi::backend::Buffer,
+    mesh_group: rhi::backend::BindGroup,
     staging_buffer: rhi::backend::Buffer,
     staging_size: u64,
     use_staging: bool,
     format: TerrainFormat,
-    /// Vertices the pool holds, in either format.
-    pool_vertices: u32,
-
-    /// Exact-size sub-allocators over the vertex and index pools (in elements).
-    vtx_free: FreeList,
-    idx_free: FreeList,
+    /// One arena allocator, in MESH_ALIGNMENT-byte units.
+    mesh_free: FreeList,
     chunks: HashMap<ChunkPos, ChunkAlloc>,
+    lod_sections: usize,
     /// Per-column bitmask of occlusion-visible section indices (bit `si`), from
     /// the CPU visibility graph. A column absent here defaults to fully
     /// visible, so freshly-loaded-but-not-yet-graphed columns still draw.
@@ -500,28 +553,47 @@ pub struct ChunkBufferStore {
 }
 
 impl ChunkBufferStore {
-    pub fn new(device: &rhi::backend::Device, indirect_draw: IndirectDrawFeatures) -> Self {
+    pub fn new(
+        device: &rhi::backend::Device,
+        indirect_draw: IndirectDrawFeatures,
+        mesh_layout: rhi::backend::BindGroupLayout,
+        geometry: &[GlobalCuboid],
+    ) -> Self {
         let total_buckets = compute_bucket_count(device.device_local_bytes);
         let pool_vertices = total_buckets * BUCKET_VERTICES;
-        let format = TerrainFormat::Vanilla;
+        let format = TerrainFormat::Compact;
         let vertex_size = u64::from(pool_vertices) * format.vertex_size();
         let index_size = total_buckets as u64 * BUCKET_INDICES as u64 * INDEX_SIZE;
 
         let use_staging = device.discrete;
 
-        let vertex_buffer = create_pool(
+        let pool_units = ((vertex_size + index_size)
+            .min(u64::from(device.max_storage_buffer_range))
+            / MESH_ALIGNMENT) as u32;
+        let mesh_buffer = create_pool(
             device,
             use_staging,
-            "vertex_pool",
-            vertex_size,
-            rhi::BufferUsages::VERTEX,
+            "mesh_pool",
+            u64::from(pool_units) * MESH_ALIGNMENT,
+            rhi::BufferUsages::VERTEX | rhi::BufferUsages::INDEX | rhi::BufferUsages::STORAGE,
         );
-        let index_buffer = create_pool(
-            device,
-            use_staging,
-            "index_pool",
-            index_size,
-            rhi::BufferUsages::INDEX,
+        let geometry_bytes = size_of_val(geometry) as u64;
+        let geometry_buffer = upload_baked_geometry(device, geometry);
+        let mesh_group = device.create_bind_group(
+            mesh_layout,
+            &[
+                (
+                    0,
+                    rhi::backend::BindingResource::storage(
+                        &mesh_buffer,
+                        u64::from(pool_units) * MESH_ALIGNMENT,
+                    ),
+                ),
+                (
+                    1,
+                    rhi::backend::BindingResource::storage(&geometry_buffer, geometry_bytes),
+                ),
+            ],
         );
 
         // Discrete GPUs batch a frame's uploads through this buffer in one
@@ -542,19 +614,17 @@ impl ChunkBufferStore {
         );
 
         tracing::info!(
-            "Chunk buffers: {} (vertex={} MB, index={} MB, staging={} KB)",
+            "Chunk mesh arena: {} (vertices+indices={} MB, staging={} KB)",
             if use_staging {
                 "DEVICE_LOCAL + staging"
             } else {
                 "HOST_VISIBLE"
             },
-            vertex_size / (1024 * 1024),
-            index_size / (1024 * 1024),
+            u64::from(pool_units) * MESH_ALIGNMENT / (1024 * 1024),
             staging_size / 1024,
         );
 
-        let vtx_free = FreeList::new(pool_vertices);
-        let idx_free = FreeList::new(total_buckets * BUCKET_INDICES);
+        let mesh_free = FreeList::new(pool_units);
 
         // Per-section packing yields many more draws than buckets, so pre-size
         // generously: growth (`ensure_meta_capacity`) needs a `device.wait_idle`
@@ -590,16 +660,16 @@ impl ChunkBufferStore {
         Self {
             indirect_draw,
             max_meta,
-            vertex_buffer,
-            index_buffer,
+            mesh_buffer,
+            geometry_buffer,
+            mesh_group,
             staging_buffer,
             staging_size,
             use_staging,
             format,
-            pool_vertices,
-            vtx_free,
-            idx_free,
+            mesh_free,
             chunks: HashMap::new(),
+            lod_sections: 0,
             chunk_visibility: HashMap::new(),
             meta_dirty: true,
             fade_until: std::time::Instant::now(),
@@ -636,7 +706,7 @@ impl ChunkBufferStore {
             return;
         }
         device.submit(|encoder| {
-            for (dst, copies) in [(&self.vertex_buffer, copy_v), (&self.index_buffer, copy_i)] {
+            for (dst, copies) in [(&self.mesh_buffer, copy_v), (&self.mesh_buffer, copy_i)] {
                 if !copies.is_empty() {
                     encoder.copy_buffer(self.staging_buffer.handle(), dst.handle(), copies);
                 }
@@ -661,10 +731,10 @@ impl ChunkBufferStore {
             return needs_remesh;
         }
 
-        // Sub-allocate an exact-size vertex + index slice for each non-empty
-        // section. Indices stay section-local and `vertex_offset` rebases the draw,
-        // so no packing or rebasing is needed — just one slice per section.
+        // Sub-allocate one contiguous region for each non-empty section.
+        // Indices stay section-local and `vertex_offset` rebases the draw.
         struct Plan<'a> {
+            lod: u32,
             section_index: i32,
             verts: &'a [u8],
             vertex_count: u32,
@@ -725,30 +795,6 @@ impl ChunkBufferStore {
                 })
                 .collect();
 
-            // Retire the slices of every accepted covered section: the re-meshed
-            // ones are re-allocated below, the now-empty ones simply vanish.
-            // Remember which were present so a re-meshed section swaps instantly
-            // while a freshly revealed one still fades in. Rejected sections are
-            // left untouched.
-            let mut freed: Vec<(u32, u32, u32, u32)> = Vec::new();
-            let mut was_present: std::collections::HashSet<i32> = std::collections::HashSet::new();
-            if let Some(entry) = self.chunks.get_mut(&mesh.pos) {
-                entry.sections.retain(|s| {
-                    if accepted.contains(&s.section_index) {
-                        was_present.insert(s.section_index);
-                        freed.push((s.vertex_offset as u32, s.vtx_len, s.first_index, s.idx_len));
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
-            self.retire_slices(freed.iter().copied());
-            // Sections were removed/replaced, so the draw list must be rebuilt even
-            // if this mesh is skipped below (otherwise it keeps drawing a retired,
-            // soon-reused slice).
-            self.meta_dirty = true;
-
             // A mesh from before a format change is remeshed anyway.
             let upload_secs: Vec<&SectionMesh> = mesh
                 .sections
@@ -757,8 +803,35 @@ impl ChunkBufferStore {
                 .filter(|s| s.vertices.format() == self.format)
                 .collect();
 
+            let payloads: Vec<Cow<'_, [u8]>> = upload_secs
+                .iter()
+                .map(|section| {
+                    if let Some(packed) = &section.packed {
+                        Cow::Owned(packed.encode())
+                    } else {
+                        Cow::Borrowed(section.vertices.bytes())
+                    }
+                })
+                .collect();
+            let draw_indices: Vec<(Cow<'_, [u32]>, Cow<'_, [u32]>)> = upload_secs
+                .iter()
+                .map(|section| {
+                    if let Some(packed) = &section.packed {
+                        let (indices, water) =
+                            packed.draw_indices(&section.indices, &section.water_indices);
+                        (Cow::Owned(indices), Cow::Owned(water))
+                    } else {
+                        (
+                            Cow::Borrowed(section.indices.as_slice()),
+                            Cow::Borrowed(section.water_indices.as_slice()),
+                        )
+                    }
+                })
+                .collect();
+
             if upload_secs.is_empty() {
-                // Every accepted section is now empty (freed above); drop the
+                self.retire_sections(mesh.pos, &accepted);
+                // Every accepted section is now empty; drop the
                 // column if nothing remains.
                 if self
                     .chunks
@@ -774,7 +847,7 @@ impl ChunkBufferStore {
                 // Verts and indices share the staging buffer (two halves). A chunk
                 // too large for one half is skipped rather than overflowing the
                 // buffer. This is permanent, so it's not reported for retry.
-                let v_bytes: usize = upload_secs.iter().map(|s| s.vertices.bytes().len()).sum();
+                let v_bytes: usize = payloads.iter().map(|bytes| bytes.len()).sum();
                 let i_bytes: usize = upload_secs
                     .iter()
                     .map(|s| (s.indices.len() + s.water_indices.len()) * INDEX_SIZE as usize)
@@ -795,37 +868,37 @@ impl ChunkBufferStore {
             // rollback if the pool runs out partway through a column.
             let mut taken: Vec<(u32, u32, u32, u32)> = Vec::new();
             let mut pool_full = false;
-            for sec in &upload_secs {
-                let vcount = sec.vertices.len() as u32;
+            for ((sec, payload), (indices, water_indices)) in
+                upload_secs.iter().zip(&payloads).zip(&draw_indices)
+            {
+                let vcount = (payload.len() as u64 / self.format.vertex_size()) as u32;
                 // Opaque and water indices share one slice (opaque first, water after).
                 let icount = (sec.indices.len() + sec.water_indices.len()) as u32;
                 if vcount == 0 || icount == 0 {
                     continue;
                 }
-                let Some(vtx_off) = self.vtx_free.alloc(vcount) else {
+                let layout = MeshLayout::new(vcount, icount, self.format.vertex_size());
+                let Some(base) = self.mesh_free.alloc(layout.units) else {
                     self.free_slices(&taken);
-                    tracing::debug!("Vertex pool full, skipping {:?}", mesh.pos);
+                    tracing::debug!("Mesh pool full, skipping {:?}", mesh.pos);
                     pool_full = true;
                     break;
                 };
-                let Some(idx_off) = self.idx_free.alloc(icount) else {
-                    self.vtx_free.free_region(vtx_off, vcount);
-                    self.free_slices(&taken);
-                    tracing::debug!("Index pool full, skipping {:?}", mesh.pos);
-                    pool_full = true;
-                    break;
-                };
+                let base_bytes = u64::from(base) * MESH_ALIGNMENT;
+                let vtx_off = (base_bytes / self.format.vertex_size()) as u32;
+                let idx_off = ((base_bytes + layout.index_offset) / INDEX_SIZE) as u32;
                 debug_assert_eq!(
-                    sec.vertices.bytes().len() as u64,
+                    payload.len() as u64,
                     u64::from(vcount) * self.format.vertex_size()
                 );
                 taken.push((vtx_off, vcount, idx_off, icount));
                 plans.push(Plan {
+                    lod: sec.lod,
                     section_index: sec.section_index,
-                    verts: sec.vertices.bytes(),
+                    verts: payload,
                     vertex_count: vcount,
-                    indices: &sec.indices,
-                    water_indices: &sec.water_indices,
+                    indices,
+                    water_indices,
                     vtx_off,
                     idx_off,
                     solid_index_count: sec.solid_index_count,
@@ -838,8 +911,7 @@ impl ChunkBufferStore {
                 });
             }
             if pool_full {
-                // The accepted sections were retired above; report them so the
-                // next rescan re-enqueues them.
+                // Keep old sections active and request another upload attempt.
                 needs_remesh.push((mesh.pos, accepted.iter().copied().collect()));
                 continue;
             }
@@ -885,16 +957,21 @@ impl ChunkBufferStore {
             } else {
                 for p in &plans {
                     let base = u64::from(p.vtx_off) * self.format.vertex_size();
-                    self.vertex_buffer.write_at(base as usize, p.verts);
+                    self.mesh_buffer.write_at(base as usize, p.verts);
                     p.write_indices(
-                        &mut self.index_buffer,
+                        &mut self.mesh_buffer,
                         p.idx_off as usize * INDEX_SIZE as usize,
                     );
                 }
             }
 
+            // Publish replacements only after all allocation and upload work
+            // succeeded. Pool exhaustion must leave the previous mesh alive.
+            let was_present = self.retire_sections(mesh.pos, &accepted);
+            self.lod_sections += plans.iter().filter(|p| p.lod > 0).count();
             let now = std::time::Instant::now();
             let new_sections = plans.iter().map(|p| SectionAlloc {
+                lod: p.lod,
                 section_index: p.section_index,
                 aabb: p.aabb,
                 origin: p.origin,
@@ -972,10 +1049,41 @@ impl ChunkBufferStore {
         self.max_meta = new_max;
     }
 
+    fn retire_sections(
+        &mut self,
+        pos: ChunkPos,
+        accepted: &std::collections::HashSet<i32>,
+    ) -> std::collections::HashSet<i32> {
+        let mut freed = Vec::new();
+        let mut present = std::collections::HashSet::new();
+        if let Some(entry) = self.chunks.get_mut(&pos) {
+            entry.sections.retain(|section| {
+                if !accepted.contains(&section.section_index) {
+                    return true;
+                }
+                present.insert(section.section_index);
+                self.lod_sections -= usize::from(section.lod > 0);
+                freed.push((
+                    section.vertex_offset as u32,
+                    section.vtx_len,
+                    section.first_index,
+                    section.idx_len,
+                ));
+                false
+            });
+        }
+        self.retire_slices(freed);
+        self.meta_dirty = true;
+        present
+    }
+
     /// Return one slice's vertex and index ranges to the pools.
     fn free_slice(&mut self, (vo, vl, io, il): (u32, u32, u32, u32)) {
-        self.vtx_free.free_region(vo, vl);
-        self.idx_free.free_region(io, il);
+        let layout = MeshLayout::new(vl, il, self.format.vertex_size());
+        let base_bytes = u64::from(vo) * self.format.vertex_size();
+        debug_assert_eq!(base_bytes + layout.index_offset, u64::from(io) * INDEX_SIZE);
+        self.mesh_free
+            .free_region((base_bytes / MESH_ALIGNMENT) as u32, layout.units);
     }
 
     /// Return slices immediately. Only safe for slices never submitted to a
@@ -1008,7 +1116,7 @@ impl ChunkBufferStore {
         while self
             .pending_free
             .front()
-            .is_some_and(|&(retire_at, _)| retire_at <= self.frame_seq)
+            .is_some_and(|(retire_at, _)| *retire_at <= self.frame_seq)
         {
             let (_, slice) = self.pending_free.pop_front().unwrap();
             self.free_slice(slice);
@@ -1017,7 +1125,8 @@ impl ChunkBufferStore {
 
     pub fn remove(&mut self, pos: &ChunkPos) {
         if let Some(alloc) = self.chunks.remove(pos) {
-            self.retire_slices(alloc.sections.iter().map(|sec| {
+            self.lod_sections -= alloc.sections.iter().filter(|s| s.lod > 0).count();
+            self.retire_slices(alloc.sections.into_iter().map(|sec| {
                 (
                     sec.vertex_offset as u32,
                     sec.vtx_len,
@@ -1029,32 +1138,59 @@ impl ChunkBufferStore {
         }
     }
 
-    /// Drops every mesh and, for a new format, remakes the vertex pool at its
-    /// stride. The caller waits for in-flight frames first.
-    pub fn set_format(&mut self, device: &rhi::backend::Device, format: TerrainFormat) {
+    /// Drops meshes before switching stride. The arena supports both formats;
+    /// the caller waits for in-flight frames before clearing it.
+    pub fn set_format(&mut self, _device: &rhi::backend::Device, format: TerrainFormat) {
         self.clear();
-        if format == self.format {
-            return;
-        }
         self.format = format;
-        std::mem::take(&mut self.vertex_buffer).destroy(device);
-        self.vertex_buffer = create_pool(
-            device,
-            self.use_staging,
-            "vertex_pool",
-            u64::from(self.pool_vertices) * format.vertex_size(),
-            rhi::BufferUsages::VERTEX,
-        );
     }
 
     pub fn format(&self) -> TerrainFormat {
         self.format
     }
 
+    pub fn has_lods(&self) -> bool {
+        self.lod_sections != 0
+    }
+
+    /// Asset reload owns the GPU idle wait. Rebuild the immutable geometry
+    /// table once and invalidate section meshes referencing the previous one.
+    pub fn replace_geometry(
+        &mut self,
+        device: &rhi::backend::Device,
+        layout: rhi::backend::BindGroupLayout,
+        geometry: &[GlobalCuboid],
+    ) {
+        self.clear();
+        let buffer = upload_baked_geometry(device, geometry);
+        let old = std::mem::replace(&mut self.geometry_buffer, buffer);
+        self.mesh_group.replace(
+            device,
+            layout,
+            &[
+                (
+                    0,
+                    rhi::backend::BindingResource::storage(
+                        &self.mesh_buffer,
+                        u64::from(self.mesh_free.capacity) * MESH_ALIGNMENT,
+                    ),
+                ),
+                (
+                    1,
+                    rhi::backend::BindingResource::storage(
+                        &self.geometry_buffer,
+                        size_of_val(geometry) as u64,
+                    ),
+                ),
+            ],
+        );
+        old.destroy(device);
+    }
+
     pub fn clear(&mut self) {
         self.chunks.clear();
-        self.vtx_free.reset();
-        self.idx_free.reset();
+        self.lod_sections = 0;
+        self.mesh_free.reset();
         self.pending_free.clear();
         self.camera.meta.clear();
         self.meta_dirty = true;
@@ -1065,27 +1201,24 @@ impl ChunkBufferStore {
     /// awaiting reclaim and free ranges must never share a vertex or index.
     #[cfg(feature = "test-harness")]
     pub fn slice_overlap(&self) -> Option<String> {
-        let mut vertex = self.vtx_free.free.clone();
-        let mut index = self.idx_free.free.clone();
+        let mut ranges = self.mesh_free.free.clone();
         let live = self
             .chunks
             .values()
             .flat_map(|c| &c.sections)
             .map(|s| (s.vertex_offset as u32, s.vtx_len, s.first_index, s.idx_len));
-        let retired = self.pending_free.iter().map(|&(_, slice)| slice);
+        let retired = self.pending_free.iter().map(|(_, slice)| *slice);
         for (vtx_off, vtx_len, idx_off, idx_len) in live.chain(retired) {
-            vertex.push((vtx_off, vtx_len));
-            index.push((idx_off, idx_len));
+            let layout = MeshLayout::new(vtx_len, idx_len, self.format.vertex_size());
+            let base = u64::from(vtx_off) * self.format.vertex_size();
+            debug_assert_eq!(base + layout.index_offset, u64::from(idx_off) * INDEX_SIZE);
+            ranges.push(((base / MESH_ALIGNMENT) as u32, layout.units));
         }
-        [("vertex", vertex), ("index", index)]
-            .into_iter()
-            .find_map(|(pool, mut ranges)| {
-                ranges.sort_unstable();
-                ranges
-                    .windows(2)
-                    .find(|w| w[0].0 + w[0].1 > w[1].0)
-                    .map(|w| format!("{pool} ranges {:?} and {:?} overlap", w[0], w[1]))
-            })
+        ranges.sort_unstable();
+        ranges
+            .windows(2)
+            .find(|w| w[0].0 + w[0].1 > w[1].0)
+            .map(|w| format!("mesh ranges {:?} and {:?} overlap", w[0], w[1]))
     }
 
     pub fn chunk_count(&self) -> u32 {
@@ -1272,9 +1405,12 @@ impl ChunkBufferStore {
 
         // Binding 0: packed vertex pool. Binding 1: the meta buffer, read per
         // instance for the section origin + fade (indexed by `first_instance`).
-        pass.set_vertex_buffer(0, self.vertex_buffer.handle());
+        pass.set_vertex_buffer(0, self.mesh_buffer.handle());
+        if self.format == TerrainFormat::Compact {
+            pass.set_bind_group(3, self.mesh_group);
+        }
         pass.set_vertex_buffer(1, list.meta_buffers[frame].handle());
-        pass.set_index_buffer(self.index_buffer.handle());
+        pass.set_index_buffer(self.mesh_buffer.handle());
         let stride = size_of::<DrawCommand>() as u32;
         if self.indirect_draw.count {
             pass.draw_indexed_indirect_count(indirect, count, max_draws, stride);
@@ -1325,8 +1461,11 @@ impl ChunkBufferStore {
             return;
         }
 
-        pass.set_vertex_buffer(0, self.vertex_buffer.handle());
-        pass.set_index_buffer(self.index_buffer.handle());
+        pass.set_vertex_buffer(0, self.mesh_buffer.handle());
+        if self.format == TerrainFormat::Compact {
+            pass.set_bind_group(3, self.mesh_group);
+        }
+        pass.set_index_buffer(self.mesh_buffer.handle());
 
         let now = std::time::Instant::now();
         for (pos, alloc) in self.chunks.iter() {
@@ -1347,6 +1486,13 @@ impl ChunkBufferStore {
                     0,
                     bytemuck::bytes_of(&origin_fade),
                 );
+                if self.format == TerrainFormat::Compact {
+                    pass.set_push_constants(
+                        rhi::ShaderStages::VERTEX,
+                        16,
+                        bytemuck::bytes_of(&[sec.vertex_offset as u32, 0, 0, 0]),
+                    );
+                }
                 pass.draw_indexed(
                     sec.water_index_count,
                     1,
@@ -1359,9 +1505,9 @@ impl ChunkBufferStore {
     }
 
     pub fn destroy(&mut self, device: &rhi::backend::Device) {
-        for buffer in [&mut self.vertex_buffer, &mut self.index_buffer] {
-            std::mem::take(buffer).destroy(device);
-        }
+        std::mem::take(&mut self.mesh_buffer).destroy(device);
+        std::mem::take(&mut self.geometry_buffer).destroy(device);
+        self.mesh_group.destroy(device);
         for list in std::iter::once(&mut self.camera).chain(&mut self.shadow) {
             list.destroy(device);
         }
@@ -1372,6 +1518,48 @@ impl ChunkBufferStore {
         self.compute_layout.destroy(device);
         self.cull_layout.destroy(device);
     }
+}
+
+/// Upload only during asset load/reload, sized to actual baked geometry.
+fn upload_baked_geometry(
+    device: &rhi::backend::Device,
+    geometry: &[GlobalCuboid],
+) -> rhi::backend::Buffer {
+    let bytes = bytemuck::cast_slice(geometry);
+    assert!(!bytes.is_empty());
+    assert!(bytes.len() as u64 <= u64::from(device.max_storage_buffer_range));
+    let mut buffer = create_pool(
+        device,
+        device.discrete,
+        "baked_terrain_geometry",
+        bytes.len() as u64,
+        rhi::BufferUsages::STORAGE,
+    );
+    if device.discrete {
+        let mut staging = rhi::backend::Buffer::new(
+            device,
+            "baked_geometry_upload",
+            bytes.len() as u64,
+            rhi::BufferUsages::COPY_SRC,
+            rhi::MemoryLocation::Host,
+        );
+        staging.write(bytes);
+        device.submit(|encoder| {
+            encoder.copy_buffer(
+                staging.handle(),
+                buffer.handle(),
+                &[rhi::BufferCopy {
+                    src_offset: 0,
+                    dst_offset: 0,
+                    size: bytes.len() as u64,
+                }],
+            )
+        });
+        staging.destroy(device);
+    } else {
+        buffer.write(bytes);
+    }
+    buffer
 }
 
 /// A chunk pool: device-local behind the staging buffer, or host-visible.
@@ -1575,6 +1763,35 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[test]
+    fn mesh_streams_share_one_aligned_allocation() {
+        let mut arena = FreeList::new(1024);
+        let mut allocations = Vec::new();
+        for stride in [16, 24] {
+            for (vertices, indices) in [(4, 6), (7, 12), (13, 30)] {
+                let layout = MeshLayout::new(vertices, indices, stride);
+                let base = arena.alloc(layout.units).unwrap();
+                let bytes = u64::from(base) * MESH_ALIGNMENT;
+                assert_eq!(bytes % stride, 0);
+                assert_eq!((bytes + layout.index_offset) % INDEX_SIZE, 0);
+                assert_eq!(layout.index_offset, u64::from(vertices) * stride);
+                assert!(
+                    layout.index_offset + u64::from(indices) * INDEX_SIZE
+                        <= u64::from(layout.units) * MESH_ALIGNMENT
+                );
+                allocations.push((base, layout.units));
+            }
+        }
+        // Freeing out of order must restore the single original range.
+        for index in [2, 0, 4, 1, 5, 3] {
+            let (base, units) = allocations[index];
+            arena.free_region(base, units);
+        }
+        assert_eq!(arena.free, [(0, 1024)]);
+        assert_eq!(arena.alloc(1025), None);
+        assert_eq!(arena.free, [(0, 1024)]);
+    }
 
     #[test]
     fn build_meta_masks_fades_and_sorts_front_to_back() {

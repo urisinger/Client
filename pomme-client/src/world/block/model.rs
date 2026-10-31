@@ -482,6 +482,11 @@ impl TextureId {
 
 #[derive(Clone, Debug)]
 pub struct BakedQuad {
+    /// Identity of the model element, assigned while baking (master's cuboid
+    /// UID).
+    pub cuboid_uid: u32,
+    /// Face slot within that element; independent of visibility and shading.
+    pub direction: Direction,
     pub positions: [[f32; 3]; 4],
     pub uvs: [[f32; 2]; 4],
     pub texture: TextureId,
@@ -1223,6 +1228,8 @@ fn add_chest_cube(
 
     for spec in face_specs {
         quads.push(BakedQuad {
+            cuboid_uid: 0,
+            direction: Direction::Up,
             positions: spec.positions,
             uvs: spec
                 .uv_pixels
@@ -1859,6 +1866,9 @@ fn bake_resolved_model(
     let mut quads = Vec::new();
 
     for element in &resolved.elements {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT_CUBOID_UID: AtomicU32 = AtomicU32::new(1);
+        let cuboid_uid = NEXT_CUBOID_UID.fetch_add(1, Ordering::Relaxed);
         let from = [
             element.from[0] / 16.0,
             element.from[1] / 16.0,
@@ -1912,6 +1922,8 @@ fn bake_resolved_model(
                 .then(|| direction_from_positions(&positions).unwrap_or(Direction::Up));
 
             quads.push(BakedQuad {
+                cuboid_uid,
+                direction: dir.rotate_x(rot_x).rotate_y(rot_y),
                 positions,
                 uvs,
                 texture: TextureId::intern(&texture_name),
@@ -2396,6 +2408,8 @@ mod tests {
     #[test]
     fn gui_lambert_replaces_terrain_cardinal_shade() {
         let mut quad = BakedQuad {
+            cuboid_uid: 0,
+            direction: Direction::Up,
             positions: face_positions(Direction::Up, [0.0; 3], [1.0; 3]),
             uvs: [[0.0; 2]; 4],
             texture: TextureId::intern("block/stone"),
@@ -2524,6 +2538,35 @@ mod tests {
         };
         let baked = bake_resolved_model(&resolved, 0, 0, Tint::None).unwrap();
         assert_eq!(baked.quads[0].tint_index, Some(1));
+    }
+
+    #[test]
+    fn baked_faces_keep_their_element_identity_before_culling() {
+        let element = serde_json::json!({
+            "from": [0, 0, 0], "to": [16, 16, 16],
+            "faces": {
+                "up": { "texture": "all" },
+                "north": { "texture": "all" }
+            }
+        });
+        let resolved = ResolvedModel {
+            textures: HashMap::from([("all".to_owned(), "block/stone".to_owned())]),
+            elements: vec![
+                serde_json::from_value(element.clone()).unwrap(),
+                serde_json::from_value(element).unwrap(),
+            ],
+            ambient_occlusion: true,
+            gui_transform: DisplayTransform::IDENTITY,
+            gui_light: GuiLight::Side,
+            ground_transform: Mat4::IDENTITY,
+        };
+        let baked = bake_resolved_model(&resolved, 0, 90, Tint::None).unwrap();
+        assert_eq!(baked.quads.len(), 4);
+        assert_ne!(baked.quads[0].cuboid_uid, 0);
+        assert_eq!(baked.quads[0].cuboid_uid, baked.quads[1].cuboid_uid);
+        assert_eq!(baked.quads[2].cuboid_uid, baked.quads[3].cuboid_uid);
+        assert_ne!(baked.quads[0].cuboid_uid, baked.quads[2].cuboid_uid);
+        assert_ne!(baked.quads[0].direction, baked.quads[1].direction);
     }
 
     #[test]
@@ -2729,6 +2772,8 @@ mod tests {
         let mut model = BakedModel {
             quads: vec![
                 BakedQuad {
+                    cuboid_uid: 0,
+                    direction: Direction::Up,
                     positions: [[0.0; 3]; 4],
                     uvs: [[0.0; 2]; 4],
                     texture: TextureId::intern("fern"),
@@ -2741,6 +2786,8 @@ mod tests {
                     ambient_occlusion: true,
                 },
                 BakedQuad {
+                    cuboid_uid: 0,
+                    direction: Direction::Up,
                     positions: [[0.0; 3]; 4],
                     uvs: [[0.0; 2]; 4],
                     texture: TextureId::intern("fern_overlay"),

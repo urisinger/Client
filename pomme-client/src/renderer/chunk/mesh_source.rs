@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::packed_face::GlobalCuboidTable;
 use crate::assets::AssetIndex;
 use crate::renderer::chunk::atlas::{AtlasUVMap, TextureAtlas, atlas_texture_names};
 use crate::renderer::chunk::mesher::{BiomeClimate, MeshDispatcher};
@@ -15,6 +16,7 @@ use crate::world::block::render_assets::{BlockRenderAssets, OwnedBlockRenderView
 pub trait MeshSource {
     fn shared_render_assets(&self) -> Arc<BlockRenderAssets>;
     fn uv_map(&self) -> &AtlasUVMap;
+    fn terrain_geometry(&self) -> Arc<GlobalCuboidTable>;
     fn jar_assets_dir(&self) -> &Path;
     fn asset_index(&self) -> &Option<AssetIndex>;
 
@@ -28,6 +30,7 @@ pub trait MeshSource {
         MeshDispatcher::load(
             render_view,
             self.uv_map().clone(),
+            self.terrain_geometry(),
             self.jar_assets_dir(),
             self.asset_index(),
             packs,
@@ -43,6 +46,7 @@ pub struct CpuMeshAssets {
     pub asset_index: Option<AssetIndex>,
     pub render_assets: Arc<BlockRenderAssets>,
     pub uv_map: AtlasUVMap,
+    pub terrain_geometry: Arc<GlobalCuboidTable>,
 }
 
 impl CpuMeshAssets {
@@ -64,16 +68,21 @@ impl CpuMeshAssets {
             None,
         )
         .uv_map;
+        let terrain_geometry = Arc::new(GlobalCuboidTable::build(&render_assets, &uv_map));
         Self {
             jar_assets_dir: jar_assets_dir.to_path_buf(),
             asset_index,
             render_assets,
             uv_map,
+            terrain_geometry,
         }
     }
 }
 
 impl MeshSource for CpuMeshAssets {
+    fn terrain_geometry(&self) -> Arc<GlobalCuboidTable> {
+        Arc::clone(&self.terrain_geometry)
+    }
     fn shared_render_assets(&self) -> Arc<BlockRenderAssets> {
         Arc::clone(&self.render_assets)
     }

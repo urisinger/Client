@@ -1033,9 +1033,6 @@ pub(crate) fn block_tags_for_test(
     resolve_block_tags(raw_tags, &names)
 }
 
-/// Number of block-state table slots (one per distinct state-id space).
-pub(crate) const TABLE_SLOTS: usize = BLOCK_DATA.len();
-
 /// Blocks the collision scan special-cases, tagged at table build so it
 /// doesn't compare ids per cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
