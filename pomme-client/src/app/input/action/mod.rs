@@ -67,6 +67,7 @@ impl Action {
 
     /// The first default or fixed keyboard key, for harness input synthesis.
     #[cfg(any(test, feature = "test-harness"))]
+    #[allow(dead_code)]
     pub fn default_key(self) -> Option<KeyCode> {
         self.defaults()
             .iter()

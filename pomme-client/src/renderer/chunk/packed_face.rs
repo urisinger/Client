@@ -28,16 +28,19 @@ impl BlockRecord {
     }
 
     #[cfg(any(test, feature = "cpu-bench"))]
+    #[allow(dead_code)]
     pub fn position(self) -> [u8; 3] {
         std::array::from_fn(|axis| ((self.words[0] >> (axis * 4)) & 15) as u8)
     }
 
     #[cfg(any(test, feature = "cpu-bench"))]
+    #[allow(dead_code)]
     pub fn global_id(self) -> u16 {
         ((self.words[0] >> 12) & 0xffff) as u16
     }
 
     #[cfg(any(test, feature = "cpu-bench"))]
+    #[allow(dead_code)]
     pub fn tint(self) -> [u8; 3] {
         [
             ((self.words[0] >> 28) | (self.words[1] << 4)) as u8,
@@ -68,16 +71,19 @@ impl FaceRecord {
     }
 
     #[cfg(any(test, feature = "cpu-bench"))]
+    #[allow(dead_code)]
     pub fn cuboid(self) -> u16 {
         ((self.packed & 0xfff) / 6) as u16
     }
 
     #[cfg(any(test, feature = "cpu-bench"))]
+    #[allow(dead_code)]
     pub fn direction(self) -> u8 {
         ((self.packed & 0xfff) % 6) as u8
     }
 
     #[cfg(any(test, feature = "cpu-bench"))]
+    #[allow(dead_code)]
     pub fn shades(self) -> [u8; 4] {
         std::array::from_fn(|corner| ((self.packed >> (12 + corner * 5)) & 31) as u8)
     }
@@ -102,6 +108,7 @@ impl FluidHeights {
     }
 
     #[cfg(any(test, feature = "cpu-bench"))]
+    #[allow(dead_code)]
     pub fn heights(self) -> [f32; 4] {
         std::array::from_fn(|corner| ((self.packed >> (corner * 4)) & 15) as f32 / 15.0)
     }
@@ -212,9 +219,9 @@ impl GlobalCuboidTable {
         // Only fixed fluid templates are needed: ordinary/backward top winding
         // and the two bottom inset cases. Surface heights stay in mesh data.
         let mut fluids = [[[0; 2]; 2]; 2];
-        for (kind, texture) in ["water_still", "lava_still"].into_iter().enumerate() {
-            for inset in 0..2 {
-                for backward in 0..2 {
+        for (kind_fluids, texture) in fluids.iter_mut().zip(["water_still", "lava_still"]) {
+            for (inset, inset_fluids) in kind_fluids.iter_mut().enumerate() {
+                for (backward, fluid_id) in inset_fluids.iter_mut().enumerate() {
                     let mut geometry = cube([atlas.get_region(texture).sprite; 6]);
                     for direction in Direction::VALUES {
                         let face = &mut geometry.faces[direction as usize];
@@ -246,7 +253,7 @@ impl GlobalCuboidTable {
                             material: top.material,
                         };
                     }
-                    fluids[kind][inset][backward] = intern(geometry);
+                    *fluid_id = intern(geometry);
                 }
             }
         }
@@ -378,8 +385,10 @@ mod tests {
         let bytes = mesh.encode();
         assert_eq!(bytes.len() % 16, 0);
         let words: Vec<u32> = bytes
-            .chunks_exact(4)
-            .map(|word| u32::from_ne_bytes(word.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_ne_bytes(*word))
             .collect();
         assert_eq!(&words[..8], &[1, 8, 16, 18, 19, 0, 0, 0]);
         assert_eq!(&words[8..16], &[18, 1, 16, 2, 19, 1, 0, 0]);
@@ -434,8 +443,10 @@ mod tests {
         let mut words = vec![0u32; base];
         words.extend(
             mesh.encode()
-                .chunks_exact(4)
-                .map(|word| u32::from_ne_bytes(word.try_into().unwrap())),
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| u32::from_ne_bytes(*word)),
         );
         for index in 0..2 {
             let batch = base + 8 + index * 8;

@@ -345,8 +345,10 @@ mod tests {
 
     fn op_count(bytes: &[u8], opcode: u16) -> usize {
         let words: Vec<u32> = bytes
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
             .collect();
         let mut cursor = 5; // SPIR-V header
         let mut count = 0;

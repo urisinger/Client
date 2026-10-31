@@ -18,6 +18,7 @@ const BUCKET_INDICES: u32 = 49152;
 // All streams belonging to a section occupy one arena region.
 const MESH_ALIGNMENT: u64 = 48;
 const INDEX_SIZE: u64 = size_of::<u32>() as u64;
+type DrawIndices<'a> = (Cow<'a, [u32]>, Cow<'a, [u32]>);
 const BYTES_PER_BUCKET: u64 =
     BUCKET_VERTICES as u64 * size_of::<PackedVertex>() as u64 + BUCKET_INDICES as u64 * INDEX_SIZE;
 const MIN_BUCKETS: u32 = 128;
@@ -813,7 +814,7 @@ impl ChunkBufferStore {
                     }
                 })
                 .collect();
-            let draw_indices: Vec<(Cow<'_, [u32]>, Cow<'_, [u32]>)> = upload_secs
+            let draw_indices: Vec<DrawIndices<'_>> = upload_secs
                 .iter()
                 .map(|section| {
                     if let Some(packed) = &section.packed {

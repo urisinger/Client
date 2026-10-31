@@ -138,6 +138,7 @@ impl TerrainVertices {
 
     /// The vanilla vertices, or `None` in a shader pack's format.
     #[cfg(any(test, feature = "cpu-bench"))]
+    #[allow(dead_code)]
     pub fn vanilla(&self) -> Option<&[PackedVertex]> {
         match self {
             Self::Compact(v) | Self::Vanilla(v) => Some(v),
@@ -3434,9 +3435,9 @@ mod packed_mesh_tests {
         for face in 0..18 {
             for corner in 0..4 {
                 let decoded = decoded_position(&sink.packed, face, corner);
-                for axis in 0..3 {
+                for (axis, decoded_axis) in decoded.iter().enumerate() {
                     assert!(
-                        (decoded[axis] - sink.vertices[face * 4 + corner].position[axis]).abs()
+                        (*decoded_axis - sink.vertices[face * 4 + corner].position[axis]).abs()
                             < 0.00001
                     );
                 }
