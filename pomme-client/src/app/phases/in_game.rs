@@ -2798,13 +2798,13 @@ pub fn update_game(
             screen_w: gfx.renderer.screen_width(),
             screen_h: gfx.renderer.screen_height(),
             timings: Some(hud::FrameTimings {
-                pace_ms: gfx.renderer.last_timings().pace_ms,
-                frame_ms: gfx.renderer.last_timings().frame_ms,
-                fence_ms: gfx.renderer.last_timings().fence_ms,
-                acquire_ms: gfx.renderer.last_timings().acquire_ms,
-                cull_ms: gfx.renderer.last_timings().cull_ms,
-                draw_ms: gfx.renderer.last_timings().draw_ms,
-                present_ms: gfx.renderer.last_timings().present_ms,
+                frame_ms: gfx.renderer.last_timings().frame_ms(),
+                cull_ms: gfx.renderer.last_timings().cull_ms(),
+                gui_bake_ms: gfx.renderer.last_timings().gui_bake_ms(),
+                terrain_ms: gfx.renderer.last_timings().terrain_ms(),
+                entities_ms: gfx.renderer.last_timings().entities_ms(),
+                translucent_ms: gfx.renderer.last_timings().translucent_ms(),
+                ui_ms: gfx.renderer.last_timings().ui_ms(),
             }),
         })
     } else {

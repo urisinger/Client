@@ -9,6 +9,7 @@ pub mod pipelines;
 pub(crate) mod rhi;
 mod screenshot;
 pub(crate) mod shader;
+pub(crate) mod timings;
 pub(crate) mod util;
 
 pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 3;
@@ -48,6 +49,8 @@ use pipelines::skin_preview::SkinPreviewPipeline;
 pub use pipelines::sky::{SkyPipeline, SkyState};
 pub use pipelines::weather::{WeatherColumn, WeatherPipeline};
 use thiserror::Error;
+pub use timings::RenderTimings;
+use timings::{Timer, Timestamp};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
@@ -229,17 +232,6 @@ pub struct MenuSkin {
     pub scale: f32,
 }
 
-#[derive(Default, Clone)]
-pub struct RenderTimings {
-    pub pace_ms: f32,
-    pub frame_ms: f32,
-    pub fence_ms: f32,
-    pub acquire_ms: f32,
-    pub cull_ms: f32,
-    pub draw_ms: f32,
-    pub present_ms: f32,
-}
-
 pub struct Renderer {
     ctx: rhi::backend::Context,
     swapchain: rhi::backend::Swapchain,
@@ -299,6 +291,8 @@ pub struct Renderer {
     vsync: bool,
     width: u32,
     height: u32,
+    query_pools: Option<[rhi::backend::TimestampQueries; MAX_FRAMES_IN_FLIGHT]>,
+    query_reset: [bool; MAX_FRAMES_IN_FLIGHT],
     last_timings: RenderTimings,
 }
 
@@ -523,6 +517,20 @@ impl Renderer {
             &render_assets,
         );
 
+        let timestamp_period = ctx.physical_device.get_properties().limits.timestamp_period;
+        let valid_bits = ctx.physical_device.get_queue_family_properties()
+            [ctx.graphics_family as usize]
+            .timestamp_valid_bits;
+        let query_pools = (valid_bits != 0).then(|| {
+            std::array::from_fn(|_| {
+                rhi::backend::TimestampQueries::new(&ctx.device, Timestamp::Count as u32)
+            })
+        });
+        let timestamp_mask = match valid_bits {
+            0 => 0,
+            64.. => u64::MAX,
+            bits => (1u64 << bits) - 1,
+        };
         Ok(Self {
             ctx,
             swapchain: swapchain_state,
@@ -567,7 +575,13 @@ impl Renderer {
             vsync,
             width: swapchain_extent.width,
             height: swapchain_extent.height,
-            last_timings: RenderTimings::default(),
+            query_pools,
+            query_reset: Default::default(),
+            last_timings: RenderTimings {
+                timestamp_period,
+                timestamp_mask,
+                ..Default::default()
+            },
         })
     }
 
@@ -768,6 +782,7 @@ impl Renderer {
         encoder: &rhi::backend::CommandEncoder,
         frame: usize,
         mode: &RenderMode,
+        timer: &Timer,
     ) -> bool {
         use pipelines::entity_renderer::PackLayer;
         use pipelines::shaderpack::{PackFrame, PackGeometry, PackRenderer};
@@ -823,6 +838,7 @@ impl Renderer {
             return false;
         };
 
+        let _terrain_timer = timer.scope(Timestamp::TerrainStart, Timestamp::TerrainEnd);
         let device = &self.ctx.device;
         let (view, projection) = self.camera.pack_matrices();
         let (near, far) = self.camera.planes();
@@ -1750,6 +1766,12 @@ impl Renderer {
         let t_fence = std::time::Instant::now();
         self.frames.wait(&self.ctx.device)?;
         let fence_ms = t_fence.elapsed().as_secs_f32() * 1000.0;
+        if let Some(pools) = self.query_pools
+            && self.query_reset[frame]
+        {
+            pools[frame].read(&self.ctx.device, &mut self.last_timings.ticks);
+            self.query_reset[frame] = false;
+        }
 
         // Fence signalled: reclaim chunk slices the GPU is now provably done with,
         // and read back any screenshot copy recorded for this frame index.
@@ -1793,12 +1815,24 @@ impl Renderer {
         }
 
         let encoder = self.frames.begin(&self.ctx.device)?;
+        // Only world frames write every query; menu frames must never arm readback.
+        let timer_pool = self
+            .query_pools
+            .filter(|_| matches!(&mode, RenderMode::World { .. }))
+            .map(|pools| {
+                encoder.reset_timestamps(pools[frame], Timestamp::Count as u32);
+                self.query_reset[frame] = true;
+                pools[frame]
+            });
+        let timer = Timer::new(encoder, timer_pool);
+        let frame_timer = timer.scope(Timestamp::FrameStart, Timestamp::FrameEnd);
         self.atlas.record_animation_upload(&encoder, frame);
         self.lightmap.record(&self.ctx.device, &encoder);
 
         let scissor = rhi::Rect::covering(self.swapchain.extent);
 
         if matches!(&mode, RenderMode::World { .. }) {
+            let _cull_timer = timer.scope(Timestamp::CullStart, Timestamp::CullEnd);
             let frustum = self.camera.frustum_planes();
             // The eye (including the third-person offset) is the origin the chunk
             // vertex shader renders relative to, so the cull must use it too.
@@ -1877,6 +1911,7 @@ impl Renderer {
             }
         }
 
+        let gui_timer = timer.scope(Timestamp::GuiBakeStart, Timestamp::GuiBakeEnd);
         let target_slot_px = pipelines::gui_item_atlas::slot_px_for_screen(
             self.swapchain.extent.width as f32,
             self.swapchain.extent.height as f32,
@@ -1962,7 +1997,8 @@ impl Renderer {
             self.gui_item_atlas.end_bake_pass(&encoder, bake);
         }
 
-        let pack_drawn = self.render_pack_world(&encoder, frame, &mode);
+        gui_timer.end();
+        let pack_drawn = self.render_pack_world(&encoder, frame, &mode, &timer);
 
         let mut pass = encoder.begin_render_pass(
             &self.ctx.device,
@@ -2008,6 +2044,9 @@ impl Renderer {
                     if let Some((_, Some(pack))) = &mut self.shader_pack {
                         pack.draw_final(&self.ctx.device, &mut pass, frame);
                     }
+                    timer.zero_duration(Timestamp::EntitiesStart, Timestamp::EntitiesEnd);
+                    timer.zero_duration(Timestamp::TranslucentStart, Timestamp::TranslucentEnd);
+                    timer.write(Timestamp::UiStart);
                     0.0
                 } else {
                     // Vanilla water fog hides the sky dome and clouds; the framebuffer
@@ -2023,6 +2062,7 @@ impl Renderer {
                         );
                     }
 
+                    let terrain_timer = timer.scope(Timestamp::TerrainStart, Timestamp::TerrainEnd);
                     let t_cull = std::time::Instant::now();
                     // A pack that failed to build leaves its vertex format until
                     // the next frame remeshes; skip those.
@@ -2042,6 +2082,7 @@ impl Renderer {
                             .draw_indirect(&pass, frame, true, View::Camera);
                         self.moving_block_buffers.draw(&pass, frame, true);
                     }
+                    terrain_timer.end();
                     let cull_ms = t_cull.elapsed().as_secs_f32() * 1000.0;
 
                     let anchor = self.camera.anchor();
@@ -2059,6 +2100,8 @@ impl Renderer {
                         );
                     }
 
+                    let entity_timer =
+                        timer.scope(Timestamp::EntitiesStart, Timestamp::EntitiesEnd);
                     let ent_frustum = self.camera.frustum_planes();
                     let ent_cull_dist = entity_cull_distance(*render_distance);
 
@@ -2086,6 +2129,9 @@ impl Renderer {
                         item_entities,
                     );
 
+                    entity_timer.end();
+                    let translucent_timer =
+                        timer.scope(Timestamp::TranslucentStart, Timestamp::TranslucentEnd);
                     // Break particles draw after entities but before translucent
                     // water: they write depth, and pomme's water doesn't, so this
                     // lets water blend over particles behind it (vanilla draws
@@ -2108,6 +2154,8 @@ impl Renderer {
                             .draw_water(&pass, &ent_frustum, anchor, eye);
                     }
 
+                    translucent_timer.end();
+                    timer.write(Timestamp::UiStart);
                     // Clouds draw after opaque world geometry (so terrain occludes
                     // them) and before weather, depth-tested against the scene.
                     if !*eyes_in_water {
@@ -2270,6 +2318,7 @@ impl Renderer {
                     pass.set_scissor_rect(scissor);
                 }
 
+                timer.write(Timestamp::UiEnd);
                 self.last_timings.cull_ms = cull_ms;
                 self.last_timings.frame_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
             }
@@ -2314,6 +2363,7 @@ impl Renderer {
         }
 
         pass.end();
+        frame_timer.end();
         self.swapchain.ready_to_present(&encoder, image_index);
 
         // The image is ready to present; grab it first if F2 was pressed.
@@ -2685,6 +2735,11 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         self.ctx.device.wait_idle();
 
+        if let Some(pools) = self.query_pools {
+            for pool in pools {
+                pool.destroy(&self.ctx.device);
+            }
+        }
         self.screenshot.destroy(&self.ctx.device);
         if let Some((_, Some(mut pack))) = self.shader_pack.take() {
             pack.destroy(&self.ctx.device);

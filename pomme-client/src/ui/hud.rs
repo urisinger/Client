@@ -28,13 +28,13 @@ pub enum ContextualBarKind<'a> {
 }
 
 pub struct FrameTimings {
-    pub pace_ms: f32,
     pub frame_ms: f32,
-    pub fence_ms: f32,
-    pub acquire_ms: f32,
     pub cull_ms: f32,
-    pub draw_ms: f32,
-    pub present_ms: f32,
+    pub gui_bake_ms: f32,
+    pub terrain_ms: f32,
+    pub entities_ms: f32,
+    pub translucent_ms: f32,
+    pub ui_ms: f32,
 }
 
 type ScoreKey = (String, String);
@@ -1682,13 +1682,13 @@ pub fn build_debug_overlay(
 
     if let Some(t) = &info.timings {
         right_lines.push(String::new());
-        right_lines.push(format!("Pace: {:.2}ms", t.pace_ms));
-        right_lines.push(format!("Frame: {:.2}ms", t.frame_ms));
-        right_lines.push(format!("  Fence: {:.2}ms", t.fence_ms));
-        right_lines.push(format!("  Acquire: {:.2}ms", t.acquire_ms));
+        right_lines.push(format!("GPU frame: {:.2}ms", t.frame_ms));
         right_lines.push(format!("  Cull: {:.2}ms", t.cull_ms));
-        right_lines.push(format!("  Draw: {:.2}ms", t.draw_ms));
-        right_lines.push(format!("  Present: {:.2}ms", t.present_ms));
+        right_lines.push(format!("  GUI bake: {:.2}ms", t.gui_bake_ms));
+        right_lines.push(format!("  Terrain: {:.2}ms", t.terrain_ms));
+        right_lines.push(format!("  Entities: {:.2}ms", t.entities_ms));
+        right_lines.push(format!("  Translucent: {:.2}ms", t.translucent_ms));
+        right_lines.push(format!("  UI: {:.2}ms", t.ui_ms));
     }
     let right_x = info.screen_w as f32 - pad;
     push_debug_lines(

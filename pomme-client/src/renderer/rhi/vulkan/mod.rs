@@ -2281,3 +2281,49 @@ fn read_spv<R: io::Read + io::Seek>(x: &mut R) -> io::Result<Vec<u32>> {
     }
     Ok(result)
 }
+
+/// Timestamp query storage, read only after the frame fence signals.
+#[derive(Clone, Copy)]
+pub struct TimestampQueries(vk::QueryPool);
+impl TimestampQueries {
+    pub fn new(device: &Device, count: u32) -> Self {
+        Self(
+            device
+                .raw
+                .create_query_pool(
+                    &vk::QueryPoolCreateInfo {
+                        query_type: vk::QueryType::Timestamp,
+                        query_count: count,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap(),
+        )
+    }
+    pub fn read(self, device: &Device, ticks: &mut [u64]) {
+        device
+            .raw
+            .get_query_pool_results(
+                self.0,
+                0,
+                ticks.len() as u32,
+                bytemuck::cast_slice_mut(ticks),
+                size_of::<u64>() as u64,
+                vk::QueryResultFlags::Type64 | vk::QueryResultFlags::Wait,
+            )
+            .unwrap();
+    }
+    pub fn destroy(self, device: &Device) {
+        device.raw.destroy_query_pool(self.0, None);
+    }
+}
+impl CommandEncoder {
+    pub fn reset_timestamps(&self, pool: TimestampQueries, count: u32) {
+        self.cmd.reset_query_pool(pool.0, 0, count);
+    }
+    pub fn write_timestamp(&self, pool: TimestampQueries, point: u32) {
+        self.cmd
+            .write_timestamp(vk::PipelineStageFlags::BottomOfPipe, pool.0, point);
+    }
+}
