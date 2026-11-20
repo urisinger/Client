@@ -174,8 +174,6 @@ pub enum TextureUse {
     CopyDst,
     /// Sampled by a vertex or fragment shader.
     ShaderRead,
-    /// Sampled by a compute shader.
-    ComputeRead,
     ColorAttachment,
     Present,
     /// A depth texture as a pass's depth target.

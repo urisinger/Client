@@ -7,10 +7,10 @@
 // The scene uniform: the camera's view projection moved by the camera's
 // position within its section, that section, the frame, and whether the
 // occlusion pass was skipped (cmdgen then keeps visibility itself); then
-// the traversal's: the Hi-Z's base size (width << 16 | height), the screen
-// area a node splits at, the frame's request queue's room, the render
-// distance squared in blocks, the frustum planes, and those
-// of the wider view meshes are requested within; last the dimension's shade
+// the traversal's (after a padding word): the screen area a node splits at,
+// the frame's request queue's room, the render distance squared in blocks,
+// the frustum planes, and those of the wider view meshes are requested
+// within; last the dimension's shade
 // per face (down, up, north, south, then west, east).
 #ifdef SCENE_BINDING
 layout(set = DISTANT_SET, binding = SCENE_BINDING, std140) uniform SceneUniform {
@@ -19,7 +19,7 @@ layout(set = DISTANT_SET, binding = SCENE_BINDING, std140) uniform SceneUniform 
     uint frame_id;
     vec3 camera_sub_pos;
     uint occlusion_skipped;
-    uint hiz_size;
+    uint _pad;
     float min_sss;
     uint request_limit;
     float render_distance;

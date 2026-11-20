@@ -1,11 +1,11 @@
 //! Distant terrain's passes: the drawn chunks' boxes into a depth bound; last
 //! frame's draw list into the far terrain's own image over the frame's depth,
 //! which the chunks already hold (reverse Z keeps one depth precise out to
-//! distant terrain); that depth reduced into the Hi-Z the node traversal
-//! culls by as it picks this frame's sections; the listed sections' boxes
-//! tested against the depth; this frame's draw list built from the ones that
-//! showed and the newly seen drawn after; then the image blended into the
-//! frame, fogged and faded by the depth it left.
+//! distant terrain); the node traversal picking this frame's sections within
+//! the frustum; the listed sections' boxes tested against that depth; this
+//! frame's draw list built from the ones that showed and the newly seen drawn
+//! after; then the image blended into the frame, fogged and faded by the depth
+//! it left.
 
 use glam::{DVec3, Mat4};
 
@@ -32,9 +32,6 @@ use crate::world::block::model::{CardinalLighting, Direction};
 const FORMAT: rhi::TextureFormat = rhi::TextureFormat::Rgba8Unorm;
 /// The chunks' bound.
 const DEPTH: rhi::TextureFormat = rhi::TextureFormat::Depth32Float;
-/// The Hi-Z's levels: a colour texture holding the reduced depth, so each
-/// level can be attached on its own and written by a full-screen pass.
-const HIZ: rhi::TextureFormat = rhi::TextureFormat::R32Float;
 /// A node is split while it covers more than this many pixels squared.
 const SUBDIVISION_SIZE: f32 = 64.0;
 
@@ -50,7 +47,7 @@ struct SceneUniform {
     frame_id: u32,
     camera_sub_pos: [f32; 3],
     occlusion_skipped: u32,
-    hiz_size: u32,
+    _pad: u32,
     min_sss: f32,
     request_limit: u32,
     render_distance: f32,
@@ -65,11 +62,6 @@ const _: () = assert!(size_of::<SceneUniform>() == 336);
 const SCENE_BYTES: u64 = size_of::<SceneUniform>() as u64;
 const CAMERA_BYTES: u64 = size_of::<CameraUniform>() as u64;
 
-/// A sampled texture and its sampler, for the fragment stage.
-const TEXTURE_SAMPLER: &[rhi::BindGroupLayoutEntry] = &[
-    rhi::BindGroupLayoutEntry::texture(rhi::ShaderStages::FRAGMENT),
-    rhi::BindGroupLayoutEntry::sampler(rhi::ShaderStages::FRAGMENT),
-];
 /// The blit's inputs: the image, the frame's depth, and the sampler.
 const BLIT_INPUTS: &[rhi::BindGroupLayoutEntry] = &[
     rhi::BindGroupLayoutEntry::texture(rhi::ShaderStages::FRAGMENT),
@@ -86,8 +78,8 @@ const COMPUTE_UNIFORM: rhi::BindGroupLayoutEntry =
 const COMPUTE_STORAGE: rhi::BindGroupLayoutEntry =
     rhi::BindGroupLayoutEntry::storage(rhi::ShaderStages::COMPUTE);
 /// `distant_traversal.comp`: the scene, then the request queue, render
-/// list, nodes, queue metadata, source and sink queues, the Hi-Z and the
-/// nodes' last-drawn frames.
+/// list, nodes, queue metadata, source and sink queues and the nodes'
+/// last-drawn frames.
 const TRAVERSAL_SET: &[rhi::BindGroupLayoutEntry] = &[
     COMPUTE_UNIFORM,
     COMPUTE_STORAGE,
@@ -96,8 +88,6 @@ const TRAVERSAL_SET: &[rhi::BindGroupLayoutEntry] = &[
     COMPUTE_STORAGE,
     COMPUTE_STORAGE,
     COMPUTE_STORAGE,
-    rhi::BindGroupLayoutEntry::texture(rhi::ShaderStages::COMPUTE),
-    rhi::BindGroupLayoutEntry::sampler(rhi::ShaderStages::COMPUTE),
     COMPUTE_STORAGE,
 ];
 /// `distant_visibility_set.comp`: the last-drawn frames and the frame's
@@ -161,15 +151,6 @@ struct Targets {
     frame_depth: rhi::backend::TextureHandle,
     /// The far side of the drawn chunks' boxes.
     bound: rhi::backend::Texture,
-    /// The depth reduced level by level, each a power of two no larger
-    /// than the screen.
-    hiz: rhi::backend::Texture,
-    hiz_width: u32,
-    hiz_height: u32,
-    hiz_levels: u32,
-    /// Per Hi-Z level, what it reduces: the frame's depth, then the level
-    /// before.
-    hiz_sets: Vec<rhi::backend::BindGroup>,
     /// Per frame in flight, a set per [`Iteration`].
     traversal_sets: Vec<rhi::backend::BindGroup>,
     /// The draw positions with the depth bound.
@@ -187,7 +168,6 @@ pub struct DistantPipeline {
     /// The quads, opaque then translucent, into the image.
     quads: [rhi::backend::RenderPipeline; 2],
     bound: rhi::backend::RenderPipeline,
-    hiz: rhi::backend::RenderPipeline,
     blit: rhi::backend::RenderPipeline,
     /// The occlusion pass; `None` where the fragment stage can't write
     /// buffers, and every listed section then counts as seen.
@@ -195,7 +175,6 @@ pub struct DistantPipeline {
     traversal: rhi::backend::ComputePipeline,
     quads_layout: rhi::backend::PipelineLayout,
     bound_layout: rhi::backend::PipelineLayout,
-    hiz_layout: rhi::backend::PipelineLayout,
     blit_layout: rhi::backend::PipelineLayout,
     cull_layout: rhi::backend::PipelineLayout,
     traversal_layout: rhi::backend::PipelineLayout,
@@ -203,8 +182,6 @@ pub struct DistantPipeline {
     /// for the quads.
     camera_layout: rhi::backend::BindGroupLayout,
     camera_fragment_layout: rhi::backend::BindGroupLayout,
-    /// A sampled texture: each Hi-Z level's source.
-    texture_layout: rhi::backend::BindGroupLayout,
     blit_inputs_layout: rhi::backend::BindGroupLayout,
     draw_layout: rhi::backend::BindGroupLayout,
     cull_set_layout: rhi::backend::BindGroupLayout,
@@ -243,7 +220,6 @@ impl DistantPipeline {
         let layout = |entries| rhi::backend::create_bind_group_layout(device, entries);
         let camera_layout = layout(util::VERTEX_UNIFORM);
         let camera_fragment_layout = layout(util::VERTEX_FRAGMENT_UNIFORM);
-        let texture_layout = layout(TEXTURE_SAMPLER);
         let blit_inputs_layout = layout(BLIT_INPUTS);
         let draw_layout = layout(DRAW_SET);
         let cull_set_layout = layout(CULL_SET);
@@ -266,7 +242,6 @@ impl DistantPipeline {
             &[camera_layout, buffers.bound_layout()],
             push(rhi::ShaderStages::VERTEX, 80),
         );
-        let hiz_layout = pipeline_layout(&[texture_layout], None);
         // The inverse view projection, then the fade.
         let blit_layout = pipeline_layout(
             &[camera_fragment_layout, blit_inputs_layout],
@@ -319,7 +294,6 @@ impl DistantPipeline {
         Self {
             quads: create_quad_pipelines(device, quads_layout),
             bound: create_bound_pipeline(device, bound_layout),
-            hiz: create_hiz_pipeline(device, hiz_layout),
             blit: create_blit_pipeline(device, swapchain, blit_layout),
             cull: fragment_stores.then(|| create_cull_pipeline(device, cull_layout)),
             traversal: rhi::backend::create_compute_pipeline(
@@ -420,13 +394,11 @@ impl DistantPipeline {
             ),
             quads_layout,
             bound_layout,
-            hiz_layout,
             blit_layout,
             cull_layout,
             traversal_layout,
             camera_layout,
             camera_fragment_layout,
-            texture_layout,
             blit_inputs_layout,
             draw_layout,
             cull_set_layout,
@@ -468,7 +440,7 @@ impl DistantPipeline {
     }
 
     /// The targets at `extent`, made with `frame_depth` (the swapchain's,
-    /// which distant terrain draws into and the Hi-Z and blit read), unless
+    /// which distant terrain draws into and the blit reads), unless
     /// they're already made.
     fn ensure_targets(
         &mut self,
@@ -506,31 +478,6 @@ impl DistantPipeline {
         };
         let color = texture(screen("distant_color", FORMAT), TextureUse::ShaderRead);
         let bound = texture(screen("distant_depth_bound", DEPTH), TextureUse::DepthRead);
-        // The Hi-Z's size: the screen rounded down to powers of two, a level
-        // per halving down to 2.
-        let highest_bit = |n: u32| 1u32 << (31 - n.max(1).leading_zeros());
-        let (hiz_width, hiz_height) = (highest_bit(extent.width), highest_bit(extent.height));
-        let hiz_levels = hiz_width.max(hiz_height).ilog2().max(1);
-        let hiz = texture(
-            rhi::TextureDesc {
-                width: hiz_width,
-                height: hiz_height,
-                mip_levels: hiz_levels,
-                ..screen("distant_hiz", HIZ)
-            },
-            TextureUse::ComputeRead,
-        );
-        let texture_set =
-            |source| util::create_texture_group(device, self.texture_layout, source, self.sampler);
-        let hiz_sets = (0..hiz_levels)
-            .map(|level| {
-                texture_set(if level == 0 {
-                    frame_depth
-                } else {
-                    hiz.mip_handle(level - 1)
-                })
-            })
-            .collect();
         let draw = buffers.draw_buffers();
         let traversal_sets = (0..MAX_FRAMES_IN_FLIGHT)
             .flat_map(|frame| {
@@ -552,9 +499,7 @@ impl DistantPipeline {
                             storage_binding(4, draw.queue_meta, QUEUE_META_BYTES),
                             storage_binding(5, source, source_bytes),
                             storage_binding(6, sink, SCRATCH_BYTES),
-                            (7, rhi::backend::BindingResource::Texture(hiz.handle())),
-                            (8, rhi::backend::BindingResource::Sampler(self.sampler)),
-                            storage_binding(9, draw.node_visibility, NODE_VISIBILITY_BYTES),
+                            storage_binding(7, draw.node_visibility, NODE_VISIBILITY_BYTES),
                         ],
                     )
                 })
@@ -579,11 +524,6 @@ impl DistantPipeline {
             color,
             frame_depth,
             bound,
-            hiz,
-            hiz_width,
-            hiz_height,
-            hiz_levels,
-            hiz_sets,
             traversal_sets,
             draw_set,
             blit_set,
@@ -592,8 +532,8 @@ impl DistantPipeline {
 
     /// The frame's distant passes up to the blit, after the chunks' solid and
     /// cutout passes, whose depth `frame_depth` holds: the bound pass, last
-    /// frame's opaque draws into the image and that depth, the Hi-Z from it,
-    /// the cleaner's passes, the traversal picking this frame's sections,
+    /// frame's opaque draws into the image and that depth, the cleaner's
+    /// passes, the traversal picking this frame's sections,
     /// the occlusion pass over them, this frame's draw list, and the newly
     /// seen and translucent draws, shaded by the dimension's
     /// `cardinal_lighting`.
@@ -627,7 +567,7 @@ impl DistantPipeline {
             frame_id,
             camera_sub_pos: sub_pos.to_array(),
             occlusion_skipped: u32::from(self.cull.is_none()),
-            hiz_size: targets.hiz_width << 16 | targets.hiz_height,
+            _pad: 0,
             min_sss: SUBDIVISION_SIZE * SUBDIVISION_SIZE / (extent.width * extent.height) as f32,
             request_limit: buffers.request_limit(),
             render_distance: buffers.render_distance_sq(),
@@ -690,25 +630,13 @@ impl DistantPipeline {
         pass.end();
         stamp(encoder, "distant last opaque");
 
-        // The Hi-Z from the depth so far, the cleaner, then the traversal.
-        encoder.transition_textures(&[TextureTransition::color(
-            depth,
-            TextureUse::DepthAttachment,
-            TextureUse::DepthRead,
-        )]);
-        self.build_hiz(device, encoder, targets);
-        stamp(encoder, "distant hiz");
+        // The cleaner, then the traversal.
         self.clean(encoder, frame, frame_id, buffers);
         stamp(encoder, "distant cleaner");
         let top_count = buffers.record_traversal_setup(encoder, frame);
         self.traverse(encoder, frame, targets, top_count, queue_meta);
         buffers.record_request_readback(encoder, frame);
         stamp(encoder, "distant traversal");
-        encoder.transition_textures(&[TextureTransition::color(
-            depth,
-            TextureUse::DepthRead,
-            TextureUse::DepthAttachment,
-        )]);
 
         // `distant_prep.comp`, after last frame's draws are done with the
         // counts and positions and the traversal with the render list; the
@@ -839,67 +767,6 @@ impl DistantPipeline {
             );
             buffers.record_cleaner_readback(encoder, frame);
         }
-    }
-
-    /// The Hi-Z's levels, each a full-screen pass over the one before, the
-    /// first over the frame's depth.
-    fn build_hiz(
-        &self,
-        device: &rhi::backend::Device,
-        encoder: &rhi::backend::CommandEncoder,
-        targets: &Targets,
-    ) {
-        let transition = |first_mip, mips, from, to| TextureTransition {
-            texture: targets.hiz.handle(),
-            range: rhi::TextureRange {
-                first_mip,
-                mips,
-                ..rhi::TextureRange::BASE
-            },
-            from,
-            to,
-        };
-        encoder.transition_textures(&[transition(
-            0,
-            targets.hiz_levels,
-            TextureUse::ComputeRead,
-            TextureUse::ColorAttachment,
-        )]);
-        for level in 0..targets.hiz_levels {
-            let mut pass = encoder.begin_render_pass(
-                device,
-                &rhi::backend::RenderPassDesc {
-                    color: Some(rhi::backend::ColorAttachment {
-                        texture: targets.hiz.mip_handle(level),
-                        format: rhi::backend::texture_format(HIZ),
-                        load: rhi::LoadOp::Clear([0.0; 4]),
-                        store: rhi::StoreOp::Store,
-                    }),
-                    extra_colors: Vec::new(),
-                    depth: None,
-                    extent: rhi::Extent {
-                        width: (targets.hiz_width >> level).max(1),
-                        height: (targets.hiz_height >> level).max(1),
-                    },
-                },
-            );
-            pass.set_pipeline(&self.hiz);
-            pass.set_bind_group(0, targets.hiz_sets[level as usize]);
-            pass.draw(3, 1, 0, 0);
-            pass.end();
-            encoder.transition_textures(&[transition(
-                level,
-                1,
-                TextureUse::ColorAttachment,
-                TextureUse::ShaderRead,
-            )]);
-        }
-        encoder.transition_textures(&[transition(
-            0,
-            targets.hiz_levels,
-            TextureUse::ShaderRead,
-            TextureUse::ComputeRead,
-        )]);
     }
 
     /// The node traversal: the first iteration over the top-level nodes,
@@ -1037,14 +904,13 @@ impl DistantPipeline {
 
     fn destroy_targets(&self, device: &rhi::backend::Device, mut targets: Targets) {
         for set in targets
-            .hiz_sets
+            .traversal_sets
             .drain(..)
-            .chain(targets.traversal_sets.drain(..))
             .chain([targets.draw_set, targets.blit_set])
         {
             set.destroy(device);
         }
-        for texture in [&mut targets.color, &mut targets.bound, &mut targets.hiz] {
+        for texture in [&mut targets.color, &mut targets.bound] {
             std::mem::take(texture).destroy(device);
         }
     }
@@ -1074,7 +940,7 @@ impl DistantPipeline {
         for pipeline in self
             .quads
             .iter_mut()
-            .chain([&mut self.bound, &mut self.hiz, &mut self.blit])
+            .chain([&mut self.bound, &mut self.blit])
             .chain(self.cull.as_mut())
         {
             pipeline.destroy(device);
@@ -1082,7 +948,6 @@ impl DistantPipeline {
         for layout in [
             self.quads_layout,
             self.bound_layout,
-            self.hiz_layout,
             self.blit_layout,
             self.cull_layout,
             self.traversal_layout,
@@ -1092,7 +957,6 @@ impl DistantPipeline {
         for layout in [
             self.camera_layout,
             self.camera_fragment_layout,
-            self.texture_layout,
             self.blit_inputs_layout,
             self.draw_layout,
             self.cull_set_layout,
@@ -1231,22 +1095,6 @@ fn create_cull_pipeline(
                 &[],
             )
         },
-    )
-}
-
-/// One Hi-Z level from the one before.
-fn create_hiz_pipeline(
-    device: &rhi::backend::Device,
-    layout: rhi::backend::PipelineLayout,
-) -> rhi::backend::RenderPipeline {
-    fullscreen_pipeline(
-        device,
-        rhi::backend::PipelineTargets::new(rhi::backend::texture_format(HIZ), false),
-        layout,
-        "distant hi-z",
-        shader::include_shader!("distant_hiz.frag"),
-        None,
-        None,
     )
 }
 

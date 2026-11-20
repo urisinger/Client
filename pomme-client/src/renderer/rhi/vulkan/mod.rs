@@ -1159,7 +1159,7 @@ impl TextureUse {
             Self::Undefined => vk::ImageLayout::Undefined,
             Self::CopySrc | Self::DepthCopySrc => vk::ImageLayout::TransferSrcOptimal,
             Self::CopyDst | Self::DepthCopyDst => vk::ImageLayout::TransferDstOptimal,
-            Self::ShaderRead | Self::ComputeRead => vk::ImageLayout::ShaderReadOnlyOptimal,
+            Self::ShaderRead => vk::ImageLayout::ShaderReadOnlyOptimal,
             Self::ColorAttachment => vk::ImageLayout::ColorAttachmentOptimal,
             Self::Present => vk::ImageLayout::PresentSrcKHR,
             Self::DepthAttachment => vk::ImageLayout::DepthStencilAttachmentOptimal,
@@ -1202,10 +1202,6 @@ impl TextureUse {
             Self::ShaderRead | Self::DepthRead => (
                 vk::AccessFlags::ShaderRead,
                 vk::PipelineStageFlags::VertexShader | vk::PipelineStageFlags::FragmentShader,
-            ),
-            Self::ComputeRead => (
-                vk::AccessFlags::ShaderRead,
-                vk::PipelineStageFlags::ComputeShader,
             ),
             Self::DepthAttachment => (
                 vk::AccessFlags::DepthStencilAttachmentRead
