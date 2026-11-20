@@ -16,8 +16,6 @@ pub const CLEANER_SENTINEL: u32 = MAX_NODES - 2;
 pub const CLEANER_OUTPUT: u32 = 256;
 /// Requests a traversal may make a frame.
 pub const MAX_REQUESTS: u32 = 50;
-/// Sections a frame's render list, and nodes a traversal iteration, may hold.
-pub const MAX_LISTED: u32 = 200_000;
 /// Quads the shared index buffer covers, the most a draw can hold; the
 /// cube's indices follow.
 pub const QUADS_PER_DRAW: u32 = 1 << 16;

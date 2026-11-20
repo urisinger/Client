@@ -224,7 +224,6 @@ fn distant_consts_glsl() -> String {
         ("EMPTY_ID", EMPTY_ID),
         ("CLEANER_SENTINEL", CLEANER_SENTINEL),
         ("MAX_REQUESTS", MAX_REQUESTS),
-        ("MAX_LISTED", MAX_LISTED),
         ("QUADS_PER_DRAW", QUADS_PER_DRAW),
         ("OPAQUE_DRAWS", OPAQUE_DRAWS),
         ("TRANSLUCENT_DRAWS", TRANSLUCENT_DRAWS),

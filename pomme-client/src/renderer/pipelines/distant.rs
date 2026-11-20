@@ -14,10 +14,9 @@ use crate::renderer::chunk::buffer::DrawCommand;
 use crate::renderer::chunk::occlusion_graph::VIS_MARGIN_RADIANS;
 use crate::renderer::distant::gpu::{
     CLEANER_IDS_BYTES, CLEANER_KEYS_BYTES, COUNTS_BYTES, COUNTS_CULL_DRAW, CUBE_FIRST_INDEX,
-    DRAWS_BYTES, DistantBuffers, LIST_GROUP, NODE_VISIBILITY_BYTES, POSITIONS_BYTES,
-    QUEUE_META_BYTES, RENDER_LIST_BYTES, REQUESTS_BYTES, Region, SCRATCH_BYTES, SECTIONS_BYTES,
-    TOP_IDS_BYTES, TRANSLUCENT_BUCKETS, TRANSLUCENT_BYTES, TRAVERSAL_GROUP, VISIBILITY_BYTES,
-    VISIBILITY_SETS_BYTES,
+    DRAWS_BYTES, DistantBuffers, DrawBuffers, LIST_GROUP, NODE_VISIBILITY_BYTES, QUEUE_META_BYTES,
+    REQUESTS_BYTES, Region, SECTIONS_BYTES, TOP_IDS_BYTES, TRANSLUCENT_BUCKETS, TRANSLUCENT_BYTES,
+    TRAVERSAL_GROUP, VISIBILITY_BYTES, VISIBILITY_SETS_BYTES,
 };
 use crate::renderer::distant::nodes::NODE_BYTES;
 use crate::renderer::distant::section::LEVELS;
@@ -269,23 +268,15 @@ impl DistantPipeline {
         let (scene_sets, scene_buffers) =
             util::create_uniform_sets(device, camera_layout, SCENE_BYTES, "distant_scene_uniform");
         let draw = buffers.draw_buffers();
-        let scene = |frame: usize| uniform_binding(0, &scene_buffers[frame], SCENE_BYTES);
-        let counts = |binding| storage_binding(binding, draw.counts, COUNTS_BYTES);
-        let draws = |binding| storage_binding(binding, draw.draws, DRAWS_BYTES);
-        let sections = |binding| storage_binding(binding, draw.sections, SECTIONS_BYTES);
-        let visibility = |binding| storage_binding(binding, draw.visibility, VISIBILITY_BYTES);
         let translucent = |binding| storage_binding(binding, draw.translucent, TRANSLUCENT_BYTES);
-        let render_list = |binding| storage_binding(binding, draw.render_list, RENDER_LIST_BYTES);
         let nodes = |binding| storage_binding(binding, draw.nodes, NODE_BYTES);
         let node_visibility =
             |binding| storage_binding(binding, draw.node_visibility, NODE_VISIBILITY_BYTES);
         let cleaner_ids = |binding| storage_binding(binding, draw.cleaner_ids, CLEANER_IDS_BYTES);
         let cull_sets = (0..MAX_FRAMES_IN_FLIGHT)
             .map(|frame| {
-                device.create_bind_group(
-                    cull_set_layout,
-                    &[scene(frame), sections(1), visibility(2), render_list(3)],
-                )
+                device
+                    .create_bind_group(cull_set_layout, &cull_bindings(draw, &scene_buffers[frame]))
             })
             .collect();
         let pass = |label, shader, entries, push, frames, bindings: &dyn Fn(usize) -> Vec<_>| {
@@ -308,7 +299,7 @@ impl DistantPipeline {
                 PREP_SET,
                 None,
                 1,
-                &|_| vec![counts(0), render_list(1)],
+                &|_| prep_bindings(draw),
             ),
             cmdgen: pass(
                 "distant command generation",
@@ -316,18 +307,7 @@ impl DistantPipeline {
                 CMDGEN_SET,
                 None,
                 MAX_FRAMES_IN_FLIGHT,
-                &|frame| {
-                    vec![
-                        scene(frame),
-                        draws(1),
-                        counts(2),
-                        sections(3),
-                        visibility(4),
-                        render_list(5),
-                        storage_binding(6, draw.positions, POSITIONS_BYTES),
-                        translucent(7),
-                    ]
-                },
+                &|frame| cmdgen_bindings(draw, &scene_buffers[frame]),
             ),
             prefix_sum: pass(
                 "distant prefix sum",
@@ -343,16 +323,7 @@ impl DistantPipeline {
                 TRANSLUCENTS_SET,
                 None,
                 MAX_FRAMES_IN_FLIGHT,
-                &|frame| {
-                    vec![
-                        scene(frame),
-                        draws(1),
-                        counts(2),
-                        sections(3),
-                        render_list(4),
-                        translucent(5),
-                    ]
-                },
+                &|frame| translucents_bindings(draw, &scene_buffers[frame]),
             ),
             // Its push constants are the count and the frame to set.
             visibility_set: pass(
@@ -426,6 +397,26 @@ impl DistantPipeline {
         self.blit = create_blit_pipeline(device, swapchain, self.blit_layout);
     }
 
+    /// Remakes the sets binding the lists [`DistantBuffers::grow_lists`]
+    /// just replaced; the targets' (the traversal's and the quads'
+    /// positions) are remade by the next [`Self::ensure_targets`].
+    fn rebind_lists(&mut self, device: &rhi::backend::Device, buffers: &DistantBuffers) {
+        self.drop_targets(device);
+        let draw = buffers.draw_buffers();
+        let scene = &self.scene_buffers;
+        util::destroy_bind_groups(device, self.cull_sets.drain(..));
+        self.cull_sets = (0..MAX_FRAMES_IN_FLIGHT)
+            .map(|frame| {
+                device.create_bind_group(self.cull_set_layout, &cull_bindings(draw, &scene[frame]))
+            })
+            .collect();
+        self.prep.rebind(device, |_| prep_bindings(draw));
+        self.cmdgen
+            .rebind(device, |frame| cmdgen_bindings(draw, &scene[frame]));
+        self.translucents
+            .rebind(device, |frame| translucents_bindings(draw, &scene[frame]));
+    }
+
     /// The swapchain was remade, its depth with it even at the same size:
     /// the targets, sized to it and reading that depth, are remade by the
     /// next frame that draws.
@@ -486,19 +477,19 @@ impl DistantPipeline {
                         Iteration::First => {
                             (buffers.top_ids(frame), TOP_IDS_BYTES, draw.scratch[1])
                         }
-                        Iteration::Odd => (draw.scratch[1], SCRATCH_BYTES, draw.scratch[0]),
-                        Iteration::Even => (draw.scratch[0], SCRATCH_BYTES, draw.scratch[1]),
+                        Iteration::Odd => (draw.scratch[1], draw.scratch_bytes(), draw.scratch[0]),
+                        Iteration::Even => (draw.scratch[0], draw.scratch_bytes(), draw.scratch[1]),
                     };
                     device.create_bind_group(
                         self.traversal_set_layout,
                         &[
                             uniform_binding(0, &self.scene_buffers[frame], SCENE_BYTES),
                             storage_binding(1, draw.requests, REQUESTS_BYTES),
-                            storage_binding(2, draw.render_list, RENDER_LIST_BYTES),
+                            storage_binding(2, draw.render_list, draw.render_list_bytes()),
                             storage_binding(3, draw.nodes, NODE_BYTES),
                             storage_binding(4, draw.queue_meta, QUEUE_META_BYTES),
                             storage_binding(5, source, source_bytes),
-                            storage_binding(6, sink, SCRATCH_BYTES),
+                            storage_binding(6, sink, draw.scratch_bytes()),
                             storage_binding(7, draw.node_visibility, NODE_VISIBILITY_BYTES),
                         ],
                     )
@@ -508,7 +499,7 @@ impl DistantPipeline {
         let draw_set = device.create_bind_group(
             self.draw_layout,
             &[
-                storage_binding(0, draw.positions, POSITIONS_BYTES),
+                storage_binding(0, draw.positions, draw.positions_bytes()),
                 (1, rhi::backend::BindingResource::Texture(bound.handle())),
             ],
         );
@@ -552,6 +543,9 @@ impl DistantPipeline {
         cardinal_lighting: CardinalLighting,
         stamp: &mut dyn FnMut(&rhi::backend::CommandEncoder, &'static str),
     ) {
+        if buffers.grow_lists(device) {
+            self.rebind_lists(device, buffers);
+        }
         self.ensure_targets(device, extent, frame_depth, buffers);
         let targets = self.targets.as_ref().expect("made above");
         let (color, depth, bound) = (targets.color.handle(), frame_depth, targets.bound.handle());
@@ -966,6 +960,52 @@ impl DistantPipeline {
         }
         self.sampler.destroy(device);
     }
+}
+
+type Bindings = Vec<(u32, rhi::backend::BindingResource)>;
+
+/// The occlusion pass's set (`CULL_SET`), which binds the render list.
+fn cull_bindings(draw: DrawBuffers, scene: &rhi::backend::Buffer) -> Bindings {
+    vec![
+        uniform_binding(0, scene, SCENE_BYTES),
+        storage_binding(1, draw.sections, SECTIONS_BYTES),
+        storage_binding(2, draw.visibility, VISIBILITY_BYTES),
+        storage_binding(3, draw.render_list, draw.render_list_bytes()),
+    ]
+}
+
+/// `distant_prep.comp`'s set (`PREP_SET`).
+fn prep_bindings(draw: DrawBuffers) -> Bindings {
+    vec![
+        storage_binding(0, draw.counts, COUNTS_BYTES),
+        storage_binding(1, draw.render_list, draw.render_list_bytes()),
+    ]
+}
+
+/// `distant_cmdgen.comp`'s set (`CMDGEN_SET`).
+fn cmdgen_bindings(draw: DrawBuffers, scene: &rhi::backend::Buffer) -> Bindings {
+    vec![
+        uniform_binding(0, scene, SCENE_BYTES),
+        storage_binding(1, draw.draws, DRAWS_BYTES),
+        storage_binding(2, draw.counts, COUNTS_BYTES),
+        storage_binding(3, draw.sections, SECTIONS_BYTES),
+        storage_binding(4, draw.visibility, VISIBILITY_BYTES),
+        storage_binding(5, draw.render_list, draw.render_list_bytes()),
+        storage_binding(6, draw.positions, draw.positions_bytes()),
+        storage_binding(7, draw.translucent, TRANSLUCENT_BYTES),
+    ]
+}
+
+/// `distant_translucents.comp`'s set (`TRANSLUCENTS_SET`).
+fn translucents_bindings(draw: DrawBuffers, scene: &rhi::backend::Buffer) -> Bindings {
+    vec![
+        uniform_binding(0, scene, SCENE_BYTES),
+        storage_binding(1, draw.draws, DRAWS_BYTES),
+        storage_binding(2, draw.counts, COUNTS_BYTES),
+        storage_binding(3, draw.sections, SECTIONS_BYTES),
+        storage_binding(4, draw.render_list, draw.render_list_bytes()),
+        storage_binding(5, draw.translucent, TRANSLUCENT_BYTES),
+    ]
 }
 
 /// `distant.vert`'s shade by face, in [`Direction::VALUES`] order.

@@ -84,6 +84,20 @@ impl ComputePass {
         self.sets[frame.min(self.sets.len() - 1)]
     }
 
+    /// Remakes the sets, `bindings(frame)` each, once a buffer they bind was
+    /// replaced and the GPU is done with the old ones.
+    pub fn rebind(
+        &mut self,
+        device: &rhi::backend::Device,
+        bindings: impl Fn(usize) -> Vec<(u32, rhi::backend::BindingResource)>,
+    ) {
+        let frames = self.sets.len();
+        destroy_bind_groups(device, self.sets.drain(..));
+        self.sets = (0..frames)
+            .map(|frame| device.create_bind_group(self.group_layout, &bindings(frame)))
+            .collect();
+    }
+
     pub fn destroy(&mut self, device: &rhi::backend::Device) {
         destroy_bind_groups(device, self.sets.drain(..));
         self.pipeline.destroy(device);

@@ -34,8 +34,8 @@ use consts::{
     TEMPORAL_OFFSET, TRANSLUCENT_DRAWS, TRANSLUCENT_OFFSET,
 };
 pub(crate) use consts::{
-    COUNTS_CULL_DRAW, COUNTS_OPAQUE, COUNTS_TEMPORAL, COUNTS_TRANSLUCENT, LIST_GROUP, MAX_LISTED,
-    MAX_REQUESTS, TRANSLUCENT_BUCKETS,
+    COUNTS_CULL_DRAW, COUNTS_OPAQUE, COUNTS_TEMPORAL, COUNTS_TRANSLUCENT, LIST_GROUP, MAX_REQUESTS,
+    TRANSLUCENT_BUCKETS,
 };
 
 const _: () = assert!(consts::LEVELS == LEVELS as u32);
@@ -85,21 +85,23 @@ const CUBE: [u32; 36] = [
 ];
 pub(crate) const CUBE_FIRST_INDEX: u32 = QUADS_PER_DRAW * 6;
 
+/// The render list's, the draw positions' and each traversal queue's room
+/// at first, in entries; they grow with the nodes
+/// ([`DistantBuffers::grow_lists`]).
+const MIN_LIST_CAPACITY: u32 = 1 << 16;
+
 /// Byte sizes of the buffers the GPU passes bind.
 pub(crate) const SECTIONS_BYTES: u64 = MAX_SECTIONS as u64 * 32;
-pub(crate) const RENDER_LIST_BYTES: u64 = (1 + MAX_LISTED as u64) * 4;
 pub(crate) const COUNTS_BYTES: u64 = 64;
 const COUNT_WORDS: usize = COUNTS_BYTES as usize / 4;
 pub(crate) const DRAWS_BYTES: u64 =
     (TEMPORAL_OFFSET + TEMPORAL_DRAWS) as u64 * size_of::<DrawCommand>() as u64;
-pub(crate) const POSITIONS_BYTES: u64 = MAX_LISTED as u64 * 8;
 pub(crate) const VISIBILITY_BYTES: u64 = MAX_SECTIONS as u64 * 4;
 pub(crate) const TRANSLUCENT_BYTES: u64 = (TRANSLUCENT_BUCKETS + TRANSLUCENT_DRAWS) as u64 * 4;
 /// The request queue: a `uvec2` count, then the keys.
 pub(crate) const REQUESTS_BYTES: u64 = 8 + MAX_REQUESTS as u64 * 8;
 /// Per traversal iteration, a `uvec4`: its dispatch size and node count.
 pub(crate) const QUEUE_META_BYTES: u64 = LEVELS as u64 * 16;
-pub(crate) const SCRATCH_BYTES: u64 = MAX_LISTED as u64 * 4;
 pub(crate) const TOP_IDS_BYTES: u64 = MAX_ROOTS as u64 * 4;
 /// Per node, the frame the traversal last drew it, which the cleaner sorts by.
 pub(crate) const NODE_VISIBILITY_BYTES: u64 = MAX_NODES as u64 * 4;
@@ -185,6 +187,70 @@ pub(crate) struct DrawBuffers<'a> {
     pub node_visibility: &'a rhi::backend::Buffer,
     pub cleaner_ids: &'a rhi::backend::Buffer,
     pub cleaner_keys: &'a rhi::backend::Buffer,
+    /// The entries the render list, the positions and each queue hold.
+    pub list_capacity: u32,
+}
+
+impl DrawBuffers<'_> {
+    /// The render list: its count, then a section per entry.
+    pub fn render_list_bytes(&self) -> u64 {
+        render_list_bytes(self.list_capacity)
+    }
+
+    /// A section's packed key per render list entry.
+    pub fn positions_bytes(&self) -> u64 {
+        positions_bytes(self.list_capacity)
+    }
+
+    /// A node id per entry.
+    pub fn scratch_bytes(&self) -> u64 {
+        scratch_bytes(self.list_capacity)
+    }
+}
+
+fn render_list_bytes(capacity: u32) -> u64 {
+    (1 + u64::from(capacity)) * 4
+}
+
+fn positions_bytes(capacity: u32) -> u64 {
+    u64::from(capacity) * 8
+}
+
+fn scratch_bytes(capacity: u32) -> u64 {
+    u64::from(capacity) * 4
+}
+
+/// The buffers sized by the list capacity: the two traversal queues, the
+/// render list and the draw positions.
+fn list_buffers(
+    device: &rhi::backend::Device,
+    capacity: u32,
+) -> (
+    [rhi::backend::Buffer; 2],
+    rhi::backend::Buffer,
+    rhi::backend::Buffer,
+) {
+    let buffer = |name, bytes, usage| {
+        rhi::backend::Buffer::new(
+            device,
+            name,
+            bytes,
+            usage | rhi::BufferUsages::COPY_DST,
+            rhi::MemoryLocation::Device,
+        )
+    };
+    let storage = rhi::BufferUsages::STORAGE;
+    (
+        ["distant_queue_a", "distant_queue_b"]
+            .map(|name| buffer(name, scratch_bytes(capacity), storage)),
+        buffer("distant_render_list", render_list_bytes(capacity), storage),
+        // Copied over when the lists grow.
+        buffer(
+            "distant_draw_positions",
+            positions_bytes(capacity),
+            storage | rhi::BufferUsages::COPY_SRC,
+        ),
+    )
 }
 
 pub(crate) struct DistantBuffers {
@@ -249,6 +315,8 @@ pub(crate) struct DistantBuffers {
     positions: rhi::backend::Buffer,
     visibility: rhi::backend::Buffer,
     translucent: rhi::backend::Buffer,
+    /// What [`list_buffers`] were made with: at least the node count.
+    list_capacity: u32,
     indirect: IndirectDrawFeatures,
     /// The ring of top-level sections: its centre, radius and height
     /// range, so the roots change only when it moves.
@@ -344,9 +412,7 @@ impl DistantBuffers {
             QUEUE_META_BYTES,
             storage | rhi::BufferUsages::INDIRECT,
         );
-        let scratch = ["distant_queue_a", "distant_queue_b"]
-            .map(|name| device_buffer(name, SCRATCH_BYTES, storage));
-        let render_list = device_buffer("distant_render_list", RENDER_LIST_BYTES, storage);
+        let (scratch, render_list, positions) = list_buffers(device, MIN_LIST_CAPACITY);
         let node_visibility =
             device_buffer("distant_node_visibility", NODE_VISIBILITY_BYTES, storage);
         let cleaner_ids = device_buffer("distant_cleaner_ids", CLEANER_IDS_BYTES, storage);
@@ -365,7 +431,6 @@ impl DistantBuffers {
             DRAWS_BYTES,
             storage | rhi::BufferUsages::INDIRECT,
         );
-        let positions = device_buffer("distant_draw_positions", POSITIONS_BYTES, storage);
         let visibility = device_buffer("distant_visibility", VISIBILITY_BYTES, storage);
         let translucent = device_buffer("distant_translucent_draws", TRANSLUCENT_BYTES, storage);
         let models = device_buffer("distant_block_models", MODELS_BYTES, storage);
@@ -501,6 +566,7 @@ impl DistantBuffers {
             positions,
             visibility,
             translucent,
+            list_capacity: MIN_LIST_CAPACITY,
             indirect,
             ring: None,
             view: None,
@@ -548,7 +614,49 @@ impl DistantBuffers {
             node_visibility: &self.node_visibility,
             cleaner_ids: &self.cleaner_ids,
             cleaner_keys: &self.cleaner_keys,
+            list_capacity: self.list_capacity,
         }
+    }
+
+    /// Grows the render list, the draw positions and the traversal queues to
+    /// the next power of two past the node count, so none of them runs out:
+    /// each holds a node at most once. Rare, so it waits for the GPU to let
+    /// go of the old ones rather than keeping them for the frames in flight,
+    /// and carries the positions over, which last frame's draws read. True
+    /// when they grew: the sets binding them are to be remade.
+    pub fn grow_lists(&mut self, device: &rhi::backend::Device) -> bool {
+        let nodes = self.graph.end_id();
+        if nodes <= self.list_capacity {
+            return false;
+        }
+        let capacity = nodes.next_power_of_two();
+        device.wait_idle();
+        let (scratch, render_list, positions) = list_buffers(device, capacity);
+        device.submit(|encoder| {
+            encoder.copy_buffer(
+                self.positions.handle(),
+                positions.handle(),
+                &[rhi::BufferCopy::from_start(positions_bytes(
+                    self.list_capacity,
+                ))],
+            );
+            encoder.fill_buffer(render_list.handle(), 0, 4, 0);
+            encoder.transition_buffers(rhi::BufferUse::CopyDst, rhi::BufferUse::Storage);
+        });
+        let [scratch_a, scratch_b] = &mut self.scratch;
+        for buffer in [
+            scratch_a,
+            scratch_b,
+            &mut self.render_list,
+            &mut self.positions,
+        ] {
+            std::mem::take(buffer).destroy(device);
+        }
+        self.scratch = scratch;
+        self.render_list = render_list;
+        self.positions = positions;
+        self.list_capacity = capacity;
+        true
     }
 
     /// The top-level nodes' ids, the traversal's first iteration's source.
