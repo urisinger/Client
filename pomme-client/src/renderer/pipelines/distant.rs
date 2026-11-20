@@ -610,6 +610,7 @@ impl DistantPipeline {
         frame_depth: rhi::backend::TextureHandle,
         extent: rhi::Extent,
         cardinal_lighting: CardinalLighting,
+        stamp: &mut dyn FnMut(&rhi::backend::CommandEncoder, &'static str),
     ) {
         self.ensure_targets(device, extent, frame_depth, buffers);
         let targets = self.targets.as_ref().expect("made above");
@@ -679,6 +680,7 @@ impl DistantPipeline {
             TextureTransition::color(bound, TextureUse::DepthAttachment, TextureUse::DepthRead),
             TextureTransition::color(color, TextureUse::ShaderRead, TextureUse::ColorAttachment),
         ]);
+        stamp(encoder, "distant bound");
 
         // The opaque draws of the draw list built last frame, depth-tested
         // against the chunks'.
@@ -686,6 +688,7 @@ impl DistantPipeline {
         self.bind_quads(&mut pass, frame, targets, false);
         buffers.draw(&pass, Region::Opaque);
         pass.end();
+        stamp(encoder, "distant last opaque");
 
         // The Hi-Z from the depth so far, the cleaner, then the traversal.
         encoder.transition_textures(&[TextureTransition::color(
@@ -694,10 +697,13 @@ impl DistantPipeline {
             TextureUse::DepthRead,
         )]);
         self.build_hiz(device, encoder, targets);
+        stamp(encoder, "distant hiz");
         self.clean(encoder, frame, frame_id, buffers);
+        stamp(encoder, "distant cleaner");
         let top_count = buffers.record_traversal_setup(encoder, frame);
         self.traverse(encoder, frame, targets, top_count, queue_meta);
         buffers.record_request_readback(encoder, frame);
+        stamp(encoder, "distant traversal");
         encoder.transition_textures(&[TextureTransition::color(
             depth,
             TextureUse::DepthRead,
@@ -721,6 +727,7 @@ impl DistantPipeline {
             (rhi::BufferUse::StorageWrite, rhi::BufferUse::ShaderRead),
             (rhi::BufferUse::CopyDst, rhi::BufferUse::Storage),
         ]);
+        stamp(encoder, "distant prep");
 
         // The occlusion pass: each listed section's box against the image's
         // depth, the ones that show marked seen this frame.
@@ -746,6 +753,7 @@ impl DistantPipeline {
             pass.end();
             encoder.transition_buffers(rhi::BufferUse::FragmentWrite, rhi::BufferUse::Storage);
         }
+        stamp(encoder, "distant occlusion");
 
         // `distant_cmdgen.comp`, then the translucent draws sorted far to
         // near.
@@ -776,6 +784,7 @@ impl DistantPipeline {
             (rhi::BufferUse::StorageWrite, rhi::BufferUse::DrawInput),
             (rhi::BufferUse::StorageWrite, rhi::BufferUse::ShaderRead),
         ]);
+        stamp(encoder, "distant cmdgen");
 
         // The sections seen this frame but not last, then the translucent
         // quads.
@@ -790,6 +799,7 @@ impl DistantPipeline {
             TextureUse::ColorAttachment,
             TextureUse::ShaderRead,
         )]);
+        stamp(encoder, "distant new + translucent");
     }
 
     /// The cleaner's passes: the nodes allocated and freed since last frame

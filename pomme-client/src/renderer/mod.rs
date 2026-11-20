@@ -613,7 +613,7 @@ impl Renderer {
             &atlas.uv_map,
             &render_assets,
         );
-        let gpu_timer = rhi::backend::GpuTimer::new(&ctx, 16);
+        let gpu_timer = rhi::backend::GpuTimer::new(&ctx, 32);
 
         Ok(Self {
             ctx,
@@ -2639,6 +2639,11 @@ impl Renderer {
                             self.swapchain.depth.handle(),
                             extent,
                             sky.cardinal_light.table(),
+                            &mut |encoder, what| {
+                                if let Some(timer) = &mut self.gpu_timer {
+                                    timer.stamp(encoder, frame, what);
+                                }
+                            },
                         );
                         distant.pipeline.composite(
                             &self.ctx.device,
@@ -2649,6 +2654,7 @@ impl Renderer {
                             (*render_distance * 16) as f32,
                             (*distant_terrain * 16) as f32,
                         );
+                        self.gpu_stamp(&encoder, frame, "distant blit");
                         pass = encoder.begin_render_pass(
                             &self.ctx.device,
                             &self.swapchain.pass_keeping_depth(
@@ -2658,8 +2664,6 @@ impl Renderer {
                             ),
                         );
                     }
-
-                    self.gpu_stamp(&encoder, frame, "distant");
 
                     let anchor = self.camera.anchor();
 
