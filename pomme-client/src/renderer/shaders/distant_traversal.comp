@@ -102,9 +102,9 @@ void mark_requested(inout Node node) {
 }
 
 // This iteration's node for the invocation, or none past the queue's count
-// or room (the scratch queues', which the top-level ids never pass).
+// or room.
 uint current_node() {
-    if (min(queue_meta[queue_index].w, MAX_LISTED) <= gl_GlobalInvocationID.x) {
+    if (min(queue_meta[queue_index].w, uint(queue_source.length())) <= gl_GlobalInvocationID.x) {
         return OUT_OF_BOUNDS;
     }
     return queue_source[gl_GlobalInvocationID.x];
@@ -112,8 +112,9 @@ uint current_node() {
 
 uint push_index;
 
+// The next iteration's workgroups for `nodes`, capped at its queue's room.
 uint workgroups(uint nodes) {
-    return (min(nodes, MAX_LISTED) + LOCAL_SIZE - 1u) >> TRAVERSAL_GROUP_BITS;
+    return (min(nodes, uint(queue_sink.length())) + LOCAL_SIZE - 1u) >> TRAVERSAL_GROUP_BITS;
 }
 
 // Room for `count` nodes in the next iteration, its dispatch grown by the
@@ -123,7 +124,7 @@ void push_nodes_init(uint count) {
     // A coarser node than the iteration expects (a record not yet rewritten)
     // has no next iteration to push to.
     if (queue_index + 1u >= LEVELS) {
-        push_index = MAX_LISTED;
+        push_index = uint(queue_sink.length());
         return;
     }
     uint index = atomicAdd(queue_meta[queue_index + 1u].w, count);
@@ -136,7 +137,7 @@ void push_nodes_init(uint count) {
 
 // Past the queue's room, dropped.
 void push_node(uint id) {
-    if (push_index < MAX_LISTED) {
+    if (push_index < uint(queue_sink.length())) {
         queue_sink[push_index] = id;
     }
     push_index++;
@@ -252,11 +253,11 @@ void enqueue_children(Node node) {
 }
 
 void enqueue_render(Node node) {
-    if (section_count < MAX_LISTED) {
+    if (section_count < uint(render_list.length())) {
         last_render_frame[node.id] = frame_id;
         if (node.mesh != EMPTY_ID) {
             uint index = atomicAdd(section_count, 1u);
-            if (index < MAX_LISTED) {
+            if (index < uint(render_list.length())) {
                 render_list[index] = node.mesh;
             }
         }

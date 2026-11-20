@@ -118,9 +118,10 @@ layout(set = DISTANT_SET, binding = RENDER_LIST_BINDING, std430) RENDER_LIST_ACC
     uint render_list[];
 };
 
-// The traversal's count can overshoot the list as it races to fill it.
+// The traversal's count can overshoot the list as it races to fill it; the
+// list's room is the bound range's.
 uint listed_count() {
-    return min(section_count, MAX_LISTED);
+    return min(section_count, uint(render_list.length()));
 }
 #endif
 
