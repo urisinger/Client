@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use glam::DVec3;
 
 use super::mesher::{
-    ChunkAABB, ChunkMeshData, PackVertex, PackedVertex, SectionMesh, TerrainFormat,
+    ChunkAABB, ChunkMeshData, FaceEnds, PackVertex, PackedVertex, SectionMesh, TerrainFormat,
 };
 use super::tlsf::Tlsf;
 use crate::position::{BlockPos, ChunkPos};
@@ -69,7 +69,8 @@ impl ArenaSize {
 }
 
 /// The cull pass's bindings: meta, frustum, then indirect draws and a count
-/// per [`Layer`], and the columns' visibility masks.
+/// per [`Layer`], the columns' visibility masks, and the occlusion pass's
+/// candidates, its [`OcclusionCmd`] and the sections it saw.
 const CULL_BINDINGS: &[rhi::BindGroupLayoutEntry] = &[
     rhi::BindGroupLayoutEntry::storage(rhi::ShaderStages::COMPUTE),
     rhi::BindGroupLayoutEntry::uniform(rhi::ShaderStages::COMPUTE),
@@ -80,7 +81,26 @@ const CULL_BINDINGS: &[rhi::BindGroupLayoutEntry] = &[
     rhi::BindGroupLayoutEntry::storage(rhi::ShaderStages::COMPUTE),
     rhi::BindGroupLayoutEntry::storage(rhi::ShaderStages::COMPUTE),
     rhi::BindGroupLayoutEntry::storage(rhi::ShaderStages::COMPUTE),
+    rhi::BindGroupLayoutEntry::storage(rhi::ShaderStages::COMPUTE),
+    rhi::BindGroupLayoutEntry::storage(rhi::ShaderStages::COMPUTE),
+    rhi::BindGroupLayoutEntry::storage(rhi::ShaderStages::COMPUTE),
 ];
+/// The occlusion pass's bindings: the metas and candidates its vertex stage
+/// boxes, and the sections its fragment stage marks seen.
+const OCCLUSION_BINDINGS: &[rhi::BindGroupLayoutEntry] = &[
+    rhi::BindGroupLayoutEntry::storage(rhi::ShaderStages::VERTEX),
+    rhi::BindGroupLayoutEntry::storage(rhi::ShaderStages::VERTEX),
+    rhi::BindGroupLayoutEntry::storage(rhi::ShaderStages::FRAGMENT),
+];
+/// A box's 36 indices over its corners, a bit an axis (`chunk_occlusion.vert`).
+const BOX_INDICES: [u32; 36] = [
+    0, 2, 1, 1, 2, 3, 4, 5, 6, 5, 7, 6, 0, 1, 4, 1, 5, 4, 2, 6, 3, 3, 6, 7, 0, 4, 2, 2, 4, 6, 1, 3,
+    5, 3, 7, 5,
+];
+/// The draws a section's solid or cutout indices may take when the cull
+/// leaves out the face groups turned away from the eye (`cull.comp`'s
+/// `OPAQUE_SLOTS`).
+const OPAQUE_DRAW_SLOTS: u32 = 3;
 /// A draw count per arena, then an index count per arena.
 const COUNTS_SIZE: u64 = (2 * MAX_ARENAS * size_of::<u32>()) as u64;
 const FRUSTUM_SIZE: u64 = size_of::<FrustumData>() as u64;
@@ -206,6 +226,9 @@ pub(crate) struct ChunkMeta {
     /// for none.
     uploaded_ms: u32,
     _pad: u32,
+    /// Where the solid then the cutout indices' face groups end
+    /// ([`FaceEnds`]).
+    face_ends: FaceEnds,
 }
 
 impl ChunkMeta {
@@ -336,6 +359,41 @@ pub(crate) struct DrawCommand {
     pub first_instance: u32,
 }
 
+/// The occlusion pass's box draw, one instance per candidate the cull
+/// lists, then the late cull's dispatch over them (`cull.glsl`'s
+/// `OcclusionCmdBuf`).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct OcclusionCmd {
+    boxes: DrawCommand,
+    late_groups: [u32; 3],
+}
+
+impl OcclusionCmd {
+    /// Before the cull: no candidates, so no boxes or late groups.
+    const RESET: Self = Self {
+        boxes: DrawCommand {
+            index_count: BOX_INDICES.len() as u32,
+            instance_count: 0,
+            first_index: 0,
+            vertex_offset: 0,
+            first_instance: 0,
+        },
+        late_groups: [0, 1, 1],
+    };
+}
+
+/// `chunk_occlusion.vert`'s push constants.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct OcclusionPush {
+    view_proj: [f32; 16],
+    cam_block: [i32; 3],
+    frame_id: u32,
+    frac: [f32; 3],
+    _pad: u32,
+}
+
 /// An integer section origin widened for f64 math.
 fn origin_dvec(origin: [i32; 3]) -> DVec3 {
     DVec3::new(origin[0] as f64, origin[1] as f64, origin[2] as f64)
@@ -358,7 +416,15 @@ struct FrustumData {
     use_visibility: u32,
     /// How long a section fades in.
     fade_ms: u32,
-    _pad: [u32; 2],
+    /// Whether solid and cutout draw only the face groups that can face the
+    /// eye, a section taking [`OPAQUE_DRAW_SLOTS`] in their lists.
+    use_facing: u32,
+    _pad: u32,
+    /// This cull's stamp in the sections the occlusion pass sees.
+    frame_id: u32,
+    /// Whether the occlusion pass and the late cull run after this cull.
+    use_occlusion: u32,
+    _pad2: [u32; 2],
     /// Per arena, where its segment starts and how many sections it holds,
     /// four to a row as std140 lays `uint` arrays out.
     arena_base: [[u32; 4]; MAX_ARENAS / 4],
@@ -366,8 +432,8 @@ struct FrustumData {
 }
 
 // The sizes `cull.comp` lays these out at.
-const _: () = assert!(size_of::<ChunkMeta>() == 80);
-const _: () = assert!(size_of::<FrustumData>() == 2192);
+const _: () = assert!(size_of::<ChunkMeta>() == 128);
+const _: () = assert!(size_of::<FrustumData>() == 2208);
 
 /// The columns with uploaded sections, each in a slot the visibility masks
 /// and the metas refer to it by.
@@ -766,6 +832,8 @@ pub(crate) struct SectionAlloc {
     /// Translucent water indices, stored right after the opaque ones in the
     /// same index allocation and drawn in a separate blended pass.
     water_index_count: u32,
+    /// Where the solid then cutout indices' face groups end.
+    face_ends: FaceEnds,
     /// Total allocated index slice length (opaque + water), for freeing.
     idx_len: u32,
     vertex_offset: i32,
@@ -812,6 +880,7 @@ impl SectionAlloc {
             section: self.section_index as u32,
             uploaded_ms: self.uploaded_ms,
             _pad: 0,
+            face_ends: self.face_ends,
         }
     }
 }
@@ -867,6 +936,8 @@ impl SectionAlloc {
             index_count: 6,
             solid_index_count: 6,
             water_index_count: 0,
+            // The quad on no axis plane.
+            face_ends: [0, 0, 0, 6, 6, 6, 0, 0, 0, 0, 0, 0],
             idx_len: 6,
             vertex_offset: 0,
             vtx_len: 4,
@@ -1444,8 +1515,23 @@ pub struct ChunkBufferStore {
     bare_uploads: HashMap<ChunkPos, Vec<(i32, u32)>>,
 
     compute_pipeline: rhi::backend::ComputePipeline,
+    /// cull_late.comp, over the cull's layout.
+    late_pipeline: rhi::backend::ComputePipeline,
     compute_layout: rhi::backend::PipelineLayout,
     cull_layout: rhi::backend::BindGroupLayout,
+    /// The camera's occlusion pass; `None` where the fragment stage can't
+    /// write buffers.
+    occlusion: Option<OcclusionPass>,
+    /// Per meta slot, the `frame_id` of the last cull whose occlusion pass
+    /// saw it; zeroed before the next cull once remade.
+    seen: rhi::backend::Buffer,
+    seen_stale: bool,
+    /// The camera cull's stamp, one up each cull.
+    frame_id: u32,
+    /// Whether this frame's camera cull left sections to the occlusion
+    /// pass, and the eye it culled from, which the pass boxes from too.
+    occluding: bool,
+    cull_eye: ([i32; 3], [f32; 3]),
 
     /// Sections uploaded before the first cull appear at once; later ones
     /// fade in.
@@ -1512,15 +1598,36 @@ impl ChunkBufferStore {
             "cull",
             shader::include_shader!("cull.comp"),
         );
+        let late_pipeline = rhi::backend::create_compute_pipeline(
+            device,
+            compute_layout,
+            "late cull",
+            shader::include_shader!("cull_late.comp"),
+        );
         let meta_buffers = meta_buffers(device, INITIAL_META);
         let visibility_buffers = visibility_buffers(device, INITIAL_COLUMNS);
+        let seen = seen_buffer(device, INITIAL_META);
+        let occlusion = indirect_draw
+            .fragment_stores
+            .then(|| OcclusionPass::new(device, &meta_buffers));
+        // Without drawIndirectCount every slot is drawn, so the face groups'
+        // extra slots would cost more than they save.
         let camera = DrawList::new(
             device,
             cull_layout,
-            &meta_buffers,
-            &visibility_buffers,
+            CullShared {
+                meta: &meta_buffers,
+                visibility: &visibility_buffers,
+                seen: &seen,
+            },
             INITIAL_META,
+            indirect_draw.count,
+            occlusion.is_some(),
         );
+        let mut occlusion = occlusion;
+        if let Some(occlusion) = &mut occlusion {
+            occlusion.bind(device, &meta_buffers, &camera.candidates, &seen);
+        }
 
         Self {
             indirect_draw,
@@ -1563,7 +1670,7 @@ impl ChunkBufferStore {
                     rhi::backend::Buffer::new(
                         device,
                         "draw_count_readback",
-                        3 * COUNTS_SIZE,
+                        LISTS as u64 * COUNTS_SIZE,
                         rhi::BufferUsages::COPY_DST,
                         rhi::MemoryLocation::Readback,
                     )
@@ -1572,8 +1679,15 @@ impl ChunkBufferStore {
             eye: None,
             epoch: std::time::Instant::now(),
             compute_pipeline,
+            late_pipeline,
             compute_layout,
             cull_layout,
+            occlusion,
+            seen,
+            seen_stale: true,
+            frame_id: 1,
+            occluding: false,
+            cull_eye: ([0; 3], [0.0; 3]),
             fade_enabled: false,
             fade_ms: crate::ui::menu::DEFAULT_CHUNK_FADE_MS,
             last_draw_count: 0,
@@ -1684,6 +1798,7 @@ impl ChunkBufferStore {
             vtx_off: u32,
             idx_off: u32,
             solid_index_count: u32,
+            face_ends: FaceEnds,
             aabb: ChunkAABB,
             origin: [i32; 3],
         }
@@ -1836,6 +1951,7 @@ impl ChunkBufferStore {
                     vtx_off,
                     idx_off,
                     solid_index_count: sec.solid_index_count,
+                    face_ends: sec.face_ends,
                     aabb: sec.aabb,
                     origin: [
                         mesh.pos.x * 16,
@@ -1951,6 +2067,7 @@ impl ChunkBufferStore {
                     index_count: p.indices.len() as u32,
                     solid_index_count: p.solid_index_count,
                     water_index_count: p.water_indices.len() as u32,
+                    face_ends: p.face_ends,
                     idx_len: p.index_len,
                     vertex_offset: p.vtx_off as i32,
                     vtx_len: p.vertex_count,
@@ -2036,6 +2153,9 @@ impl ChunkBufferStore {
             for segment in &mut self.lists.segments {
                 segment.mark(0, segment.cap);
             }
+            std::mem::take(&mut self.seen).destroy(device);
+            self.seen = seen_buffer(device, self.max_meta);
+            self.seen_stale = true;
         }
         if columns > self.max_columns {
             self.max_columns = columns.next_power_of_two().max(self.max_columns * 2);
@@ -2043,15 +2163,23 @@ impl ChunkBufferStore {
             self.visibility_buffers = visibility_buffers(device, self.max_columns);
             self.visibility_pending = MAX_FRAMES_IN_FLIGHT as u32;
         }
+        let shared = CullShared {
+            meta: &self.meta_buffers,
+            visibility: &self.visibility_buffers,
+            seen: &self.seen,
+        };
         for list in draw_lists(&mut self.camera, &mut self.shadow) {
             if grow_meta {
                 list.regrow(device, self.max_meta);
             }
-            list.bind(
+            list.bind(device, self.cull_layout, shared);
+        }
+        if let Some(occlusion) = &mut self.occlusion {
+            occlusion.bind(
                 device,
-                self.cull_layout,
                 &self.meta_buffers,
-                &self.visibility_buffers,
+                &self.camera.candidates,
+                &self.seen,
             );
         }
     }
@@ -2741,6 +2869,8 @@ impl ChunkBufferStore {
         anchor: DVec3,
         eye: DVec3,
         use_visibility: bool,
+        use_facing: bool,
+        use_occlusion: bool,
     ) -> FrustumData {
         let mut data = FrustumData {
             planes: *frustum,
@@ -2750,7 +2880,11 @@ impl ChunkBufferStore {
             now_ms: self.now_ms(),
             use_visibility: u32::from(use_visibility),
             fade_ms: self.fade_ms,
-            _pad: [0; 2],
+            use_facing: u32::from(use_facing),
+            _pad: 0,
+            frame_id: self.frame_id,
+            use_occlusion: u32::from(use_occlusion),
+            _pad2: [0; 2],
             arena_base: [[0; 4]; MAX_ARENAS / 4],
             arena_len: [[0; 4]; MAX_ARENAS / 4],
         };
@@ -2777,6 +2911,11 @@ impl ChunkBufferStore {
     /// `anchor` must be the same `Camera::anchor()` this frame's
     /// `CameraUniform` was built with, so the cull's block/fraction split
     /// matches the vertex shader's.
+    ///
+    /// With `occlusion`, where the occlusion pass can run, the solid and
+    /// cutout lists hold only the sections it saw last frame and water none:
+    /// the caller then records [`Self::record_occlusion`] after drawing them
+    /// and draws [`View::Late`] after that (see [`Self::occludes`]).
     pub fn dispatch_cull(
         &mut self,
         encoder: &rhi::backend::CommandEncoder,
@@ -2784,12 +2923,23 @@ impl ChunkBufferStore {
         frustum: &[[f32; 4]; 6],
         anchor: DVec3,
         eye: DVec3,
+        occlusion: bool,
     ) {
+        self.occluding = false;
         self.set_eye(eye);
         self.record_uploads(encoder);
         if self.lists.columns.is_empty() {
             return;
         }
+        let occluding = occlusion && self.occlusion.is_some();
+        if occluding && self.seen_stale {
+            encoder.fill_buffer(self.seen.handle(), 0, self.seen.size(), 0);
+            encoder.transition_buffers(rhi::BufferUse::CopyDst, rhi::BufferUse::Storage);
+            self.seen_stale = false;
+        }
+        // 0 is the stamp of a section never seen, and 1 the one before the
+        // first.
+        self.frame_id = self.frame_id.wrapping_add(1).max(2);
 
         // Front-to-back order is an early-Z optimization, so it follows the
         // camera a list per frame, once it has moved far enough.
@@ -2820,7 +2970,8 @@ impl ChunkBufferStore {
             }
             (draws, indices)
         });
-        let data = self.frustum_data(frustum, anchor, eye, true);
+        let data = self.frustum_data(frustum, anchor, eye, true, self.camera.facing, occluding);
+        self.cull_eye = (data.cam_block, data.frac);
         self.camera.cull(
             encoder,
             &self.compute_pipeline,
@@ -2828,27 +2979,107 @@ impl ChunkBufferStore {
             &data,
             !self.indirect_draw.count,
         );
+        // Every list, the late ones as the cull zeroed them; the occlusion
+        // pass copies them and water again once the late cull has run.
+        self.copy_counts(encoder, frame, 0..LISTS);
+        self.occluding = occluding;
+        self.fade_enabled = true;
+    }
+
+    /// Copies the camera's draw counts of `lists` into this frame slot's
+    /// readback.
+    fn copy_counts(
+        &self,
+        encoder: &rhi::backend::CommandEncoder,
+        frame: usize,
+        lists: impl Iterator<Item = usize>,
+    ) {
         encoder.transition_buffers(rhi::BufferUse::StorageWrite, rhi::BufferUse::CopySrc);
         let readback = self.count_readbacks[frame].handle();
-        for (i, count) in self
-            .camera
-            .counts
-            .iter()
-            .map(|counts| &counts[frame])
-            .enumerate()
-        {
+        for list in lists.filter(|&list| !self.camera.counts[list].is_empty()) {
             encoder.copy_buffer(
-                count.handle(),
+                self.camera.counts[list][frame].handle(),
                 readback,
                 &[rhi::BufferCopy {
                     src_offset: 0,
-                    dst_offset: i as u64 * COUNTS_SIZE,
+                    dst_offset: list as u64 * COUNTS_SIZE,
                     size: COUNTS_SIZE,
                 }],
             );
         }
         encoder.transition_buffers(rhi::BufferUse::CopyDst, rhi::BufferUse::HostRead);
-        self.fade_enabled = true;
+    }
+
+    /// Whether this frame's camera cull left the sections it didn't see last
+    /// frame, and water, to [`Self::record_occlusion`].
+    pub fn occludes(&self) -> bool {
+        self.occluding
+    }
+
+    /// After this frame's solid and cutout [`View::Camera`] draws into
+    /// `depth`, outside any pass: the occlusion pass's boxes against that
+    /// depth, through `view_proj` (the terrain's, eye-relative), with
+    /// reverse Z unless `forward_z`, then the late cull of what it saw into
+    /// the [`View::Late`] lists and water. Nothing without
+    /// [`Self::occludes`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_occlusion(
+        &self,
+        device: &rhi::backend::Device,
+        encoder: &rhi::backend::CommandEncoder,
+        frame: usize,
+        depth: rhi::backend::TextureHandle,
+        extent: rhi::Extent,
+        view_proj: glam::Mat4,
+        forward_z: bool,
+    ) {
+        let Some(occlusion) = self.occlusion.as_ref().filter(|_| self.occluding) else {
+            return;
+        };
+        let (cam_block, frac) = self.cull_eye;
+        let push = OcclusionPush {
+            view_proj: view_proj.to_cols_array(),
+            cam_block,
+            frame_id: self.frame_id,
+            frac,
+            _pad: 0,
+        };
+        let mut pass = encoder.begin_render_pass(
+            device,
+            &rhi::backend::RenderPassDesc {
+                color: None,
+                extra_colors: Vec::new(),
+                depth: Some(rhi::backend::DepthAttachment {
+                    texture: depth,
+                    load: rhi::LoadOp::Load,
+                    store: rhi::StoreOp::Store,
+                }),
+                extent,
+            },
+        );
+        pass.set_pipeline(&occlusion.pipelines[usize::from(forward_z)]);
+        pass.set_bind_group(0, occlusion.sets[frame]);
+        pass.set_push_constants(rhi::ShaderStages::VERTEX, 0, bytemuck::bytes_of(&push));
+        pass.set_index_buffer(occlusion.box_indices.handle());
+        pass.draw_indexed_indirect(
+            self.camera.occlusion_cmds[frame].handle(),
+            0,
+            1,
+            size_of::<DrawCommand>() as u32,
+        );
+        pass.end();
+        encoder.transition_buffers(rhi::BufferUse::FragmentWrite, rhi::BufferUse::Storage);
+        self.camera.late_cull(encoder, &self.late_pipeline, frame);
+        self.copy_counts(
+            encoder,
+            frame,
+            [
+                Layer::Water as usize,
+                list_index(Layer::Solid, true),
+                list_index(Layer::Cutout, true),
+            ]
+            .into_iter(),
+        );
     }
 
     /// Culls every section, the camera's occluded ones too, against a shader
@@ -2866,16 +3097,22 @@ impl ChunkBufferStore {
         if self.lists.columns.is_empty() {
             return;
         }
-        let data = self.frustum_data(frustum, anchor, eye, false);
+        // The shadow pass draws unculled, so no face faces away.
+        let data = self.frustum_data(frustum, anchor, eye, false, false, false);
         // Both culls write the sections' fade.
         encoder.transition_buffers(rhi::BufferUse::StorageWrite, rhi::BufferUse::StorageWrite);
         let shadow = self.shadow.get_or_insert_with(|| {
             DrawList::new(
                 device,
                 self.cull_layout,
-                &self.meta_buffers,
-                &self.visibility_buffers,
+                CullShared {
+                    meta: &self.meta_buffers,
+                    visibility: &self.visibility_buffers,
+                    seen: &self.seen,
+                },
                 self.max_meta,
+                false,
+                false,
             )
         });
         shadow.cull(
@@ -2905,17 +3142,22 @@ impl ChunkBufferStore {
         if self.lists.columns.is_empty() {
             return;
         }
-        let list = match (view, &self.shadow) {
-            (View::Camera, _) => &self.camera,
-            (View::Shadow, Some(shadow)) => shadow,
+        let (list, index) = match (view, &self.shadow) {
+            (View::Camera, _) => (&self.camera, layer as usize),
+            (View::Late, _) if self.occluding && layer != Layer::Water => {
+                (&self.camera, list_index(layer, true))
+            }
+            (View::Late, _) => return,
+            (View::Shadow, Some(shadow)) => (shadow, layer as usize),
             (View::Shadow, None) => return,
         };
-        let indirect = list.draws[layer as usize][frame].handle();
-        let count = list.counts[layer as usize][frame].handle();
+        let indirect = list.draws[index][frame].handle();
+        let count = list.counts[index][frame].handle();
         // Binding 1: the meta buffer, read per instance for the section
         // origin + fade (indexed by `first_instance`).
         pass.set_vertex_buffer(1, self.meta_buffers[frame].handle());
         let stride = size_of::<DrawCommand>() as u32;
+        let slots = list.slots(layer);
         for (id, (slot, segment)) in self.arenas.iter().zip(&self.lists.segments).enumerate() {
             let Some(arena) = live(slot).filter(|_| !segment.metas.is_empty()) else {
                 continue;
@@ -2923,8 +3165,8 @@ impl ChunkBufferStore {
             // Binding 0: the arena's packed vertices.
             pass.set_vertex_buffer(0, arena.vertex_buffer.handle());
             pass.set_index_buffer(arena.index_buffer.handle());
-            let max_draws = segment.metas.len() as u32;
-            let offset = u64::from(segment.base * stride);
+            let max_draws = segment.metas.len() as u32 * slots;
+            let offset = u64::from(segment.base * slots * stride);
             if self.indirect_draw.count {
                 let count_offset = (id * size_of::<u32>()) as u64;
                 pass.draw_indexed_indirect_count(
@@ -2954,8 +3196,13 @@ impl ChunkBufferStore {
             list.destroy(device);
         }
         util::destroy_buffers(device, &mut self.count_readbacks);
+        std::mem::take(&mut self.seen).destroy(device);
+        if let Some(occlusion) = &mut self.occlusion {
+            occlusion.destroy(device);
+        }
 
         self.compute_pipeline.destroy(device);
+        self.late_pipeline.destroy(device);
         self.compute_layout.destroy(device);
         self.cull_layout.destroy(device);
     }
@@ -2979,6 +3226,116 @@ fn visibility_buffers(device: &rhi::backend::Device, columns: usize) -> Vec<rhi:
         rhi::BufferUsages::STORAGE,
         "column_visibility",
     )
+}
+
+/// The sections the occlusion pass saw, a stamp per meta slot of `draws`.
+fn seen_buffer(device: &rhi::backend::Device, draws: usize) -> rhi::backend::Buffer {
+    rhi::backend::Buffer::new(
+        device,
+        "occlusion_seen",
+        (draws * size_of::<u32>()) as u64,
+        rhi::BufferUsages::STORAGE | rhi::BufferUsages::COPY_DST,
+        rhi::MemoryLocation::Device,
+    )
+}
+
+/// The camera's occlusion pass: each candidate's box, grown by a block,
+/// against the depth of the terrain drawn so far, marking the sections that
+/// show (`chunk_occlusion.vert/.frag`).
+struct OcclusionPass {
+    set_layout: rhi::backend::BindGroupLayout,
+    layout: rhi::backend::PipelineLayout,
+    /// Reverse Z (vanilla), then forward Z (a shader pack's).
+    pipelines: [rhi::backend::RenderPipeline; 2],
+    /// Per frame slot, over its metas and candidates.
+    sets: Vec<rhi::backend::BindGroup>,
+    box_indices: rhi::backend::Buffer,
+}
+
+impl OcclusionPass {
+    fn new(device: &rhi::backend::Device, meta: &[rhi::backend::Buffer]) -> Self {
+        let set_layout = rhi::backend::create_bind_group_layout(device, OCCLUSION_BINDINGS);
+        let layout = rhi::backend::create_pipeline_layout(
+            device,
+            &[set_layout],
+            Some(rhi::PushConstants {
+                visibility: rhi::ShaderStages::VERTEX,
+                size: size_of::<OcclusionPush>() as u32,
+            }),
+        );
+        // Unculled: a box's back faces show from inside it, and either
+        // winding stands, whichever way the projection flips.
+        let pipeline = |label, compare| {
+            rhi::backend::create_render_pipeline(
+                device,
+                rhi::backend::PipelineTargets::depth_only(),
+                layout,
+                &rhi::RenderPipelineDesc {
+                    cull_mode: rhi::CullMode::None,
+                    depth: Some(rhi::DepthState {
+                        write: false,
+                        compare,
+                        bias: None,
+                    }),
+                    ..rhi::RenderPipelineDesc::new(
+                        label,
+                        shader::include_shader!("chunk_occlusion.vert"),
+                        shader::include_shader!("chunk_occlusion.frag"),
+                        &[],
+                    )
+                },
+            )
+        };
+        let mut box_indices = rhi::backend::Buffer::new(
+            device,
+            "occlusion_box_indices",
+            size_of_val(&BOX_INDICES) as u64,
+            rhi::BufferUsages::INDEX,
+            rhi::MemoryLocation::Host,
+        );
+        box_indices.write(bytemuck::cast_slice(&BOX_INDICES));
+        Self {
+            set_layout,
+            layout,
+            pipelines: [
+                pipeline("chunk occlusion", rhi::CompareFunction::GreaterEqual),
+                pipeline("pack chunk occlusion", rhi::CompareFunction::LessEqual),
+            ],
+            sets: vec![rhi::backend::BindGroup::default(); meta.len()],
+            box_indices,
+        }
+    }
+
+    fn bind(
+        &mut self,
+        device: &rhi::backend::Device,
+        meta: &[rhi::backend::Buffer],
+        candidates: &[rhi::backend::Buffer],
+        seen: &rhi::backend::Buffer,
+    ) {
+        let storage = rhi::backend::BindingResource::storage;
+        for (i, set) in self.sets.iter_mut().enumerate() {
+            set.replace(
+                device,
+                self.set_layout,
+                &[
+                    (0, storage(&meta[i], meta[i].size())),
+                    (1, storage(&candidates[i], candidates[i].size())),
+                    (2, storage(seen, seen.size())),
+                ],
+            );
+        }
+    }
+
+    fn destroy(&mut self, device: &rhi::backend::Device) {
+        util::destroy_bind_groups(device, self.sets.drain(..));
+        for pipeline in &self.pipelines {
+            pipeline.destroy(device);
+        }
+        std::mem::take(&mut self.box_indices).destroy(device);
+        self.layout.destroy(device);
+        self.set_layout.destroy(device);
+    }
 }
 
 /// Of the `loaded` columns, as (distance from the eye squared, position,
@@ -3212,28 +3569,60 @@ fn create_pool(
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Camera,
+    /// The camera's sections the occlusion pass newly saw, drawn after it;
+    /// solid and cutout only, as the camera's water waits for it.
+    Late,
     /// A shader pack's shadow pass.
     Shadow,
 }
 
 /// One view's cull: per frame slot, its frustum and the draw lists it
 /// writes over the shared metas, a range and a draw count per arena and
-/// [`Layer`].
+/// [`Layer`]; for the camera with the occlusion pass, the late solid and
+/// cutout lists cull_late.comp writes too.
 struct DrawList {
     cull_sets: Vec<rhi::backend::BindGroup>,
+    /// The late cull's groups: the late lists where the early ones bind.
+    late_sets: Vec<rhi::backend::BindGroup>,
     frustum_buffers: Vec<rhi::backend::Buffer>,
-    /// By [`Layer`], then frame slot.
-    draws: [Vec<rhi::backend::Buffer>; 3],
-    counts: [Vec<rhi::backend::Buffer>; 3],
+    /// By [`list_index`], then frame slot; the late lists are empty without
+    /// `late`.
+    draws: [Vec<rhi::backend::Buffer>; LISTS],
+    counts: [Vec<rhi::backend::Buffer>; LISTS],
+    /// Per frame slot, the occlusion pass's candidates and its
+    /// [`OcclusionCmd`].
+    candidates: Vec<rhi::backend::Buffer>,
+    occlusion_cmds: Vec<rhi::backend::Buffer>,
+    /// Whether solid and cutout draw only the face groups facing the eye.
+    facing: bool,
+    /// Whether it has the late lists.
+    late: bool,
 }
+
+/// The draw lists: each [`Layer`]'s, then the late solid and cutout ones.
+const LISTS: usize = 5;
+
+/// Where `layer`'s list sits in a [`DrawList`]'s, the late one if `late`.
+fn list_index(layer: Layer, late: bool) -> usize {
+    match (layer, late) {
+        (layer, false) => layer as usize,
+        (Layer::Solid, true) => 3,
+        (Layer::Cutout, true) => 4,
+        (Layer::Water, true) => unreachable!("water has no late list"),
+    }
+}
+
+/// The occlusion pass's late dispatch, within an [`OcclusionCmd`].
+const LATE_DISPATCH_OFFSET: u64 = offset_of!(OcclusionCmd, late_groups) as u64;
 
 impl DrawList {
     fn new(
         device: &rhi::backend::Device,
         layout: rhi::backend::BindGroupLayout,
-        meta: &[rhi::backend::Buffer],
-        visibility: &[rhi::backend::Buffer],
-        draws: usize,
+        shared: CullShared,
+        sections: usize,
+        facing: bool,
+        late: bool,
     ) -> Self {
         let count = |name: &str| {
             util::create_per_frame_host_buffers(
@@ -3247,6 +3636,11 @@ impl DrawList {
         };
         let mut this = Self {
             cull_sets: vec![rhi::backend::BindGroup::default(); MAX_FRAMES_IN_FLIGHT],
+            late_sets: if late {
+                vec![rhi::backend::BindGroup::default(); MAX_FRAMES_IN_FLIGHT]
+            } else {
+                Vec::new()
+            },
             frustum_buffers: util::create_per_frame_host_buffers(
                 device,
                 FRUSTUM_SIZE,
@@ -3258,22 +3652,56 @@ impl DrawList {
                 count("draw_count"),
                 count("draw_count_cutout"),
                 count("draw_count_water"),
+                if late {
+                    count("draw_count_late")
+                } else {
+                    Vec::new()
+                },
+                if late {
+                    count("draw_count_cutout_late")
+                } else {
+                    Vec::new()
+                },
             ],
+            candidates: Vec::new(),
+            occlusion_cmds: util::create_per_frame_host_buffers(
+                device,
+                size_of::<OcclusionCmd>() as u64,
+                rhi::BufferUsages::STORAGE | rhi::BufferUsages::INDIRECT,
+                "occlusion_cmd",
+            ),
+            facing,
+            late,
         };
-        this.regrow(device, draws);
-        this.bind(device, layout, meta, visibility);
+        this.regrow(device, sections);
+        this.bind(device, layout, shared);
         this
     }
 
-    /// Remakes the per-frame indirect buffers to hold `draws`; the caller
-    /// binds after.
-    fn regrow(&mut self, device: &rhi::backend::Device, draws: usize) {
-        let size = (draws * size_of::<DrawCommand>()) as u64;
-        for (buffers, name) in self.draws.iter_mut().zip([
-            "indirect_cmds",
-            "indirect_cmds_cutout",
-            "indirect_cmds_water",
-        ]) {
+    /// The draw slots a section takes in `layer`'s list.
+    fn slots(&self, layer: Layer) -> u32 {
+        if self.facing && layer != Layer::Water {
+            OPAQUE_DRAW_SLOTS
+        } else {
+            1
+        }
+    }
+
+    /// Remakes the per-frame indirect buffers and candidates to hold
+    /// `sections`' draws; the caller binds after.
+    fn regrow(&mut self, device: &rhi::backend::Device, sections: usize) {
+        let mut lists = vec![
+            (Layer::Solid, false, "indirect_cmds"),
+            (Layer::Cutout, false, "indirect_cmds_cutout"),
+            (Layer::Water, false, "indirect_cmds_water"),
+        ];
+        if self.late {
+            lists.push((Layer::Solid, true, "indirect_cmds_late"));
+            lists.push((Layer::Cutout, true, "indirect_cmds_cutout_late"));
+        }
+        for (layer, late, name) in lists {
+            let size = (sections * self.slots(layer) as usize * size_of::<DrawCommand>()) as u64;
+            let buffers = &mut self.draws[list_index(layer, late)];
             util::destroy_buffers(device, buffers);
             *buffers = util::create_per_frame_host_buffers(
                 device,
@@ -3282,36 +3710,67 @@ impl DrawList {
                 name,
             );
         }
+        util::destroy_buffers(device, &mut self.candidates);
+        self.candidates = (0..MAX_FRAMES_IN_FLIGHT)
+            .map(|_| {
+                rhi::backend::Buffer::new(
+                    device,
+                    "occlusion_candidates",
+                    (sections * size_of::<u32>()) as u64,
+                    rhi::BufferUsages::STORAGE,
+                    rhi::MemoryLocation::Device,
+                )
+            })
+            .collect();
     }
 
-    /// Points each frame's cull group at its buffers.
+    /// Points each frame's cull groups at its buffers.
     fn bind(
         &mut self,
         device: &rhi::backend::Device,
         layout: rhi::backend::BindGroupLayout,
-        meta: &[rhi::backend::Buffer],
-        visibility: &[rhi::backend::Buffer],
+        shared: CullShared,
     ) {
         let storage = rhi::backend::BindingResource::storage;
         let uniform = rhi::backend::BindingResource::uniform;
+        let CullShared {
+            meta,
+            visibility,
+            seen,
+        } = shared;
         for i in 0..MAX_FRAMES_IN_FLIGHT {
-            let draws = |layer: Layer| {
-                let buffer = &self.draws[layer as usize][i];
+            let draws = |list: usize| {
+                let buffer = &self.draws[list][i];
                 storage(buffer, buffer.size())
             };
-            let counts = |layer: Layer| storage(&self.counts[layer as usize][i], COUNTS_SIZE);
-            let bindings = [
-                (0, storage(&meta[i], meta[i].size())),
-                (1, uniform(&self.frustum_buffers[i], FRUSTUM_SIZE)),
-                (2, draws(Layer::Solid)),
-                (3, counts(Layer::Solid)),
-                (4, draws(Layer::Cutout)),
-                (5, counts(Layer::Cutout)),
-                (6, draws(Layer::Water)),
-                (7, counts(Layer::Water)),
-                (8, storage(&visibility[i], visibility[i].size())),
-            ];
-            self.cull_sets[i].replace(device, layout, &bindings);
+            let counts = |list: usize| storage(&self.counts[list][i], COUNTS_SIZE);
+            let set = |late: bool| {
+                let (solid, cutout) = (
+                    list_index(Layer::Solid, late),
+                    list_index(Layer::Cutout, late),
+                );
+                let water = Layer::Water as usize;
+                let candidates = &self.candidates[i];
+                let cmd = &self.occlusion_cmds[i];
+                [
+                    (0, storage(&meta[i], meta[i].size())),
+                    (1, uniform(&self.frustum_buffers[i], FRUSTUM_SIZE)),
+                    (2, draws(solid)),
+                    (3, counts(solid)),
+                    (4, draws(cutout)),
+                    (5, counts(cutout)),
+                    (6, draws(water)),
+                    (7, counts(water)),
+                    (8, storage(&visibility[i], visibility[i].size())),
+                    (9, storage(candidates, candidates.size())),
+                    (10, storage(cmd, cmd.size())),
+                    (11, storage(seen, seen.size())),
+                ]
+            };
+            self.cull_sets[i].replace(device, layout, &set(false));
+            if self.late {
+                self.late_sets[i].replace(device, layout, &set(true));
+            }
         }
     }
 
@@ -3328,11 +3787,12 @@ impl DrawList {
         zero_indirect: bool,
     ) {
         self.frustum_buffers[frame].write(bytemuck::bytes_of(data));
-        for counts in &mut self.counts {
+        for counts in self.counts.iter_mut().filter(|c| !c.is_empty()) {
             counts[frame].zero();
         }
+        self.occlusion_cmds[frame].write(bytemuck::bytes_of(&OcclusionCmd::RESET));
         if zero_indirect {
-            for draws in &mut self.draws {
+            for draws in self.draws.iter_mut().filter(|d| !d.is_empty()) {
                 draws[frame].zero();
             }
         }
@@ -3342,6 +3802,30 @@ impl DrawList {
             &[],
             [data.chunk_count.div_ceil(64), 1, 1],
         );
+        // The occlusion pass draws from the candidates and its command, and
+        // stamps `seen` after the cull's own stamps.
+        encoder.transition_buffers_many(&[
+            (rhi::BufferUse::StorageWrite, rhi::BufferUse::DrawInput),
+            (rhi::BufferUse::StorageWrite, rhi::BufferUse::ShaderRead),
+            (rhi::BufferUse::StorageWrite, rhi::BufferUse::FragmentWrite),
+        ]);
+    }
+
+    /// Records cull_late.comp over the candidates the occlusion pass saw,
+    /// into the late lists and water.
+    fn late_cull(
+        &self,
+        encoder: &rhi::backend::CommandEncoder,
+        pipeline: &rhi::backend::ComputePipeline,
+        frame: usize,
+    ) {
+        encoder.dispatch_indirect(
+            pipeline,
+            self.late_sets[frame],
+            &[],
+            self.occlusion_cmds[frame].handle(),
+            LATE_DISPATCH_OFFSET,
+        );
         encoder.transition_buffers(rhi::BufferUse::StorageWrite, rhi::BufferUse::DrawInput);
     }
 
@@ -3350,8 +3834,20 @@ impl DrawList {
         for buffers in self.draws.iter_mut().chain(&mut self.counts) {
             util::destroy_buffers(device, buffers);
         }
+        util::destroy_buffers(device, &mut self.candidates);
+        util::destroy_buffers(device, &mut self.occlusion_cmds);
         util::destroy_bind_groups(device, self.cull_sets.drain(..));
+        util::destroy_bind_groups(device, self.late_sets.drain(..));
     }
+}
+
+/// The buffers every view's cull shares: per frame slot the metas and
+/// column masks, and the sections the occlusion pass saw.
+#[derive(Clone, Copy)]
+struct CullShared<'a> {
+    meta: &'a [rhi::backend::Buffer],
+    visibility: &'a [rhi::backend::Buffer],
+    seen: &'a rhi::backend::Buffer,
 }
 
 #[cfg(test)]
@@ -3485,16 +3981,16 @@ mod tests {
         // slots included, for each frame slot in flight.
         let mut writes = Vec::new();
         lists.write_pending(|offset, metas| writes.push((offset, metas.len())));
-        assert_eq!(writes, [(0, 128), (128 * 80, 64), (192 * 80, 64)]);
+        assert_eq!(writes, [(0, 128), (128 * 128, 64), (192 * 128, 64)]);
         for _ in 1..MAX_FRAMES_IN_FLIGHT {
             lists.write_pending(|_, _| {});
         }
         lists.remove_sections(0, |s| s.section_index != 2);
         writes.clear();
         lists.write_pending(|offset, metas| writes.push((offset, metas.len())));
-        assert_eq!(writes, [(192 * 80, 1)]);
+        assert_eq!(writes, [(192 * 128, 1)]);
         lists.write_pending(|offset, metas| writes.push((offset, metas.len())));
-        assert_eq!(writes, [(192 * 80, 1), (192 * 80, 1)]);
+        assert_eq!(writes, [(192 * 128, 1), (192 * 128, 1)]);
     }
 
     fn need(vertices: u64) -> Need {

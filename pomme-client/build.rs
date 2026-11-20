@@ -109,6 +109,8 @@ fn main() {
         "light.glsl",
         "distant_models.glsl",
         "distant_section.glsl",
+        "chunk_meta.glsl",
+        "cull.glsl",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -154,6 +156,9 @@ fn main() {
         ("sky.vert", shaderc::ShaderKind::Vertex),
         ("sky.frag", shaderc::ShaderKind::Fragment),
         ("cull.comp", shaderc::ShaderKind::Compute),
+        ("cull_late.comp", shaderc::ShaderKind::Compute),
+        ("chunk_occlusion.vert", shaderc::ShaderKind::Vertex),
+        ("chunk_occlusion.frag", shaderc::ShaderKind::Fragment),
         ("blur.vert", shaderc::ShaderKind::Vertex),
         ("entity.vert", shaderc::ShaderKind::Vertex),
         ("entity.frag", shaderc::ShaderKind::Fragment),

@@ -275,6 +275,8 @@ pub struct SectionMesh {
     /// Number of leading `indices` that belong to the solid (no-discard) pass;
     /// the rest are cutout (discard) geometry.
     pub solid_index_count: u32,
+    /// Where each of the solid then the cutout indices' [`FACE_GROUPS`] ends.
+    pub face_ends: FaceEnds,
     /// Translucent (water) indices into the same `vertices`, drawn in a
     /// separate blended pass after opaque geometry.
     pub water_indices: Vec<u32>,
@@ -308,14 +310,18 @@ impl MeshSink {
         let section = (!self.solid.is_empty() || !self.cutout.is_empty() || !self.water.is_empty())
             .then(|| {
                 let mut indices = Vec::with_capacity(self.solid.len() + self.cutout.len());
-                indices.extend_from_slice(&self.solid);
-                indices.extend_from_slice(&self.cutout);
+                let mut face_ends = [0; 2 * (FACE_GROUPS - 1)];
+                let solid_ends = group_by_facing(&self.solid, &self.vertices, &mut indices);
+                let cutout_ends = group_by_facing(&self.cutout, &self.vertices, &mut indices);
+                face_ends[..FACE_GROUPS - 1].copy_from_slice(&solid_ends);
+                face_ends[FACE_GROUPS - 1..].copy_from_slice(&cutout_ends);
                 SectionMesh {
                     section_index,
                     vertices: TerrainVertices::pack(format, &self.vertices),
                     aabb: section_aabb(&self.vertices),
                     indices,
                     solid_index_count: self.solid.len() as u32,
+                    face_ends,
                     water_indices: self.water.clone(),
                 }
             });
@@ -335,6 +341,80 @@ impl MeshSink {
             &mut self.cutout
         }
     }
+}
+
+/// The facings a layer's quads are grouped by, in index order: down, north,
+/// west, the quads on no axis plane, east, south, up. With the unaligned
+/// quads in the middle, the groups that can face a camera make at most three
+/// runs, so `cull.comp` draws a layer of a section in at most three draws.
+pub const FACE_GROUPS: usize = 7;
+const UNALIGNED_GROUP: usize = 3;
+
+/// Per layer, where each of the first `FACE_GROUPS - 1` groups ends within
+/// the layer's indices; the last ends with the layer.
+pub type FaceEnds = [u32; 2 * (FACE_GROUPS - 1)];
+
+/// The [`FACE_GROUPS`] group of the quad drawn by `quad`'s two triangles:
+/// the axis its four corners share a plane on, and the side its first
+/// triangle's winding faces; quads on no axis plane are unaligned.
+fn facing_group(quad: &[u32], vertices: &[TerrainVertex]) -> usize {
+    // The quad's corners are four consecutive vertices.
+    let base = *quad.iter().min().expect("a quad") as usize;
+    let corners = &vertices[base..base + 4];
+    let [a, b, c] = [quad[0], quad[1], quad[2]].map(|i| vertices[i as usize].position);
+    let (e1, e2) = (
+        [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+        [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+    );
+    let normal = [
+        e1[1] * e2[2] - e1[2] * e2[1],
+        e1[2] * e2[0] - e1[0] * e2[2],
+        e1[0] * e2[1] - e1[1] * e2[0],
+    ];
+    const EPSILON: f32 = 1e-4;
+    // Down/up, north/south, west/east per axis.
+    const GROUPS: [[usize; 2]; 3] = [[2, 4], [0, 6], [1, 5]];
+    for axis in 0..3 {
+        let plane = corners[0].position[axis];
+        if normal[axis] != 0.0
+            && corners
+                .iter()
+                .all(|v| (v.position[axis] - plane).abs() < EPSILON)
+        {
+            return GROUPS[axis][usize::from(normal[axis] > 0.0)];
+        }
+    }
+    UNALIGNED_GROUP
+}
+
+/// Appends `layer`'s quads to `out` grouped by [`facing_group`], returning
+/// where each group but the last ends within them.
+fn group_by_facing(
+    layer: &[u32],
+    vertices: &[TerrainVertex],
+    out: &mut Vec<u32>,
+) -> [u32; FACE_GROUPS - 1] {
+    let (quads, _) = layer.as_chunks::<6>();
+    let groups: Vec<u8> = quads
+        .iter()
+        .map(|quad| facing_group(quad, vertices) as u8)
+        .collect();
+    let mut ends = [0; FACE_GROUPS - 1];
+    let mut len = 0;
+    for group in 0..FACE_GROUPS {
+        for (quad, _) in quads
+            .iter()
+            .zip(&groups)
+            .filter(|&(_, &g)| usize::from(g) == group)
+        {
+            out.extend_from_slice(quad);
+            len += 6;
+        }
+        if let Some(end) = ends.get_mut(group) {
+            *end = len;
+        }
+    }
+    ends
 }
 
 /// One moving block's terrain mesh, from [`MeshDispatcher::mesh_moving_block`].
@@ -3218,5 +3298,62 @@ mod to_u8_tests {
         ] {
             assert_eq!(to_u8(f), reference(f), "{f}");
         }
+    }
+}
+
+#[cfg(test)]
+mod facing_tests {
+    use super::*;
+
+    fn quad(sink: &mut MeshSink, positions: [[f32; 3]; 4], opaque: bool) {
+        let region = AtlasRegion {
+            opaque,
+            ..AtlasRegion::UNIT
+        };
+        emit_face(
+            sink,
+            [0.0; 3],
+            &positions,
+            None,
+            &[[0.0; 2]; 4],
+            [VertexLight::flat(1.0, LightLevels(0)); 4],
+            region,
+            PACKED_WHITE_SHIFTED,
+        );
+    }
+
+    #[test]
+    fn quads_group_by_the_side_they_face() {
+        let mut sink = MeshSink::default();
+        // Cube faces in reverse group order, then a diagonal plant quad.
+        for dir in [
+            Direction::Up,
+            Direction::South,
+            Direction::East,
+            Direction::West,
+            Direction::North,
+            Direction::Down,
+        ] {
+            quad(&mut sink, face_positions(dir, [0.0; 3], [1.0; 3]), true);
+        }
+        let cross = [
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+        ];
+        quad(&mut sink, cross, true);
+        // An up face seen from below: the same plane wound the other way.
+        let mut under = face_positions(Direction::Up, [0.0; 3], [1.0; 3]);
+        under.reverse();
+        quad(&mut sink, under, false);
+
+        let mesh = sink.finish(0, TerrainFormat::Vanilla).expect("drew quads");
+        assert_eq!(mesh.solid_index_count, 42);
+        // Down, north, west, unaligned, east, south, up: one quad each.
+        assert_eq!(mesh.face_ends[..6], [6, 12, 18, 24, 30, 36]);
+        // The reversed up face is a down face.
+        assert_eq!(mesh.face_ends[6..], [6; 6]);
+        assert_eq!(mesh.indices.len(), 48);
     }
 }

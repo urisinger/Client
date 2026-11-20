@@ -1,0 +1,24 @@
+#version 450
+
+// After the occlusion pass, the candidates it saw: those cull.comp didn't
+// draw into the late solid and cutout lists, and every one's water.
+
+#include "cull.glsl"
+
+void main() {
+    uint slot = gl_GlobalInvocationID.x;
+    if (slot >= candidate_count) return;
+    uint entry = candidates[slot];
+    uint idx = entry & ~DRAWN_BIT;
+    if (seen[idx] != frame_id) return;
+
+    ChunkMeta m = chunks[idx];
+    uint base = arena_start(m);
+    if ((entry & DRAWN_BIT) == 0u) {
+        vec3 mn;
+        vec3 mx;
+        section_box(m, mn, mx);
+        emit_opaque(m, base, idx, mn, mx);
+    }
+    emit_water(m, base, idx);
+}

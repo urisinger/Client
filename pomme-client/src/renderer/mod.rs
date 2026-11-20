@@ -970,12 +970,48 @@ impl Renderer {
 
         let chunks = &self.chunk_buffers;
         let moving_blocks = &self.moving_block_buffers;
+        // The pack's clip space as its programs leave it: GL's, with depth
+        // moved to 0..1.
+        let gl_depth = glam::Mat4::from_cols(
+            glam::Vec4::X,
+            glam::Vec4::Y,
+            glam::Vec4::new(0.0, 0.0, 0.5, 0.0),
+            glam::Vec4::new(0.0, 0.0, 0.5, 1.0),
+        );
+        let occlusion_view_proj = gl_depth * projection * view;
         let terrain = |pack: &mut PackRenderer, geometry, view| {
-            if let Some((pass, _)) = pack.begin_geometry(device, encoder, frame, geometry) {
+            if let Some((mut pass, binding)) = pack.begin_geometry(device, encoder, frame, geometry)
+            {
                 pass.set_bind_group(3, pack.atlas_group);
                 for (layer, cutout) in [(Layer::Solid, false), (Layer::Cutout, true)] {
                     chunks.draw_indirect(&pass, frame, layer, view);
                     moving_blocks.draw(&pass, frame, cutout);
+                }
+                // What the occlusion pass newly sees against the terrain's
+                // depth so far, into the same targets.
+                if view == View::Camera && chunks.occludes() {
+                    pass = pack.split_geometry(
+                        device,
+                        encoder,
+                        pass,
+                        geometry,
+                        binding,
+                        |depth, extent| {
+                            chunks.record_occlusion(
+                                device,
+                                encoder,
+                                frame,
+                                depth,
+                                extent,
+                                occlusion_view_proj,
+                                true,
+                            );
+                        },
+                    );
+                    pass.set_bind_group(3, pack.atlas_group);
+                    for layer in [Layer::Solid, Layer::Cutout] {
+                        chunks.draw_indirect(&pass, frame, layer, View::Late);
+                    }
                 }
                 pack.end_geometry(encoder, pass, geometry);
             }
@@ -2305,12 +2341,15 @@ impl Renderer {
             let frustum = self.camera.frustum_planes();
             // The eye (including the third-person offset) is the origin the chunk
             // vertex shader renders relative to, so the cull must use it too.
+            // Both the vanilla and the shader pack terrain record the
+            // occlusion pass after their first draws.
             self.chunk_buffers.dispatch_cull(
                 &encoder,
                 frame,
                 &frustum,
                 self.camera.anchor(),
                 self.camera_render_position(),
+                true,
             );
             self.gpu_stamp(&encoder, frame, "cull");
             self.last_timings.sections = self.chunk_buffers.sections_drawn();
@@ -2611,6 +2650,44 @@ impl Renderer {
                         self.chunk_buffers
                             .draw_indirect(&pass, frame, Layer::Cutout, View::Camera);
                         self.moving_block_buffers.draw(&pass, frame, true);
+                        // What the occlusion pass newly sees against that
+                        // depth, drawn after it.
+                        if self.chunk_buffers.occludes() {
+                            pass.end();
+                            self.gpu_stamp(&encoder, frame, "early terrain");
+                            self.chunk_buffers.record_occlusion(
+                                &self.ctx.device,
+                                &encoder,
+                                frame,
+                                self.swapchain.depth.handle(),
+                                self.swapchain.extent,
+                                self.camera.view_projection(),
+                                false,
+                            );
+                            self.gpu_stamp(&encoder, frame, "occlusion");
+                            pass = encoder.begin_render_pass(
+                                &self.ctx.device,
+                                &self.swapchain.pass_keeping_depth(
+                                    image_index,
+                                    rhi::LoadOp::Load,
+                                    rhi::LoadOp::Load,
+                                ),
+                            );
+                            self.chunk_pipeline.bind(&mut pass, frame, false);
+                            self.chunk_buffers.draw_indirect(
+                                &pass,
+                                frame,
+                                Layer::Solid,
+                                View::Late,
+                            );
+                            self.chunk_pipeline.bind(&mut pass, frame, true);
+                            self.chunk_buffers.draw_indirect(
+                                &pass,
+                                frame,
+                                Layer::Cutout,
+                                View::Late,
+                            );
+                        }
                     }
                     let cull_ms = t_cull.elapsed().as_secs_f32() * 1000.0;
                     self.gpu_stamp(&encoder, frame, "terrain");

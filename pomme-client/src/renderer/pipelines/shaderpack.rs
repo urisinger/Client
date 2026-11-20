@@ -1305,6 +1305,30 @@ impl PackRenderer {
         Some((pass, binding))
     }
 
+    /// Ends `pass`, a [`Self::begin_geometry`] one of `geometry`, runs
+    /// `between` on its depth target, still a depth attachment, and its
+    /// extent, then begins it again with `binding` bound.
+    pub fn split_geometry(
+        &self,
+        device: &rhi::backend::Device,
+        encoder: &rhi::backend::CommandEncoder,
+        pass: rhi::backend::RenderPassEncoder,
+        geometry: PackGeometry,
+        binding: PackBinding,
+        between: impl FnOnce(rhi::backend::TextureHandle, rhi::Extent),
+    ) -> rhi::backend::RenderPassEncoder {
+        pass.end();
+        let program = self
+            .program_ref(ProgramRef::Geometry(geometry))
+            .expect("its pass began");
+        let (attachments, depth, extent) = self.geometry_targets(program, geometry.shadow());
+        between(depth, extent);
+        let mut pass = self.begin(device, encoder, attachments, Some(depth), extent);
+        pass.set_pipeline(&binding.pipeline);
+        pass.set_bind_groups(0, &binding.sets);
+        pass
+    }
+
     /// Ends a [`Self::begin_geometry`] pass, leaving its targets readable.
     pub fn end_geometry(
         &self,
