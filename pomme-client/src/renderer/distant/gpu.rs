@@ -73,8 +73,6 @@ pub(crate) const TINT_BIOMES: usize = 512;
 const TARGET_REQUESTS: f64 = 4000.0;
 /// Top-level nodes the ring may hold.
 const MAX_ROOTS: usize = 1 << 14;
-/// The distant projection's far plane: 3000 chunks.
-pub(crate) const DISTANT_FAR: f32 = 3000.0 * 16.0;
 /// Drawn chunk sections the bound store starts with room for.
 const BOUND_CAPACITY: u32 = 1 << 15;
 /// The box's 12 triangles as corner bits (x, y, z), every face wound

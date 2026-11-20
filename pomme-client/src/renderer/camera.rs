@@ -13,10 +13,6 @@ pub const MIN_FOV_DEGREES: f32 = 30.0;
 #[allow(dead_code)]
 pub const MAX_FOV_DEGREES: f32 = 110.0;
 const NEAR: f32 = 0.1;
-/// Near plane of distant terrain's projection. Its nearest column is past
-/// the loaded chunks, so a near plane this far out keeps depth precise
-/// across thousands of blocks.
-const DISTANT_NEAR: f32 = 16.0;
 /// Floor of the dynamic far plane (vanilla floors at `cloudRange * 16`
 /// instead; pomme's fixed-reach clouds derive their fade from this).
 pub(crate) const MIN_FAR: f32 = 1000.0;
@@ -520,14 +516,10 @@ impl Camera {
         // contains bobHurt (death roll + hurt tilt) followed by bobView. Keep
         // the full view effect while omitting only camera translation.
         let view = self.view_effect_matrix() * view::look_to_mat4(Vec3::ZERO, forward, up);
-        let mut proj = proj::directx::perspective(
+        reverse_z_projection(
             self.fov_radians(self.render_partial_tick),
             self.aspect_ratio,
-            NEAR,
-            self.depth_far,
-        );
-        proj.y_axis.y *= -1.0; // Vulkan NDC has +Y down
-        proj * view
+        ) * view
     }
 
     /// Vanilla `GameRenderer.renderItemInHand`'s pose base: the inverse view
@@ -596,32 +588,26 @@ impl Camera {
     }
 
     pub fn view_projection_with_fov(&self, fov: f32) -> Mat4 {
-        self.view_projection_with_planes(fov, NEAR, self.depth_far)
-    }
-
-    /// The view projection distant terrain draws with, out to `far` blocks.
-    pub fn distant_view_projection(&self, far: f32) -> Mat4 {
-        self.view_projection_with_planes(
-            self.fov_radians(self.render_partial_tick),
-            DISTANT_NEAR,
-            far,
-        )
-    }
-
-    /// [`Self::distant_view_projection`] with the field of view widened by
-    /// `extra_radians` (clamped below 180°): what is about to come into view.
-    pub fn distant_view_projection_dilated(&self, far: f32, extra_radians: f32) -> Mat4 {
-        let fov = (self.fov_radians(self.render_partial_tick) + extra_radians).min(2.96);
-        self.view_projection_with_planes(fov, DISTANT_NEAR, far)
-    }
-
-    fn view_projection_with_planes(&self, fov: f32, near: f32, far: f32) -> Mat4 {
         let (forward, up) = self.view_basis();
         let view = self.view_effect_matrix() * view::look_to_mat4(Vec3::ZERO, forward, up);
-        let mut proj = proj::directx::perspective(fov, self.aspect_ratio, near, far);
-        proj.y_axis.y *= -1.0; // Vulkan NDC has +Y down
-        proj * view
+        reverse_z_projection(fov, self.aspect_ratio) * view
     }
+
+    /// [`Self::view_projection`] with the field of view widened by
+    /// `extra_radians` (clamped below 180°): what is about to come into view.
+    pub fn view_projection_dilated(&self, extra_radians: f32) -> Mat4 {
+        let fov = (self.fov_radians(self.render_partial_tick) + extra_radians).min(2.96);
+        self.view_projection_with_fov(fov)
+    }
+}
+
+/// The world's projection: reverse Z ([`crate::renderer::rhi::DEPTH_FAR`]) with
+/// the far plane at infinity, so one depth buffer holds both the chunks and
+/// distant terrain thousands of blocks out. Vulkan NDC has +Y down.
+pub fn reverse_z_projection(fov: f32, aspect_ratio: f32) -> Mat4 {
+    let mut proj = proj::directx::perspective_infinite_reverse(fov, aspect_ratio, NEAR);
+    proj.y_axis.y *= -1.0;
+    proj
 }
 
 #[repr(C)]
@@ -856,13 +842,10 @@ mod tests {
 
         let (forward, up) = camera.view_basis();
         let view = camera.view_effect_matrix() * view::look_to_mat4(Vec3::ZERO, forward, up);
-        let mut projection = proj::directx::perspective(
+        let projection = reverse_z_projection(
             camera.fov_radians(camera.render_partial_tick),
             camera.aspect_ratio,
-            NEAR,
-            camera.depth_far,
         );
-        projection.y_axis.y *= -1.0;
 
         assert_mat4_close(
             camera.sky_view_projection(),

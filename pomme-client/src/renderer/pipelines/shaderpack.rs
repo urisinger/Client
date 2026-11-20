@@ -781,13 +781,12 @@ impl PackRenderer {
                 _ => rhi::CullMode::None,
             },
             front_face: rhi::FrontFace::Cw,
-            // Vanilla's sky and `EYES` write no depth.
-            depth: geometry.map(|g| {
-                if sky || g == PackGeometry::EntityEyes {
-                    rhi::DepthState::READ_ONLY
-                } else {
-                    rhi::DepthState::WRITE
-                }
+            // Vanilla's sky and `EYES` write no depth. Packs read depth as
+            // OpenGL leaves it, so theirs stays forward Z.
+            depth: geometry.map(|g| rhi::DepthState {
+                write: !(sky || g == PackGeometry::EntityEyes),
+                compare: rhi::CompareFunction::LessEqual,
+                bias: None,
             }),
             blend: match geometry {
                 Some(PackGeometry::EntityEyes) => Some(SPIDER_EYES_BLEND),

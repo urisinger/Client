@@ -231,7 +231,8 @@ void setup_screenspace(Node node) {
 }
 
 // Hidden when the farthest Hi-Z texel the box covers lies before the box's
-// nearest point, at the level where the box spans about two texels.
+// nearest point (the greatest depth, in reverse Z), at the level where the
+// box spans about two texels.
 bool culled_by_hiz() {
     // A box over the whole screen is never culled.
     if (any(lessThan(abs(max_bb.xy - min_bb.xy - vec2(1.0)), vec2(0.000001)))) {
@@ -245,13 +246,13 @@ bool culled_by_hiz() {
     hiz_extent = max(ivec2(1), hiz_extent >> mip);
     ivec2 high = min(ivec2(ceil(max_bb.xy * hiz_extent)), hiz_extent - 1);
     ivec2 low = ivec2(floor(min_bb.xy * hiz_extent));
-    float farthest = -1.0;
+    float farthest = 2.0;
     for (int x = low.x; x <= high.x; x++) {
         for (int y = low.y; y <= high.y; y++) {
-            farthest = max(texelFetch(sampler2D(hiz, hiz_sampler), ivec2(x, y), mip).r, farthest);
+            farthest = min(texelFetch(sampler2D(hiz, hiz_sampler), ivec2(x, y), mip).r, farthest);
         }
     }
-    return farthest <= min_bb.z;
+    return farthest >= max_bb.z;
 }
 
 bool should_descend() {

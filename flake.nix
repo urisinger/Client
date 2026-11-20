@@ -59,26 +59,28 @@
         in
         {
           default = pkgs.mkShell {
-            packages =
-              [ toolchain ]
-              ++ (with pkgs; [
-                just
-                python3
-                pkg-config
-                cmake
-                clang
-                lld
-                git
-                jdk25
+            packages = [
+              toolchain
+            ]
+            ++ (with pkgs; [
+              just
+              python3
+              pkg-config
+              cmake
+              clang
+              lld
+              dbus
+              git
+              jdk25
 
-                shaderc
-                udev
-                zlib
+              shaderc
+              udev
+              zlib
 
-                vulkan-tools
-                vulkan-validation-layers
-              ])
-              ++ runtimeLibs;
+              vulkan-tools
+              vulkan-validation-layers
+            ])
+            ++ runtimeLibs;
 
             # shaderc-sys links the nixpkgs build instead of compiling its own.
             SHADERC_LIB_DIR = "${lib.getLib pkgs.shaderc}/lib";

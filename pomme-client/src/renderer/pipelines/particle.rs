@@ -257,7 +257,7 @@ fn create_pipeline(
             // fragment discard); TRANSLUCENT_PARTICLE adds standard alpha
             // blending.
             depth: Some(rhi::DepthState {
-                compare: rhi::CompareFunction::Less,
+                compare: rhi::CompareFunction::Greater,
                 ..rhi::DepthState::WRITE
             }),
             blend: translucent.then_some(rhi::BlendState::TRANSLUCENT),

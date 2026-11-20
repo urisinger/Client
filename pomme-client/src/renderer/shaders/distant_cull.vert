@@ -1,8 +1,8 @@
 #version 450
 
 // Each listed section's quad bounds as a box, grown by a block and brought a
-// hair closer, depth-tested against the distant image's depth; the fragment
-// stage records the sections that show.
+// hair closer, depth-tested against the frame's depth; the fragment stage
+// records the sections that show.
 
 #define DISTANT_SET 0
 #define SCENE_BINDING 0
@@ -24,7 +24,8 @@ void main() {
     vec3 offset = vec3(section_aabb_offset(section)) - EXPANSION;
     offset += cube_corner(gl_VertexIndex) * (vec3(section_aabb_size(section)) + 2.0 * EXPANSION);
     gl_Position = distant_view_proj * vec4(vec3(pos) + offset * float(1 << detail), 1.0);
-    gl_Position.z -= 0.000001 * gl_Position.w;
+    // By d * d / 16e6 blocks at distance d (reverse Z's depth is near / d).
+    gl_Position.z /= 1.0 - gl_Position.w / 16000000.0;
 
     v_id = sid;
     // Whether the pass saw it last frame, for the temporal draws.

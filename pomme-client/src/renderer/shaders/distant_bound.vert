@@ -8,7 +8,7 @@
 #include "distant_section.glsl"
 
 layout(push_constant) uniform BoundPc {
-    // The camera's view projection with the distant near and far planes.
+    // The camera's view projection.
     mat4 distant_view_proj;
     // The render distance in blocks; boxes past it leave distant terrain be.
     float render_distance;
@@ -39,6 +39,8 @@ void main() {
     }
     vec3 point = vec3(origin) + cube_corner(gl_VertexIndex) * vec3(size);
     gl_Position = distant_view_proj * vec4(point - camera_pos.xyz, 1.0);
-    // Brought a hair closer, so a face on the box's edge still counts as inside.
-    gl_Position.z -= 0.0005;
+    // Brought a hair closer, so a face on the box's edge still counts as
+    // inside: by d * d / 32000 blocks at distance d, as 0.0005 off a forward
+    // depth with a near plane of 16 did. Reverse Z's depth is near / d.
+    gl_Position.z /= max(1.0 - gl_Position.w / 32000.0, 0.5);
 }

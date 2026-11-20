@@ -125,7 +125,6 @@ fn main() {
         ("distant.frag", shaderc::ShaderKind::Fragment),
         ("distant_bound.vert", shaderc::ShaderKind::Vertex),
         ("distant_bound.frag", shaderc::ShaderKind::Fragment),
-        ("distant_setup.frag", shaderc::ShaderKind::Fragment),
         ("distant_blit.frag", shaderc::ShaderKind::Fragment),
         ("distant_cull.vert", shaderc::ShaderKind::Vertex),
         ("distant_cull.frag", shaderc::ShaderKind::Fragment),

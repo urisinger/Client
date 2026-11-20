@@ -218,7 +218,8 @@ impl SkinPreviewPipeline {
         let head_y_rot_rad = head_y_rot_deg.to_radians();
         let head_x_rot_rad = head_x_rot_raw * 20.0f32.to_radians();
 
-        let mut proj = proj::directx::perspective(MENU_FOV, aspect, 0.1, 100.0);
+        // Near and far swapped: reverse Z, as the frame's depth is.
+        let mut proj = proj::directx::perspective(MENU_FOV, aspect, 100.0, 0.1);
         proj.y_axis.y *= -1.0;
 
         let ndc_x = screen_x * 2.0 - 1.0;
@@ -264,7 +265,8 @@ impl SkinPreviewPipeline {
         let units_to_px = p.model_scale * p.gui_scale;
         let half_w = sw / (2.0 * units_to_px);
         let half_h = sh / (2.0 * units_to_px);
-        let mut proj = proj::directx::orthographic(-half_w, half_w, -half_h, half_h, 0.1, 100.0);
+        // Near and far swapped: reverse Z.
+        let mut proj = proj::directx::orthographic(-half_w, half_w, -half_h, half_h, 100.0, 0.1);
         proj.y_axis.y *= -1.0;
 
         let clip_offset =
@@ -523,22 +525,22 @@ struct PreviewPipelineState {
 const TEXTURED_PREVIEW_STATE: PreviewPipelineState = PreviewPipelineState {
     cull_mode: rhi::CullMode::Front,
     blend: Some(rhi::BlendState::TRANSLUCENT),
-    depth_compare: rhi::CompareFunction::Less,
+    depth_compare: rhi::CompareFunction::Greater,
 };
-// Vanilla `ARMOR_CUTOUT_NO_CULL`; LEQUAL lets stacked layers (leather, then
-// leather_overlay) draw over each other.
+// Vanilla `ARMOR_CUTOUT_NO_CULL`; LEQUAL (GEQUAL in reverse Z) lets stacked
+// layers (leather, then leather_overlay) draw over each other.
 const ARMOR_PREVIEW_STATE: PreviewPipelineState = PreviewPipelineState {
     cull_mode: rhi::CullMode::None,
     blend: None,
-    depth_compare: rhi::CompareFunction::LessEqual,
+    depth_compare: rhi::CompareFunction::GreaterEqual,
 };
-// Vanilla `ENTITY_SOLID` for the enchanting book; LEQUAL keeps the seam from
-// winning over the lids it touches. Its mesh keeps vanilla's winding, unlike
-// the Z-reflected skin mesh, so it culls the opposite set.
+// Vanilla `ENTITY_SOLID` for the enchanting book; LEQUAL (GEQUAL here) keeps
+// the seam from winning over the lids it touches. Its mesh keeps vanilla's
+// winding, unlike the Z-reflected skin mesh, so it culls the opposite set.
 const BOOK_PREVIEW_STATE: PreviewPipelineState = PreviewPipelineState {
     cull_mode: rhi::CullMode::Back,
     blend: None,
-    depth_compare: rhi::CompareFunction::LessEqual,
+    depth_compare: rhi::CompareFunction::GreaterEqual,
 };
 
 /// The textured-model preview pipeline. Vanilla's GL-CCW front faces come
@@ -943,7 +945,7 @@ mod tests {
         assert!(ARMOR_PREVIEW_STATE.blend.is_none());
         assert!(matches!(
             ARMOR_PREVIEW_STATE.depth_compare,
-            rhi::CompareFunction::LessEqual
+            rhi::CompareFunction::GreaterEqual
         ));
         assert!(matches!(
             TEXTURED_PREVIEW_STATE.cull_mode,

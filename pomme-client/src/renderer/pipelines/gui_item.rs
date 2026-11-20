@@ -81,9 +81,9 @@ impl GuiItemPipeline {
         self.camera_px[frame] = Some(self.atlas_px);
         let atlas_px = self.atlas_px as f32;
         // Bottom/top swapped to Y-invert the projection (matches vanilla's
-        // `invertY=true`).
+        // `invertY=true`), near/far for reverse Z.
         let view_proj =
-            proj::directx::orthographic(0.0, atlas_px, atlas_px, 0.0, -10000.0, 10000.0);
+            proj::directx::orthographic(0.0, atlas_px, atlas_px, 0.0, 10000.0, -10000.0);
         self.shared
             .update_camera(frame, &CameraUniform::with_view_proj(view_proj));
     }

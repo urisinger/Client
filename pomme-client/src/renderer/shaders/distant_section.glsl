@@ -4,7 +4,7 @@
 
 #include "distant_consts.glsl"
 
-// The scene uniform: the distant view projection moved by the camera's
+// The scene uniform: the camera's view projection moved by the camera's
 // position within its section, that section, the frame, and whether the
 // occlusion pass was skipped (cmdgen then keeps visibility itself); then
 // the traversal's: the Hi-Z's base size (width << 16 | height), the screen

@@ -404,7 +404,7 @@ impl<Texture> DepthAttachment<Texture> {
     pub fn cleared(texture: Texture) -> Self {
         Self {
             texture,
-            load: LoadOp::Clear(1.0),
+            load: LoadOp::Clear(DEPTH_FAR),
             store: StoreOp::Discard,
         }
     }
@@ -706,7 +706,7 @@ pub enum CompareFunction {
     Less,
     LessEqual,
     Greater,
-    Always,
+    GreaterEqual,
 }
 
 #[derive(Clone, Copy)]
@@ -722,10 +722,15 @@ pub struct DepthState {
     pub bias: Option<DepthBias>,
 }
 
+/// Depth is reverse Z: 1 at the near plane and 0 at the far one (or at
+/// infinity), cleared to [`DEPTH_FAR`] and kept by the greater, so a float
+/// depth stays precise out to distant terrain.
+pub const DEPTH_FAR: f32 = 0.0;
+
 impl DepthState {
     pub const WRITE: Self = Self {
         write: true,
-        compare: CompareFunction::LessEqual,
+        compare: CompareFunction::GreaterEqual,
         bias: None,
     };
     /// Tested but not written, so the geometry never hides what's behind it.

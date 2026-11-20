@@ -2532,7 +2532,7 @@ impl Renderer {
             &self.swapchain.pass_keeping_depth(
                 image_index,
                 rhi::LoadOp::Clear(clear_color),
-                rhi::LoadOp::Clear(1.0),
+                rhi::LoadOp::Clear(rhi::DEPTH_FAR),
             ),
         );
 
@@ -2622,8 +2622,8 @@ impl Renderer {
                         distant.buffers.update_roots(eye);
                     }
                     // Distant terrain draws after the chunks' solid and cutout
-                    // passes: bounded by their depth, into its own image, then
-                    // laid into the frame. Nothing to traverse means nothing
+                    // passes: into their depth and its own image, then laid
+                    // into the frame. Nothing to traverse means nothing
                     // to draw or request.
                     if let Some(distant) = distant.filter(|d| d.buffers.top_count() > 0) {
                         let extent = self.swapchain.extent;
@@ -2640,6 +2640,15 @@ impl Renderer {
                             extent,
                             sky.cardinal_light.table(),
                         );
+                        distant.pipeline.composite(
+                            &self.ctx.device,
+                            &encoder,
+                            self.swapchain.pass(image_index, rhi::LoadOp::Load),
+                            frame,
+                            &self.camera,
+                            (*render_distance * 16) as f32,
+                            (*distant_terrain * 16) as f32,
+                        );
                         pass = encoder.begin_render_pass(
                             &self.ctx.device,
                             &self.swapchain.pass_keeping_depth(
@@ -2647,13 +2656,6 @@ impl Renderer {
                                 rhi::LoadOp::Load,
                                 rhi::LoadOp::Load,
                             ),
-                        );
-                        distant.pipeline.composite(
-                            &mut pass,
-                            frame,
-                            &self.camera,
-                            (*render_distance * 16) as f32,
-                            (*distant_terrain * 16) as f32,
                         );
                     }
 

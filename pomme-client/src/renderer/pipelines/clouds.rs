@@ -468,7 +468,7 @@ fn create_pipeline(
             // overlap, so depth writes keep the nearest cloud face and avoid
             // double-blending the layer.
             depth: Some(rhi::DepthState {
-                compare: rhi::CompareFunction::Less,
+                compare: rhi::CompareFunction::Greater,
                 ..rhi::DepthState::WRITE
             }),
             blend: Some(rhi::BlendState::TRANSLUCENT),

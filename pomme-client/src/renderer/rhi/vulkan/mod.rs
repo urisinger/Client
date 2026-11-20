@@ -13,10 +13,11 @@ use pyronyx::vk;
 
 use super::{
     Acquired, AddressMode, BindGroupLayoutEntry, BindingType, BlendFactor, BlendState, Blit,
-    BufferCopy, BufferUsages, BufferUse, CompareFunction, CullMode, Extent, FilterMode, FrontFace,
-    LoadOp, MAX_COLOR_TARGETS, MemoryLocation, Presented, PushConstants, Rect, RenderPipelineDesc,
-    SamplerDesc, ShaderStages, StoreOp, TexelCopy, TextureDesc, TextureFormat, TextureRange,
-    TextureUsages, TextureUse, TextureViewDimension, Topology, VertexFormat, VertexStepMode,
+    BufferCopy, BufferUsages, BufferUse, CompareFunction, CullMode, DEPTH_FAR, Extent, FilterMode,
+    FrontFace, LoadOp, MAX_COLOR_TARGETS, MemoryLocation, Presented, PushConstants, Rect,
+    RenderPipelineDesc, SamplerDesc, ShaderStages, StoreOp, TexelCopy, TextureDesc, TextureFormat,
+    TextureRange, TextureUsages, TextureUse, TextureViewDimension, Topology, VertexFormat,
+    VertexStepMode,
 };
 use crate::renderer::MAX_FRAMES_IN_FLIGHT;
 
@@ -753,7 +754,7 @@ pub fn try_create_sampler(device: &Device, desc: &SamplerDesc) -> Result<Sampler
             Some(CompareFunction::Less) => vk::CompareOp::Less,
             Some(CompareFunction::LessEqual) | None => vk::CompareOp::LessOrEqual,
             Some(CompareFunction::Greater) => vk::CompareOp::Greater,
-            Some(CompareFunction::Always) => vk::CompareOp::Always,
+            Some(CompareFunction::GreaterEqual) => vk::CompareOp::GreaterOrEqual,
         },
         ..Default::default()
     };
@@ -1083,7 +1084,7 @@ pub fn try_create_render_pipeline(
                 CompareFunction::Less => vk::CompareOp::Less,
                 CompareFunction::LessEqual => vk::CompareOp::LessOrEqual,
                 CompareFunction::Greater => vk::CompareOp::Greater,
-                CompareFunction::Always => vk::CompareOp::Always,
+                CompareFunction::GreaterEqual => vk::CompareOp::GreaterOrEqual,
             },
             ..Default::default()
         },
@@ -1761,13 +1762,13 @@ impl RenderPassEncoder {
         );
     }
 
-    /// Clears depth to 1.0 inside `rect` mid-pass.
+    /// Clears depth to the far plane inside `rect` mid-pass.
     pub fn clear_depth(&self, rect: Rect) {
         self.clear(
             vk::ImageAspectFlags::Depth,
             vk::ClearValue {
                 depth_stencil: vk::ClearDepthStencilValue {
-                    depth: 1.0,
+                    depth: DEPTH_FAR,
                     stencil: 0,
                 },
             },

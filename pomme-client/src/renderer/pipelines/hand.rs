@@ -264,7 +264,8 @@ fn arm_matrix(swing_progress: f32, invert: f32) -> Mat4 {
 }
 
 pub(super) fn projection(aspect: f32, hud_fov: f32) -> Mat4 {
-    let mut proj = proj::directx::perspective(hud_fov, aspect, NEAR, FAR);
+    // Near and far swapped: reverse Z, as the frame's depth is.
+    let mut proj = proj::directx::perspective(hud_fov, aspect, FAR, NEAR);
     proj.y_axis.y *= -1.0;
     proj
 }
@@ -400,7 +401,7 @@ fn create_pipeline(
         layout,
         &rhi::RenderPipelineDesc {
             depth: Some(rhi::DepthState {
-                compare: rhi::CompareFunction::Less,
+                compare: rhi::CompareFunction::Greater,
                 ..rhi::DepthState::WRITE
             }),
             ..rhi::RenderPipelineDesc::new(

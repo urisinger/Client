@@ -36,7 +36,8 @@ void main() {
     if (any(notEqual(clamp(tile, vec2(0.0), size), tile))) {
         discard;
     }
-    if (gl_FragCoord.z < texelFetch(sampler2D(depth_bound, model_sampler), ivec2(gl_FragCoord.xy), 0).r) {
+    // Nearer is greater in reverse Z.
+    if (gl_FragCoord.z > texelFetch(sampler2D(depth_bound, model_sampler), ivec2(gl_FragCoord.xy), 0).r) {
         discard;
     }
     vec4 color = textureGrad(sampler2D(model_atlas, model_sampler), pos, grad_x, grad_y);

@@ -413,7 +413,7 @@ fn create_pipeline(
             // NOT write depth, so overlapping translucent columns blend and the
             // later hand/HUD passes are unaffected.
             depth: Some(rhi::DepthState {
-                compare: rhi::CompareFunction::Less,
+                compare: rhi::CompareFunction::Greater,
                 ..rhi::DepthState::READ_ONLY
             }),
             blend: Some(rhi::BlendState::TRANSLUCENT),

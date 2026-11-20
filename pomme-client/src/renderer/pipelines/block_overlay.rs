@@ -341,9 +341,10 @@ fn create_pipeline(
             // slope 1): a large slope pulls edge-on side faces in front of
             // occluding neighbors.
             depth: Some(rhi::DepthState {
+                // Positive: toward the camera in reverse Z.
                 bias: Some(rhi::DepthBias {
-                    constant: -10,
-                    slope: -1.0,
+                    constant: 10,
+                    slope: 1.0,
                 }),
                 ..rhi::DepthState::READ_ONLY
             }),

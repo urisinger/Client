@@ -122,7 +122,7 @@ impl BookPreviewPipeline {
         let s = 40.0 * p.gui_scale;
         // Screen-space ortho: x/y in framebuffer pixels (y down, matching
         // vanilla's invertY ortho), z to depth like vanilla's [-1000, 1000]
-        // range, negated so vanilla's reversed-GEQUAL test becomes LESS here.
+        // range, nearer greater for vanilla's GEQUAL as for reverse Z.
         let ax = 2.0 * s / sw;
         let ay = 2.0 * s / sh;
         let bx = (p.rect[0] + p.rect[2] / 2.0) / sw * 2.0 - 1.0;
@@ -130,7 +130,7 @@ impl BookPreviewPipeline {
         let clip = Mat4::from_cols(
             Vec4::new(ax, 0.0, 0.0, 0.0),
             Vec4::new(0.0, ay, 0.0, 0.0),
-            Vec4::new(0.0, 0.0, s / 2000.0, 0.0),
+            Vec4::new(0.0, 0.0, -s / 2000.0, 0.0),
             Vec4::new(bx, by, 0.5, 1.0),
         );
         write_uniform(&mut self.mvp_buffers[frame], &clip);
