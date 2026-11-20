@@ -1247,6 +1247,11 @@ impl MainMenu {
             .set(&mut self.render_distance, rd);
     }
 
+    /// Whether a benchmark replaced the render distance.
+    pub fn bench_render_distance_set(&self) -> bool {
+        self.bench_render_distance.saved().is_some()
+    }
+
     pub fn restore_bench_render_distance(&mut self) -> Option<u32> {
         self.bench_render_distance
             .restore(&mut self.render_distance)

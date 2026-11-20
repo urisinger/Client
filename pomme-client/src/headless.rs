@@ -303,7 +303,7 @@ fn drive(
         game.last_update_phases.net_decode_ms = ms(t_net);
         // Meshing doesn't wait on visibility, which only orders the drawing.
         let t_rescan = Instant::now();
-        game.rescan_mesh_jobs(chunk_detail);
+        game.rescan_mesh_jobs(chunk_detail, game.render_radius(rd));
         game.last_update_phases.rescan_ms = ms(t_rescan);
 
         let mut batch = game.drain_meshes();

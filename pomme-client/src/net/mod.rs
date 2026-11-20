@@ -731,7 +731,9 @@ pub fn client_information(
     ];
     pomme_protocol::serverbound::ClientInformation {
         language: "en_us".into(),
-        view_distance,
+        // A signed byte on the wire: 128 would read as -128, which servers
+        // clamp to their minimum.
+        view_distance: view_distance.min(i8::MAX as u8),
         chat_visibility: match chat_options.visibility {
             crate::ui::chat::ChatVisibilitySetting::Full => 0,
             crate::ui::chat::ChatVisibilitySetting::System => 1,

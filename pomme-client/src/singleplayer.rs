@@ -120,7 +120,7 @@ mod steel {
     pub fn open(
         world: &WorldSummary,
         dir: &Path,
-        view_distance: u8,
+        render_distance: u8,
     ) -> Result<(World, MemoryEnd), String> {
         let lock = SessionLock::take(dir)?;
         let (client, server) = memory_pipes();
@@ -132,8 +132,8 @@ mod steel {
         let pending = launch(LaunchOptions {
             save_path: dir.to_path_buf(),
             seed,
-            view_distance,
-            simulation_distance: view_distance,
+            view_distance: render_distance,
+            simulation_distance: render_distance,
             game_mode: match world.game_mode {
                 world_list::GameMode::Survival => GameType::Survival,
                 world_list::GameMode::Creative => GameType::Creative,
@@ -194,7 +194,7 @@ mod steel {
     pub fn open(
         _world: &WorldSummary,
         _dir: &Path,
-        _view_distance: u8,
+        _render_distance: u8,
     ) -> Result<(World, MemoryEnd), String> {
         Err(super::UNAVAILABLE_MESSAGE.to_owned())
     }

@@ -3800,7 +3800,8 @@ impl AppCore {
         game.last_update_phases.visibility_ms = ms(t_vis);
 
         let t_rescan = std::time::Instant::now();
-        game.rescan_mesh_jobs(self.menu.chunk_detail);
+        let radius = game.render_radius(self.menu.render_distance);
+        game.rescan_mesh_jobs(self.menu.chunk_detail, radius);
         game.last_update_phases.rescan_ms = ms(t_rescan);
 
         disconnect_reason

@@ -390,6 +390,12 @@ pub struct GameState {
     /// phase: vanilla's `remoteClientInformation`, null until it has.
     client_information_sent: bool,
     pub server_render_distance: u32,
+    /// The distant terrain's reach in chunks, 0 while it's off: the server
+    /// is asked for its columns too, which [`Self::rescan_mesh_jobs`] leaves
+    /// unmeshed past the render distance.
+    pub distant_chunks: u32,
+    /// How far from the player columns mesh, as of the last rescan.
+    mesh_radius: u32,
     pub server_simulation_distance: u32,
     pub item_entity_store: ItemEntityStore,
     pub particle_store: crate::particle::ParticleStore,
@@ -573,6 +579,8 @@ impl GameState {
             last_skin_options: skin_options,
             client_information_sent: false,
             server_render_distance: 0,
+            distant_chunks: 0,
+            mesh_radius: 0,
             server_simulation_distance: 0,
             item_entity_store: ItemEntityStore::new(),
             particle_store: {
@@ -1614,10 +1622,38 @@ impl GameState {
     /// [`MeshColumns::first_unmeshed`] over the loaded columns.
     #[cfg(feature = "test-harness")]
     pub fn first_unmeshed_column(&self) -> Option<ChunkPos> {
-        self.mesh_columns
-            .first_unmeshed(self.chunk_store.loaded_positions(), |pos| {
-                neighbourhood_lit(&self.chunk_store, &self.light_engine, pos)
-            })
+        let player_chunk = self.player_chunk();
+        self.mesh_columns.first_unmeshed(
+            self.chunk_store
+                .loaded_positions()
+                .filter(|&pos| within_radius(pos, player_chunk, self.mesh_radius)),
+            |pos| neighbourhood_lit(&self.chunk_store, &self.light_engine, pos),
+        )
+    }
+
+    /// The render distance the chunks draw to: the option, within what the
+    /// server sends.
+    pub fn render_radius(&self, render_distance: u32) -> u32 {
+        if self.server_render_distance > 0 {
+            render_distance.min(self.server_render_distance)
+        } else {
+            render_distance
+        }
+    }
+
+    /// The view distance the server is asked for: the render distance, or
+    /// the distant terrain's reach when that's further (and no benchmark set
+    /// the render distance), so the distant terrain takes in the columns
+    /// past it.
+    pub fn requested_view_distance(&self, menu: &crate::ui::menu::MainMenu) -> u32 {
+        let distant = if menu.bench_render_distance_set() {
+            0
+        } else {
+            self.distant_chunks
+        };
+        menu.render_distance
+            .max(distant)
+            .min(crate::world::chunk::MAX_VIEW_DISTANCE)
     }
 
     /// Forgets every column's scheduling state, for a new level or dispatcher.
@@ -1968,9 +2004,19 @@ impl GameState {
     /// are loaded and lit, and the queue orders the backlog nearest-first.
     /// Runs every frame, publishing only when the work or the camera's
     /// 8-block bucket changed.
-    pub fn rescan_mesh_jobs(&mut self, chunk_detail: u32) {
-        let loaded: Vec<ChunkPos> = self.chunk_store.loaded_positions().collect();
+    pub fn rescan_mesh_jobs(&mut self, chunk_detail: u32, radius: u32) {
         let player_chunk = self.player_chunk();
+        // Columns past the render distance are there for the distant
+        // terrain, which takes them as their light applies.
+        let loaded: Vec<ChunkPos> = self
+            .chunk_store
+            .loaded_positions()
+            .filter(|&pos| within_radius(pos, player_chunk, radius))
+            .collect();
+        if radius != self.mesh_radius {
+            self.mesh_radius = radius;
+            self.mesh_columns.invalidate();
+        }
         let camera = *self.player.position;
         let dispatcher = &self.mesh_dispatcher;
         let requests = self.mesh_columns.requests(
@@ -1986,6 +2032,15 @@ impl GameState {
                 .publish(&self.chunk_store, camera, requests);
         }
     }
+}
+
+/// Whether `pos` lies within `radius` columns of `center`, square like the
+/// server's view.
+fn within_radius(pos: ChunkPos, center: ChunkPos, radius: u32) -> bool {
+    (pos.x - center.x)
+        .unsigned_abs()
+        .max((pos.z - center.z).unsigned_abs())
+        <= radius
 }
 
 /// Vanilla `SectionUpdateTracker.hasAllNeighbors`: every column around
@@ -5252,11 +5307,7 @@ pub fn update_game(
             .extract(partial_tick, gfx.renderer.camera_anchor(), &world_light)
     };
 
-    let effective_rd = if game.server_render_distance > 0 {
-        core.menu.render_distance.min(game.server_render_distance)
-    } else {
-        core.menu.render_distance
-    };
+    let effective_rd = game.render_radius(core.menu.render_distance);
     // `EntityRenderer.extractNameTags` with the living renderers'
     // `shouldShowName`.
     // TODO: an entity carrying passengers hides its name (Pomme doesn't link
@@ -5331,6 +5382,7 @@ pub fn update_game(
     } else {
         0
     };
+    game.distant_chunks = distant_terrain;
     if game.distant.set_view(
         &game.dimension,
         game.player.position.x,
@@ -5533,17 +5585,16 @@ pub fn update_game(
         PauseAction::None => {}
     }
 
-    // Vanilla `Options.broadcastOptions`.
+    // Vanilla `Options.broadcastOptions`; also whenever the view distance
+    // to ask for moves without an options save, as the distant terrain
+    // turns on or off with the dimension.
     let (chat_options, skin_options) = (core.menu.chat_options, core.menu.skin_options());
-    if core.menu.take_options_saved()
-        && game.client_information_outdated(core.menu.render_distance, chat_options, skin_options)
+    let view_distance = game.requested_view_distance(&core.menu);
+    let saved = core.menu.take_options_saved();
+    if (saved || game.last_render_distance != view_distance)
+        && game.client_information_outdated(view_distance, chat_options, skin_options)
     {
-        game.sync_client_information(
-            connection,
-            core.menu.render_distance,
-            chat_options,
-            skin_options,
-        );
+        game.sync_client_information(connection, view_distance, chat_options, skin_options);
     }
     if game.options_from_game {
         crate::ui::menu::apply_resource_pack_options(core, &mut gfx.renderer, Some(game));

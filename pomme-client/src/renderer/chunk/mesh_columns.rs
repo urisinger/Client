@@ -122,6 +122,12 @@ impl MeshColumns {
         };
     }
 
+    /// Has the next [`Self::requests`] look again though nothing was marked:
+    /// which columns may mesh changed.
+    pub fn invalidate(&mut self) {
+        self.changed = true;
+    }
+
     /// Marks `sections` of `pos` for remeshing under a fresh generation, as
     /// edits (recompiles) or as new content.
     pub fn mark(&mut self, pos: ChunkPos, sections: u32, edit: bool) {
